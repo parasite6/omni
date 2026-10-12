@@ -1745,7 +1745,7 @@ fn app_menu_entries(ui: &Ui, info: &gio::AppInfo) -> Vec<MenuEntry> {
         entries.push(MenuEntry::Item {
             label: if pinned { "Unpin from Dock" } else { "Pin to Dock" }.into(),
             detail: None,
-            icon: Some(gio::ThemedIcon::new(if pinned { "list-remove-symbolic" } else { "view-pin-symbolic" }).upcast()),
+            icon: Some(gio::ThemedIcon::new(if pinned { "list-remove-symbolic" } else { "list-add-symbolic" }).upcast()),
             action: Action::DockPin(id, !pinned),
         });
     }
