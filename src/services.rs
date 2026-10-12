@@ -95,16 +95,6 @@ impl Verb {
         }
     }
 
-    /// Extra systemctl flags. Disable also stops it (`--now`): a disabled service left
-    /// running isn't what anyone means from a launcher, and for D-Bus-activated services
-    /// (bluetooth) disabling also removes the alias that lets them be started on demand.
-    fn flags(self) -> &'static [&'static str] {
-        match self {
-            Verb::Disable => &["--now"],
-            _ => &[],
-        }
-    }
-
     /// Makes sense for a service in this state (no "Start" for a running one, ...).
     pub fn applies(self, s: &Service) -> bool {
         let running = s.active == "active";
@@ -220,7 +210,6 @@ pub fn run(service: &Service, verb: Verb) {
         argv.push("--user");
     }
     argv.push(verb.command());
-    argv.extend(verb.flags());
     // "--": a unit name can never be read as an option.
     argv.extend(["--", service.unit.as_str()]);
     let what = format!("{} {}", verb.label(), service.unit);
@@ -239,20 +228,24 @@ pub fn run(service: &Service, verb: Verb) {
         if !ok {
             notify(&format!("{what}: failed"), if err.is_empty() { "systemctl reported an error" } else { &err });
         } else if matches!(verb, Verb::Stop | Verb::Disable) {
-            // systemctl succeeding doesn't mean it stays stopped: a service another
-            // program can request over D-Bus (bluetooth, ...) is started straight back up.
-            // Look again a moment later and say so instead of a misleading "done".
-            glib::timeout_future(Duration::from_millis(1500)).await;
-            if is_active(&unit, user).await {
-                let body = if verb == Verb::Stop {
-                    "It stopped, but another program started it again right away. Disable it to keep it off."
+            // systemctl succeeding doesn't mean it stays that way: a service another
+            // program can request (over D-Bus, a socket, ...) is started straight back up.
+            // Look again 5 s later and report what's actually true.
+            glib::timeout_future(Duration::from_secs(5)).await;
+            let (title, body) = if verb == Verb::Stop {
+                if is_active(&unit, user).await {
+                    (format!("{what}: restarted"), format!("It stopped, but was started again: {}.", restarter(&unit, user).await))
                 } else {
-                    "It's disabled, but another program started it again. Mask it to keep it off."
-                };
-                notify(&format!("{what}: started again"), body);
+                    (format!("{what}: stopped"), String::new())
+                }
+            } else if unit_property(&unit, user, "UnitFileState").await == "enabled" {
+                (format!("{what}: enabled again"), "Something re-enabled it after it was disabled.".to_string())
+            } else if is_active(&unit, user).await {
+                (format!("{what}: disabled"), "It won't start at boot. It's still running until you stop it.".to_string())
             } else {
-                notify(&format!("{what}: done"), "");
-            }
+                (format!("{what}: disabled"), String::new())
+            };
+            notify(&title, &body);
         } else {
             notify(&format!("{what}: done"), "");
         }
@@ -331,6 +324,41 @@ async fn is_active(unit: &str, user: bool) -> bool {
         return false;
     };
     proc.wait_future().await.is_ok() && proc.is_successful()
+}
+
+/// One `systemctl show` property's value ("" if it can't be read).
+async fn unit_property(unit: &str, user: bool, property: &str) -> String {
+    let mut argv = vec!["systemctl"];
+    if user {
+        argv.push("--user");
+    }
+    let prop = format!("--property={property}");
+    argv.extend(["show", "--value", prop.as_str(), "--", unit]);
+    let Ok(proc) = gio::Subprocess::newv(
+        &argv.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>(),
+        gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_SILENCE,
+    ) else {
+        return String::new();
+    };
+    match proc.communicate_utf8_future(None).await {
+        Ok((Some(out), _)) => out.trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// What can start the unit again on its own, as far as systemd knows. Which program
+/// made the request isn't recorded anywhere, so this names the mechanism: the units
+/// that trigger it (sockets, timers, paths), or the D-Bus name a program asked for.
+async fn restarter(unit: &str, user: bool) -> String {
+    let triggers = unit_property(unit, user, "TriggeredBy").await;
+    if !triggers.is_empty() {
+        return format!("triggered by {}", triggers.split_whitespace().collect::<Vec<_>>().join(", "));
+    }
+    let bus = unit_property(unit, user, "BusName").await;
+    if !bus.is_empty() {
+        return format!("a program asked for it over D-Bus ({bus})");
+    }
+    "something started it (systemd doesn't record what)".to_string()
 }
 
 fn notify(title: &str, body: &str) {
