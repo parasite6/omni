@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Start the omni background process through ensure-running: one healthy instance,
+# never duplicated, no restart loops. Used by Hyprland autostart and install.sh.
+#
+# Healthy = has a Wayland display (GTK hangs without one at early login) and answers
+# a ping on its socket (omni-toggle --ping never opens the popup).
+bin="$HOME/.local/share/omni/bin"
+exec /usr/local/bin/ensure-running \
+    --name omni \
+    --comm omni \
+    --wait-wayland \
+    --health 'tr "\0" "\n" < /proc/$PID/environ | grep -q "^WAYLAND_DISPLAY=." && "$HOME/.local/share/omni/bin/omni-toggle" --ping' \
+    -- "$bin/omni" --daemon
