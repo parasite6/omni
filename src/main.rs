@@ -1,6 +1,7 @@
 mod answer;
 mod apps;
 mod calc;
+mod dock;
 mod files;
 mod glass;
 mod recent;
@@ -89,6 +90,8 @@ enum Action {
     ServiceVerb(services::Service, services::Verb),
     /// Show a service's `systemctl status` in the popup.
     ServiceStatus(services::Service),
+    /// Pin (true) or unpin an app on the quickshell dock, by desktop id.
+    DockPin(String, bool),
 }
 
 struct Hit {
@@ -1736,6 +1739,16 @@ fn app_menu_entries(ui: &Ui, info: &gio::AppInfo) -> Vec<MenuEntry> {
             });
         }
     }
+    if let Some(id) = dock::id_of(info) {
+        let pinned = dock::is_pinned(&id);
+        entries.push(MenuEntry::Header("Dock"));
+        entries.push(MenuEntry::Item {
+            label: if pinned { "Unpin from Dock" } else { "Pin to Dock" }.into(),
+            detail: None,
+            icon: Some(gio::ThemedIcon::new(if pinned { "list-remove-symbolic" } else { "view-pin-symbolic" }).upcast()),
+            action: Action::DockPin(id, !pinned),
+        });
+    }
     entries
 }
 
@@ -1948,6 +1961,7 @@ fn run(ui: &Ui, action: Action) {
             Err(e) => eprintln!("omni: couldn't open {} with {}: {e}", file.uri(), info.display_name()),
         },
         Action::Copy(_) => {}
+        Action::DockPin(id, pinned) => dock::set_pinned(&id, pinned),
         Action::Claude(_) | Action::Service(_) | Action::ServiceVerb(..) | Action::ServiceStatus(_) => unreachable!(),
     }
 }
