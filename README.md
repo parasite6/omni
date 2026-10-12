@@ -145,7 +145,7 @@ image while the popup is open.
 
 | Path | What |
 |---|---|
-| `~/Documents/Claude-Sandbox/omni-launcher/` | source (this folder) |
+| `~/Documents/github/omni/` | source (this folder) |
 | `~/.local/share/omni/bin/omni` | the background program (GTK window, search, Claude) |
 | `~/.local/share/omni/bin/omni-toggle` | what the keybind runs: tiny, no GTK, opens/closes the popup in ~1 ms |
 | `~/.local/share/omni/bin/omni-start` | starts `omni` through `ensure-running` |
@@ -178,7 +178,7 @@ keybind helper doesn't load GTK, so pressing the key costs ~1 ms instead of ~60 
 ## Install / update
 
 ```bash
-~/Documents/Claude-Sandbox/omni-launcher/install.sh
+~/Documents/github/omni/install.sh
 ```
 
 Builds a release (always into this folder's `target/`, even if `CARGO_TARGET_DIR` is set),
@@ -187,7 +187,7 @@ replaces the installed files atomically, restarts `omni` and checks it answers. 
 Optional, for the AgentMail badge (once, and again after changing the `scripts/` files; the stored key is kept):
 
 ```bash
-sudo ~/Documents/Claude-Sandbox/omni-launcher/scripts/install-mailcount.sh
+sudo ~/Documents/github/omni/scripts/install-mailcount.sh
 ```
 
 ## How it's hooked into Hyprland / ML4W
