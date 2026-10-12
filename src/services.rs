@@ -95,6 +95,16 @@ impl Verb {
         }
     }
 
+    /// Extra systemctl flags. Disable also stops it (`--now`): a disabled service left
+    /// running isn't what anyone means from a launcher, and for D-Bus-activated services
+    /// (bluetooth) disabling also removes the alias that lets them be started on demand.
+    fn flags(self) -> &'static [&'static str] {
+        match self {
+            Verb::Disable => &["--now"],
+            _ => &[],
+        }
+    }
+
     /// Makes sense for a service in this state (no "Start" for a running one, ...).
     pub fn applies(self, s: &Service) -> bool {
         let running = s.active == "active";
@@ -209,9 +219,12 @@ pub fn run(service: &Service, verb: Verb) {
     if service.user {
         argv.push("--user");
     }
+    argv.push(verb.command());
+    argv.extend(verb.flags());
     // "--": a unit name can never be read as an option.
-    argv.extend([verb.command(), "--", service.unit.as_str()]);
+    argv.extend(["--", service.unit.as_str()]);
     let what = format!("{} {}", verb.label(), service.unit);
+    let (unit, user) = (service.unit.clone(), service.user);
     let proc = match gio::Subprocess::newv(
         &argv.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>(),
         gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_PIPE,
@@ -223,10 +236,25 @@ pub fn run(service: &Service, verb: Verb) {
         let result = proc.communicate_utf8_future(None).await;
         let ok = proc.is_successful();
         let err = result.ok().and_then(|(_, e)| e).map(|e| e.trim().to_string()).unwrap_or_default();
-        if ok {
-            notify(&format!("{what}: done"), "");
-        } else {
+        if !ok {
             notify(&format!("{what}: failed"), if err.is_empty() { "systemctl reported an error" } else { &err });
+        } else if matches!(verb, Verb::Stop | Verb::Disable) {
+            // systemctl succeeding doesn't mean it stays stopped: a service another
+            // program can request over D-Bus (bluetooth, ...) is started straight back up.
+            // Look again a moment later and say so instead of a misleading "done".
+            glib::timeout_future(Duration::from_millis(1500)).await;
+            if is_active(&unit, user).await {
+                let body = if verb == Verb::Stop {
+                    "It stopped, but another program started it again right away. Disable it to keep it off."
+                } else {
+                    "It's disabled, but another program started it again. Mask it to keep it off."
+                };
+                notify(&format!("{what}: started again"), body);
+            } else {
+                notify(&format!("{what}: done"), "");
+            }
+        } else {
+            notify(&format!("{what}: done"), "");
         }
     });
 }
@@ -287,6 +315,22 @@ async fn first_of<T>(
         std::task::Poll::Pending
     })
     .await
+}
+
+/// Whether `systemctl [--user] is-active UNIT` says it's running (false if that can't run).
+async fn is_active(unit: &str, user: bool) -> bool {
+    let mut argv = vec!["systemctl"];
+    if user {
+        argv.push("--user");
+    }
+    argv.extend(["is-active", "--quiet", "--", unit]);
+    let Ok(proc) = gio::Subprocess::newv(
+        &argv.iter().map(std::ffi::OsStr::new).collect::<Vec<_>>(),
+        gio::SubprocessFlags::STDOUT_SILENCE | gio::SubprocessFlags::STDERR_SILENCE,
+    ) else {
+        return false;
+    };
+    proc.wait_future().await.is_ok() && proc.is_successful()
 }
 
 fn notify(title: &str, body: &str) {
