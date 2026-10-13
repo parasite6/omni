@@ -97,7 +97,9 @@ impl Verb {
 
     /// Makes sense for a service in this state (no "Start" for a running one, ...).
     pub fn applies(self, s: &Service) -> bool {
-        let running = s.active == "active";
+        // Starting up (a crash loop sits in "activating" between attempts), reloading or
+        // shutting down counts as running: Stop and Restart are what's wanted then.
+        let running = matches!(s.active.as_str(), "active" | "activating" | "reloading" | "refreshing" | "deactivating");
         match self {
             Verb::Start => !running,
             Verb::Stop => running,
@@ -233,17 +235,29 @@ pub fn run(service: &Service, verb: Verb) {
             // Look again 5 s later and report what's actually true.
             glib::timeout_future(Duration::from_secs(5)).await;
             let (title, body) = if verb == Verb::Stop {
-                if is_active(&unit, user).await {
+                // ActiveState, not just is-active: "activating" (starting up again, or
+                // waiting to retry) means it came back too.
+                let state = unit_property(&unit, user, "ActiveState").await;
+                if matches!(state.as_str(), "active" | "activating" | "reloading" | "refreshing") {
                     (format!("{what}: restarted"), format!("It stopped, but was started again: {}.", restarter(&unit, user).await))
                 } else {
                     (format!("{what}: stopped"), String::new())
                 }
             } else if unit_property(&unit, user, "UnitFileState").await == "enabled" {
                 (format!("{what}: enabled again"), "Something re-enabled it after it was disabled.".to_string())
-            } else if is_active(&unit, user).await {
-                (format!("{what}: disabled"), "It won't start at boot. It's still running until you stop it.".to_string())
             } else {
-                (format!("{what}: disabled"), String::new())
+                // Disabling only removes the boot-time start: sockets, timers or paths that
+                // trigger it can still start it on demand.
+                let boot = if unit_property(&unit, user, "TriggeredBy").await.is_empty() {
+                    "It won't start at boot.".to_string()
+                } else {
+                    format!("It won't start at boot, but can still be started on demand ({}).", restarter(&unit, user).await)
+                };
+                if is_active(&unit, user).await {
+                    (format!("{what}: disabled"), format!("{boot} It's still running until you stop it."))
+                } else {
+                    (format!("{what}: disabled"), boot)
+                }
             };
             notify(&title, &body);
         } else {
@@ -362,11 +376,12 @@ async fn restarter(unit: &str, user: bool) -> String {
 }
 
 fn notify(title: &str, body: &str) {
-    // notify-send parses these as Pango markup; systemctl's stderr is not markup.
-    let title = glib::markup_escape_text(title);
+    // The body is Pango markup to the notification server; systemctl's stderr is not
+    // markup. The summary is plain text by the spec, so escaping it would show "&#39;".
     let body = glib::markup_escape_text(body);
+    // "--": a title starting with '-' is never read as an option.
     let _ = gio::Subprocess::newv(
-        &["notify-send", "-a", "omni", "-i", "system-run", title.as_str(), body.as_str()].map(std::ffi::OsStr::new),
+        &["notify-send", "-a", "omni", "-i", "system-run", "--", title, body.as_str()].map(std::ffi::OsStr::new),
         gio::SubprocessFlags::NONE,
     );
 }
@@ -398,6 +413,12 @@ mod tests {
         let stopped = svc("cups.service", "", "inactive", "static");
         assert!(Verb::Stop.applies(&running) && !Verb::Start.applies(&running) && Verb::Disable.applies(&running));
         assert!(Verb::Start.applies(&stopped) && !Verb::Enable.applies(&stopped)); // static
+        // Crash-looping (waiting to restart) or reloading: Stop and Restart, not Start.
+        for state in ["activating", "reloading", "deactivating"] {
+            let busy = svc("cups.service", "", state, "enabled");
+            assert!(Verb::Stop.applies(&busy) && Verb::Restart.applies(&busy) && !Verb::Start.applies(&busy), "{state}");
+        }
+        assert!(Verb::Restart.applies(&svc("cups.service", "", "failed", "enabled")));
         assert!(svc("sddm.service", "", "", "").critical() && svc("systemd-resolved.service", "", "", "").critical());
         // The Hyprland session itself (uwsm) and its portals.
         assert!(svc("wayland-wm@hyprland.desktop.service", "", "", "").critical());
