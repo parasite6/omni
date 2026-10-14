@@ -179,11 +179,21 @@ fn main() -> glib::ExitCode {
     if args.get(1).map(String::as_str) == Some("--search") {
         let query = args[2..].join(" ");
         let mut apps = apps::Apps::load();
-        for (app, action) in apps.search_actions(&query, MAX_ACTIONS) {
-            println!("action  {} \u{b7} {}", action.name, app.name);
+        // same order as the popup: actions naming their app, apps, then the other actions
+        let actions: Vec<String> = apps.search_actions(&query, MAX_ACTIONS).into_iter()
+            .map(|(app, action, named)| format!("{}action  {} \u{b7} {}", if named { "+" } else { "-" }, action.name, app.name))
+            .collect();
+        actions.iter().filter(|l| l.starts_with('+')).for_each(|l| println!("{}", &l[1..]));
+        let mut later = actions.iter().filter(|l| l.starts_with('-'));
+        let mut placed = false;
+        for (app, score, by_name) in apps.search(&query, MAX_APPS) {
+            if !by_name && !placed {
+                later.by_ref().for_each(|l| println!("{}", &l[1..]));
+                placed = true;
+            }
+            println!("{score:>6}  {}", app.name);
         }
-        for (app, score) in apps.search(&query, MAX_APPS) {
-            println!("{score:>6}  {}", app.name);        }
+        later.for_each(|l| println!("{}", &l[1..]));
         return glib::ExitCode::SUCCESS;
     }
 
@@ -917,18 +927,26 @@ fn refresh(ui: &Ui) {
     } else {
         // Fixed group order: app actions, apps, files, folders, file contents, web search,
         // Ask Claude. The web row is first only when nothing above it matches.
-        // Actions come first: they only match when the query names them ("brave tor").
+        // Actions above the apps only when the query also names their app ("brave tor",
+        // "claude chat"). One that matches on its own words alone ("chat" → Claude's New chat)
+        // comes after the apps matched by name (ChatGPT), but before keyword/loose guesses
+        // ("private" → private windows above "Print Editor").
         // The filter drops whole kinds; a narrowed filter gives each shown kind more room.
         let show = ui.filter.get();
         let roomy = show != SHOW_ALL;
         if show & SHOW_APPS != 0 {
-            for (app, action) in ui.apps.borrow().search_actions(query, MAX_ACTIONS) {
-                hits.push(action_hit(app, action));
+            let mut later = Vec::new();
+            for (app, action, names_app) in ui.apps.borrow().search_actions(query, MAX_ACTIONS) {
+                if names_app { hits.push(action_hit(app, action)) } else { later.push(action_hit(app, action)) }
             }
             let max_apps = if roomy { MAX_FILTERED } else { MAX_APPS };
-            for (app, _score) in ui.apps.borrow_mut().search(query, max_apps) {
+            for (app, _score, by_name) in ui.apps.borrow_mut().search(query, max_apps) {
+                if !by_name {
+                    hits.append(&mut later);
+                }
                 hits.push(app_hit(&app.info, &app.name));
             }
+            hits.append(&mut later);
         }
         // systemd services by name ("bluetooth"): selecting only selects; actions are on right-click.
         if show & SHOW_SERVICES != 0 {

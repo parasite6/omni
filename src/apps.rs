@@ -228,8 +228,10 @@ impl Apps {
         }
     }
 
-    /// Best matching apps for `query`, highest score first.
-    pub fn search(&mut self, query: &str, limit: usize) -> Vec<(&App, u32)> {
+    /// Best matching apps for `query`, highest score first. The bool: matched by its name
+    /// (every word starts a word of the name), not just a keyword or a loose guess; such apps
+    /// rank above app actions that the query names only by the action's own words.
+    pub fn search(&mut self, query: &str, limit: usize) -> Vec<(&App, u32, bool)> {
         let query_words = words(query);
         if query_words.is_empty() {
             return Vec::new();
@@ -256,7 +258,8 @@ impl Apps {
             let best = hits.iter().map(|h| h.2).max().unwrap_or(0);
             hits.retain(|h| h.2 * 2 >= best);
         }
-        let mut hits: Vec<(usize, u32)> = hits.into_iter().map(|(i, s, _)| (i, s)).collect();
+        let strong = 70 * query_words.len() as u32;
+        let mut hits: Vec<(usize, u32, bool)> = hits.into_iter().map(|(i, s, base)| (i, s, base >= strong)).collect();
 
         // Higher score first; on ties the shorter name is the closer match.
         hits.sort_by(|a, b| {
@@ -265,16 +268,18 @@ impl Apps {
                 .then(self.apps[a.0].name_lc.cmp(&self.apps[b.0].name_lc))
         });
         hits.truncate(limit);
-        hits.into_iter().map(|(i, s)| (&self.apps[i], s)).collect()
+        hits.into_iter().map(|(i, s, by_name)| (&self.apps[i], s, by_name)).collect()
     }
 
-    /// App actions the query names (see action_score), best first.
-    pub fn search_actions(&self, query: &str, limit: usize) -> Vec<(&App, &AppAction)> {
+    /// App actions the query names (see action_score), best first. The bool: the query also
+    /// names the action's app ("claude chat"), so it's wanted over other apps; a match on the
+    /// action's own words alone ("chat") ranks below the apps.
+    pub fn search_actions(&self, query: &str, limit: usize) -> Vec<(&App, &AppAction, bool)> {
         let query_words = words(query);
         if query_words.is_empty() {
             return Vec::new();
         }
-        let mut hits: Vec<(&App, &AppAction, u32)> = Vec::new();
+        let mut hits: Vec<(&App, &AppAction, u32, bool)> = Vec::new();
         for app in &self.apps {
             let app_words: Vec<String> = app.name_words.iter().chain(&app.extra_words).cloned().collect();
             let id = app.info.id().map(|i| i.to_string()).unwrap_or_default();
@@ -284,14 +289,14 @@ impl Apps {
                 bonus += DEFAULT_BROWSER_POINTS;
             }
             for action in &app.actions {
-                if let Some(s) = action_score(&app_words, &action.name_words, &action.keywords, &query_words) {
-                    hits.push((app, action, s + bonus));
+                if let Some((s, names_app)) = action_score(&app_words, &action.name_words, &action.keywords, &query_words) {
+                    hits.push((app, action, s + bonus, names_app));
                 }
             }
         }
         hits.sort_by(|a, b| b.2.cmp(&a.2).then(a.1.name.len().cmp(&b.1.name.len())));
         hits.truncate(limit);
-        hits.into_iter().map(|(app, action, _)| (app, action)).collect()
+        hits.into_iter().map(|(app, action, _, names_app)| (app, action, names_app)).collect()
     }
 
     /// The actions of an installed app (for its right-click menu).
@@ -407,8 +412,8 @@ fn edit_distance(a: &[u8], b: &[u8]) -> usize {
 /// Score an app action against the query words; None unless every word matches the app's
 /// name or the action, and at least one matches the action. Without the app's name in the
 /// query, an action needs a distinctive whole word ("incognito", "tor"), so typing "ne"
-/// doesn't list every app's "New window".
-fn action_score(app_words: &[String], action_words: &[String], keywords: &[String], query: &[String]) -> Option<u32> {
+/// doesn't list every app's "New window". Also returns whether the query named the app.
+fn action_score(app_words: &[String], action_words: &[String], keywords: &[String], query: &[String]) -> Option<(u32, bool)> {
     let (mut total, mut names_action, mut names_app, mut distinctive) = (0, false, false, false);
     for w in query {
         let generic = GENERIC_ACTION_WORDS.contains(&w.as_str());
@@ -429,7 +434,7 @@ fn action_score(app_words: &[String], action_words: &[String], keywords: &[Strin
             return None;
         };
     }
-    (names_action && (names_app || distinctive)).then_some(total)
+    (names_action && (names_app || distinctive)).then_some((total, names_app))
 }
 
 fn usage_path() -> PathBuf {
@@ -495,7 +500,7 @@ mod tests {
         let q = words(query);
         let mut hits: Vec<(u32, &str)> = brave()
             .iter()
-            .filter_map(|(id, a)| Some((action_score(&a.app, &a.name, &a.keywords, &q)?, *id)))
+            .filter_map(|(id, a)| Some((action_score(&a.app, &a.name, &a.keywords, &q)?.0, *id)))
             .collect();
         hits.sort_by(|a, b| b.0.cmp(&a.0));
         hits.into_iter().map(|(_, id)| id).collect()
