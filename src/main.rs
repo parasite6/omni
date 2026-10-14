@@ -1958,6 +1958,9 @@ fn run(ui: &Ui, action: Action) {
         display.clipboard().set_text(text);
     }
     let ctx = display.app_launch_context();
+    for (key, value) in util::missing_x11_env() {
+        ctx.setenv(key, value);
+    }
     hide(ui);
     match action {
         Action::Web(query) => ui.web.borrow().search(&query),

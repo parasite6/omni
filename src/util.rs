@@ -43,10 +43,44 @@ pub fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<Vec<u
     }
 }
 
+/// The session's X11 variables (DISPLAY, XAUTHORITY) when omni's own environment
+/// lacks them. omni starts at login, often before XWayland is up and has exported
+/// DISPLAY, so apps it launches would inherit no DISPLAY and X11 ones (Steam) die
+/// at once. The systemd user environment has them once XWayland is running.
+pub fn missing_x11_env() -> Vec<(String, String)> {
+    if std::env::var_os("DISPLAY").is_some() {
+        return Vec::new();
+    }
+    let Some(out) = output_with_timeout(
+        Command::new("systemctl").args(["--user", "show-environment"]),
+        Duration::from_secs(1),
+    ) else {
+        return Vec::new();
+    };
+    parse_x11_env(&String::from_utf8_lossy(&out))
+        .into_iter()
+        .filter(|(k, _)| std::env::var_os(k).is_none())
+        .collect()
+}
+
+fn parse_x11_env(env: &str) -> Vec<(String, String)> {
+    env.lines()
+        .filter_map(|l| l.split_once('='))
+        .filter(|(k, v)| matches!(*k, "DISPLAY" | "XAUTHORITY") && !v.is_empty())
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn picks_x11_vars_from_systemd_env() {
+        let env = "HOME=/home/u\nDISPLAY=:0\nWAYLAND_DISPLAY=wayland-1\nXAUTHORITY=\nPATH=/usr/bin\n";
+        assert_eq!(parse_x11_env(env), vec![("DISPLAY".to_string(), ":0".to_string())]);
+    }
 
     #[test]
     fn returns_output() {
