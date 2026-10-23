@@ -1,6 +1,8 @@
 //! Recently used files and folders, from GTK's shared list (~/.local/share/recently-used.xbel),
 //! the same one GNOME, Nautilus and file pickers write to.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gtk::gio;
@@ -66,7 +68,7 @@ pub fn record(file: &gio::File) {
     gtk::RecentManager::default().add_item(&file.uri());
 }
 
-/// "~/Documents/notes" style display of a file's folder.
+/// "~/Documents/notes" style display of a file's parent folder.
 pub fn folder_label(path: &std::path::Path) -> String {
     let parent = path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
     let home = gtk::glib::home_dir().to_string_lossy().to_string();
@@ -88,12 +90,53 @@ mod tests {
     }
 }
 
-/// Icon for a file from its name (no disk read), or the folder icon.
+thread_local! {
+    /// Themed icons keyed by MIME content-type (not per-path).
+    static MIME_ICONS: RefCell<HashMap<String, gio::Icon>> = RefCell::new(HashMap::new());
+}
+
+/// System theme icon for a file or folder at 28px (caller sets pixel size).
+/// Prefer `standard::icon` from Gio, then MIME-themed icon (cached), then generics.
 pub fn icon(path: &std::path::Path, is_dir: bool) -> gio::Icon {
     if is_dir {
         return gio::ThemedIcon::new("folder").upcast();
     }
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let (content_type, _) = gio::content_type_guess(Some(name.as_str()), None);
-    gio::content_type_get_icon(&content_type)
+    let file = gio::File::for_path(path);
+    if let Ok(info) = file.query_info(
+        "standard::icon,standard::content-type",
+        gio::FileQueryInfoFlags::NONE,
+        gio::Cancellable::NONE,
+    ) {
+        if let Some(icon) = info.icon() {
+            return icon;
+        }
+        if let Some(ct) = info.content_type() {
+            return mime_icon(&ct);
+        }
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let (ct, _) = gio::content_type_guess(Some(name.as_str()), None);
+    mime_icon(&ct)
+}
+
+fn mime_icon(content_type: &str) -> gio::Icon {
+    MIME_ICONS.with(|cache| {
+        if let Some(icon) = cache.borrow().get(content_type) {
+            return icon.clone();
+        }
+        let icon = gio::content_type_get_icon(content_type);
+        // content_type_get_icon always returns something; keep an explicit last resort.
+        let icon = if icon_is_empty(&icon) {
+            gio::ThemedIcon::new("text-x-generic").upcast()
+        } else {
+            icon
+        };
+        cache.borrow_mut().insert(content_type.to_string(), icon.clone());
+        icon
+    })
+}
+
+fn icon_is_empty(icon: &gio::Icon) -> bool {
+    icon.downcast_ref::<gio::ThemedIcon>()
+        .is_some_and(|t| t.names().is_empty())
 }

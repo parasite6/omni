@@ -354,7 +354,7 @@ impl Answer {
         inner.append(&header);
         inner.append(&stack);
 
-        // The ball's colour comes from CSS (`color:` on .omni-ball = omni cyan).
+        // The ball's colour comes from CSS (`color:` on .omni-ball = omni silver).
         let ball_state = Rc::new(RefCell::new(Ball::default()));
         let ball = gtk::DrawingArea::builder().can_target(false).build();
         ball.add_css_class("omni-ball");
@@ -1296,7 +1296,7 @@ impl Ball {
     }
 }
 
-/// A plain round 2D ball in omni's cyan, squashing along the direction it hit.
+/// A plain round 2D ball in omni's silver, squashing along the direction it hit.
 fn draw_ball(area: &gtk::DrawingArea, cr: &cairo::Context, ball: &Ball) {
     if ball.fresh {
         return; // not placed yet
@@ -1888,8 +1888,8 @@ fn safe_link(url: &str) -> bool {
 
 /// Monospace with a faint backdrop, for `code` and code blocks.
 const CODE_OPEN: &str = "<span font_family=\"monospace\" background=\"#ffffff\" bgalpha=\"10%\">";
-/// Quote bars, table dividers and rules: dim cyan.
-const QUOTE_BAR: &str = "#54dbed99";
+/// Quote bars, table dividers and rules: dim silver.
+const QUOTE_BAR: &str = "#c5c9ce99";
 
 /// While an answer is still arriving: drop an opening marker whose closing half hasn't
 /// come yet, so it doesn't flash as raw text (it's rendered once the rest arrives).

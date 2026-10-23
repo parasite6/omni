@@ -1,270 +1,331 @@
-/* omni — liquid glass launcher.
- * Own colour scheme: cyan and black, matching the search bar's living rim (ring.rs), not
- * the wallpaper palette. Text colour still comes from GTK's theme (@window_fg_color).
- * Override anything in ~/.config/omni/style.css. */
+/* omni — dense opaque launcher chrome.
+ * Tokens live here. Override in ~/.config/omni/style.css if needed.
+ * Keep --radius-panel in sync with glass::RADIUS.
+ */
 
-@define-color omni_cyan #54dbed;
-@define-color omni_on_cyan #04161a;
+@define-color omni_bg #1b1b1f;
+@define-color omni_text #e6e6ea;
+@define-color omni_text_secondary #8a8a93;
+@define-color omni_placeholder #6c6c75;
+@define-color omni_accent #7aa2f7;
+@define-color omni_border #ffffff;
+@define-color omni_hover #ffffff;
+@define-color omni_selected #ffffff;
+@define-color omni_divider #ffffff;
 @define-color omni_black #07090b;
-
-/* The blur behind the card is Hyprland's (layer rule for namespace "omni", which only
- * blurs pixels above 15% alpha). So: the card's tint stays above that, and its shadow
- * stays below it, otherwise the shadow gets a blurred halo. */
+@define-color omni_silver #7aa2f7;
+@define-color omni_on_silver #121416;
 
 window.omni {
   background: transparent;
+  font-family: system-ui, sans-serif;
+  --bg: @omni_bg;
+  --surface-hover: alpha(@omni_hover, 0.04);
+  --surface-selected: alpha(@omni_accent, 0.10);
+  --text-primary: @omni_text;
+  --text-secondary: @omni_text_secondary;
+  --text-placeholder: @omni_placeholder;
+  --divider: alpha(@omni_divider, 0.06);
+  --border: alpha(@omni_border, 0.08);
+  --accent: @omni_accent;
+  --radius-panel: 10px;
+  --radius-row: 8px;
+  --radius-menu: 10px;
+  --radius-menu-item: 6px;
+  --panel-width: 720px;
+  --header-height: 56px;
+  --row-height: 52px;
+  --row-padding-x: 18px;
+  --max-visible-rows: 7;
+  --footer-height: 32px;
+  --icon-size: 28px;
+  --search-icon-size: 20px;
+  --filter-item-height: 30px;
+  --accent-pill-width: 3px;
+  --accent-pill-height: 18px;
+  --accent-pill-radius: 2px;
+  --accent-pill-inset: 6px;
+  --motion-select: 140ms;
+  --motion-select-fade: 100ms;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 14px;
+  --space-5: 16px;
+  --shadow-menu: 0 8px 24px alpha(black, 0.40);
 }
 
-/* ---------- the glass card ---------- */
+/* ---------- panel (fully opaque; no blur) ---------- */
 
-/* Outer card: only the drop shadow. The blurred backdrop is drawn in code (glass.rs)
- * between this and .omni-glass. Radius must match glass::RADIUS. */
 .omni-card {
-  border-radius: 32px;
+  border-radius: 10px;
   background: transparent;
-  box-shadow:
-    0 18px 50px alpha(black, 0.35),
-    0 2px 10px alpha(black, 0.18);
+  box-shadow: none;
 }
 
-/* Padded content area (search bar, results, answer); the path strip sits outside it so it
- * can run edge to edge. */
+.omni-frame {
+  border-radius: 10px;
+  padding: 0;
+  background: transparent;
+}
+
 .omni-content {
   padding: 0;
 }
 
-/* Glass surface on top of the backdrop: tint, specular sheen, rim light, edge glow. */
 .omni-glass {
-  padding: 0;
-  border-radius: 32px;
-  background-color: alpha(@omni_black, 0.18);
-  background-image:
-    linear-gradient(155deg,
-      alpha(white, 0.18) 0%,
-      alpha(white, 0.05) 28%,
-      alpha(white, 0.00) 50%,
-      alpha(white, 0.00) 78%,
-      alpha(white, 0.06) 100%);
-  border: 1px solid alpha(white, 0.28);
-  box-shadow:
-    inset 0 1.5px 0 alpha(white, 0.60),
-    inset 0 -1px 0 alpha(white, 0.20),
-    inset 0 0 14px alpha(white, 0.10),
-    inset 0 0 2px alpha(white, 0.25);
+  padding: 8px 8px 0 8px;
+  border-radius: 10px;
+  background-color: @omni_bg;
+  background-image: none;
+  border: 1px solid alpha(@omni_border, 0.08);
+  box-shadow: none;
 }
 
-/* ---------- search bar ---------- */
+/* ---------- search header ---------- */
 
 .omni-bar {
-  border-spacing: 10px;
-}
-
-/* Glass "bubbles" inside the card share one recipe: faint fill, rim light, inner shade. */
-.omni-search,
-.omni-toggle {
-  min-height: 50px;
-  border-radius: 999px;
-  color: @window_fg_color;
-  background-color: alpha(white, 0.08);
-  background-image: linear-gradient(180deg, alpha(white, 0.10), alpha(white, 0.00) 60%);
-  border: 1px solid alpha(white, 0.18);
-  box-shadow:
-    inset 0 1px 0 alpha(white, 0.40),
-    inset 0 -1px 2px alpha(black, 0.12);
-  outline: none;
+  min-height: 56px;
+  height: 56px;
+  border-spacing: 8px;
+  margin: 0;
+  padding: 0 16px 0 18px;
+  border-bottom: 1px solid alpha(@omni_divider, 0.06);
 }
 
 .omni-search {
-  border-color: transparent; /* the rim is drawn by ring.rs */
-  padding: 0 18px;
-  font-size: 17px;
-  transition: border-color 220ms ease, box-shadow 220ms ease, background-color 220ms ease;
+  min-height: 56px;
+  padding: 0;
+  margin: 0;
+  border-radius: 0;
+  font-size: 18px;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: @omni_text;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
 }
 
 .omni-search:focus-within {
-  background-color: alpha(white, 0.10);
-  border-color: transparent;
-  box-shadow:
-    inset 0 1px 0 alpha(white, 0.30),
-    inset 0 -1px 2px alpha(black, 0.12);
+  background-color: transparent;
+  box-shadow: none;
 }
 
 .omni-search image {
-  color: alpha(@window_fg_color, 0.65);
+  color: @omni_text_secondary;
+  -gtk-icon-size: 20px;
 }
 
 .omni-search text placeholder {
-  color: alpha(@window_fg_color, 0.50);
+  color: @omni_placeholder;
 }
 
 .omni-search text selection {
-  background-color: alpha(@omni_cyan, 0.45);
+  background-color: alpha(@omni_accent, 0.35);
 }
 
-/* ---------- "Contents" toggle ---------- */
-
 .omni-toggle {
-  min-height: 38px;
-  padding: 0 14px;
-  font-weight: 600;
-  color: alpha(@window_fg_color, 0.80);
-  transition: all 260ms cubic-bezier(0.2, 0.9, 0.25, 1.35);
+  min-height: 28px;
+  min-width: 0;
+  padding: 0 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: @omni_text_secondary;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
 }
 
 .omni-toggle:hover {
-  background-color: alpha(white, 0.15);
-  color: @window_fg_color;
-  transform: scale(1.04);
-  box-shadow:
-    inset 0 1px 0 alpha(white, 0.55),
-    inset 0 -1px 2px alpha(black, 0.12),
-    0 6px 18px alpha(black, 0.18);
-}
-
-.omni-toggle:active {
-  transform: scale(0.94);
+  color: @omni_text;
+  background-color: alpha(@omni_hover, 0.04);
 }
 
 .omni-toggle:checked {
-  color: @omni_on_cyan;
-  background-color: alpha(@omni_cyan, 0.80);
-  background-image: linear-gradient(180deg, alpha(white, 0.30), alpha(white, 0.00) 65%);
-  border-color: alpha(white, 0.35);
-  box-shadow:
-    inset 0 1px 0 alpha(white, 0.65),
-    0 6px 22px alpha(@omni_cyan, 0.40);
+  color: @omni_accent;
+  background-color: alpha(@omni_accent, 0.12);
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}
+
+.omni-toggle:checked:hover {
+  color: @omni_accent;
+  background-color: alpha(@omni_accent, 0.16);
 }
 
 /* ---------- results ---------- */
 
-.omni-results {
-  background: transparent;
-  padding: 0 16px 16px 16px;
-}
-
-/* The card's padding lives on its parts, not on .omni-content: the result list scrolls
-   inside a viewport that clips, so the list reaches the card's edges and pads itself in.
-   A lifted row's bubble and shadow then pop out over the card's margin, not cut off. */
-.omni-bar {
-  margin: 16px;
+/* List widget: no toolkit selected-row / focus chrome — only .omni-selection paints. */
+list.omni-results,
+list.omni-results:hover,
+list.omni-results:active,
+list.omni-results:focus,
+list.omni-results:focus-within,
+list.omni-results:selected,
+list.omni-results:backdrop {
+  background-color: transparent;
+  background-image: none;
+  background: none;
+  padding: 4px 0 0 0;
+  margin: 0;
+  outline: none;
+  box-shadow: none;
+  border: none;
 }
 
 .omni-answer-wrap > * {
-  margin: 0 16px 16px 16px;
+  margin: 0 12px 12px 12px;
 }
 
-.omni-results row {
-  padding: 9px 12px;
-  margin: 3px 0;
-  border-radius: 20px;
+/* Rows stay fully transparent in every state — kill Adwaita list-row / activatable prelight. */
+list.omni-results > row,
+list.omni-results > row.activatable,
+list.omni-results > row:hover,
+list.omni-results > row.activatable:hover,
+list.omni-results > row:active,
+list.omni-results > row.activatable:active,
+list.omni-results > row:focus,
+list.omni-results > row:focus-visible,
+list.omni-results > row:selected,
+list.omni-results > row:selected:hover,
+list.omni-results > row:selected:focus,
+list.omni-results > row:selected:focus-visible,
+list.omni-results > row:backdrop,
+list.omni-results > row:disabled {
+  padding: 0 18px;
+  margin: 0;
+  min-height: 52px;
+  border-radius: 0;
+  overflow: hidden;
   background-color: transparent;
   background-image: none;
-  border: 1px solid transparent;
+  background: none;
+  border: none;
+  box-shadow: none;
   outline: none;
-  transition:
-    background-color 200ms ease,
-    border-color 200ms ease,
-    box-shadow 260ms ease,
-    transform 300ms cubic-bezier(0.2, 0.9, 0.25, 1.35);
 }
 
-/* Hovering lifts a row into its own little glass pane. */
-.omni-results row:hover {
-  background-color: alpha(white, 0.09);
-  background-image: linear-gradient(180deg, alpha(white, 0.08), alpha(white, 0.00) 70%);
-  border-color: alpha(white, 0.16);
-  box-shadow:
-    inset 0 1px 0 alpha(white, 0.30),
-    0 8px 22px alpha(black, 0.14);
-  transform: scale(1.015);
+/* Positioned at top:0 via overlay; motion is transform-only (no top/height/margin). */
+.omni-selection {
+  border-radius: 8px;
+  background-color: alpha(@omni_accent, 0.10);
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+  margin: 0;
+  transform-origin: top center;
+  will-change: transform;
+  transition: none; /* enabled from Rust for moves; off while snapping */
 }
 
-.omni-results row:selected {
-  background-color: alpha(@omni_cyan, 0.22);
-  background-image: linear-gradient(180deg, alpha(white, 0.14), alpha(white, 0.00) 70%);
-  border-color: alpha(@omni_cyan, 0.45);
-  box-shadow:
-    inset 0 1px 0 alpha(white, 0.40),
-    0 8px 24px alpha(@omni_cyan, 0.20);
+.omni-selection-pill {
+  min-width: 3px;
+  min-height: 18px;
+  margin: 0;
+  padding: 0;
+  border-radius: 2px;
+  background-color: @omni_accent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  transform-origin: top left;
+  will-change: transform;
+  transition: none;
 }
 
-.omni-results row:selected:hover {
-  transform: scale(1.015);
+@media (prefers-reduced-motion: reduce) {
+  list.omni-results > row {
+    transition: none;
+  }
 }
 
 .omni-results row image {
-  -gtk-icon-shadow: 0 3px 8px alpha(black, 0.30);
-  transition: transform 300ms cubic-bezier(0.2, 0.9, 0.25, 1.5);
-}
-
-.omni-results row:hover image,
-.omni-results row:selected image {
-  transform: scale(1.10);
+  -gtk-icon-shadow: none;
 }
 
 .omni-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: @window_fg_color;
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: @omni_text;
 }
 
 .omni-subtitle {
   font-size: 12px;
-  color: alpha(@window_fg_color, 0.62);
+  font-weight: 400;
+  letter-spacing: 0;
+  color: @omni_text_secondary;
 }
 
-.omni-results row:selected .omni-subtitle {
-  color: alpha(@window_fg_color, 0.80);
+.omni-content-badge {
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: @omni_text_secondary;
+  background-color: transparent;
+  border: 1px solid alpha(@omni_border, 0.12);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin: 0;
 }
 
-/* ---------- calculator: the result is the whole answer ---------- */
+/* ---------- calculator ---------- */
 
-/* Its own soft glass pane, tinted cyan; looks the same selected or not. */
-.omni-results row.omni-calc,
-.omni-results row.omni-calc:hover,
-.omni-results row.omni-calc:selected {
-  padding: 14px 20px 10px 20px;
-  border-radius: 24px;
-  background-color: alpha(@omni_cyan, 0.10);
-  background-image:
-    radial-gradient(circle at 15% 120%, alpha(@omni_cyan, 0.35), alpha(@omni_cyan, 0.00) 60%),
-    linear-gradient(135deg, alpha(white, 0.16) 0%, alpha(white, 0.03) 45%, alpha(@omni_cyan, 0.12) 100%);
-  border: 1px solid alpha(white, 0.22);
-  box-shadow:
-    inset 0 1px 0 alpha(white, 0.45),
-    inset 0 -1px 2px alpha(black, 0.10),
-    0 10px 30px alpha(@omni_cyan, 0.18);
-  transform: none;
+list.omni-results > row.omni-calc,
+list.omni-results > row.omni-calc:hover,
+list.omni-results > row.omni-calc:active,
+list.omni-results > row.omni-calc:selected,
+list.omni-results > row.omni-calc.activatable:hover {
+  padding: 0 18px;
+  border-radius: 0;
+  background-color: transparent;
+  background-image: none;
+  background: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
 }
 
 .omni-calc-expression {
-  font-size: 17px;
-  color: alpha(@window_fg_color, 0.60);
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: @omni_text_secondary;
 }
 
 .omni-calc-hint {
   font-size: 12px;
-  color: alpha(@window_fg_color, 0.45);
+  font-weight: 400;
+  color: @omni_placeholder;
 }
 
 .omni-calc-result {
-  font-size: 56px;
-  font-weight: 700;
-  letter-spacing: -1px;
-  color: @window_fg_color;
-  text-shadow: 0 2px 12px alpha(black, 0.25);
+  font-size: 22px;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: @omni_text;
+  text-shadow: none;
 }
 
 /* ---------- Claude answer ---------- */
 
 .omni-answer {
-  margin-top: 12px;
-  padding: 14px 16px;
-  border-radius: 22px;
-  background-color: alpha(white, 0.07);
-  background-image: linear-gradient(180deg, alpha(white, 0.08), alpha(white, 0.00) 60%);
-  border: 1px solid alpha(white, 0.16);
-  box-shadow: inset 0 1px 0 alpha(white, 0.30);
+  margin-top: 8px;
+  padding: 12px;
+  border-radius: 0;
+  background-color: alpha(white, 0.04);
+  background-image: none;
+  border: none;
+  box-shadow: none;
 }
 
 .omni-answer scrolledwindow,
@@ -273,12 +334,11 @@ window.omni {
 }
 
 .omni-answer-icon {
-  -gtk-icon-shadow: 0 1px 3px alpha(black, 0.30);
+  -gtk-icon-shadow: none;
 }
 
-/* Loading ball colour (drawn in code, reads this `color`). */
 .omni-ball {
-  color: @omni_cyan;
+  color: @omni_accent;
 }
 
 .omni-answer stack {
@@ -287,17 +347,19 @@ window.omni {
 
 .omni-answer-title {
   font-size: 12px;
-  font-weight: 600;
-  color: alpha(@window_fg_color, 0.70);
+  font-weight: 500;
+  letter-spacing: 0;
+  color: @omni_text_secondary;
 }
 
 .omni-answer-body {
-  font-size: 15px;
+  font-size: 14px;
+  font-weight: 400;
+  letter-spacing: 0;
   line-height: 1.35;
-  color: @window_fg_color;
+  color: @omni_text;
 }
 
-/* Selectable text: clicking it to select shouldn't draw a focus outline. */
 .omni-answer-body,
 .omni-answer-body:focus,
 .omni-answer-body:focus-visible,
@@ -306,324 +368,310 @@ window.omni {
 .omni-answer-question:focus-visible {
   outline: none;
   box-shadow: none;
-  caret-color: transparent; /* selectable labels otherwise show a text cursor when clicked */
+  caret-color: transparent;
 }
 
-/* Per-message copy buttons: small and quiet until hovered. */
 .omni-copy {
-  min-width: 26px;
-  min-height: 26px;
+  min-width: 28px;
+  min-height: 28px;
   padding: 0;
-  border-radius: 999px;
-  color: @window_fg_color;
+  border-radius: 0;
+  color: @omni_text;
   background: none;
+  border: none;
   box-shadow: none;
   opacity: 0.45;
-  transition: opacity 160ms ease, background-color 160ms ease;
 }
 
 .omni-copy:hover {
   opacity: 1;
-  background-color: alpha(white, 0.10);
+  background-color: alpha(@omni_hover, 0.04);
 }
 
 .omni-copy image {
   -gtk-icon-size: 14px;
 }
 
-/* Links in answers. */
 .omni-answer-body link {
-  color: @omni_cyan;
+  color: @omni_accent;
 }
 
 .omni-answer-body link:hover {
-  color: mix(@omni_cyan, white, 0.35);
+  color: mix(@omni_accent, white, 0.20);
 }
 
-/* The user's message above each answer: quieter than the answer, cyan-tinted. */
 .omni-answer-question {
   font-size: 13px;
-  font-weight: 600;
-  color: alpha(mix(@window_fg_color, @omni_cyan, 0.35), 0.80);
+  font-weight: 500;
+  letter-spacing: 0;
+  color: alpha(@omni_text, 0.80);
 }
 
-/* Follow-ups get room above, separating them from the previous answer. */
 .omni-answer-followup {
-  margin-top: 14px;
+  margin-top: 12px;
   padding-top: 12px;
-  border-top: 1px solid alpha(white, 0.10);
+  border-top: 1px solid alpha(@omni_divider, 0.06);
 }
 
 .omni-answer-body selection {
-  background-color: alpha(@omni_cyan, 0.45);
+  background-color: alpha(@omni_accent, 0.35);
 }
 
 .omni-answer-button {
   min-height: 28px;
   padding: 0 12px;
-  border-radius: 999px;
+  border-radius: 0;
   font-size: 12px;
-  color: @window_fg_color;
-  background-color: alpha(white, 0.08);
+  font-weight: 400;
+  letter-spacing: 0;
+  color: @omni_text;
+  background-color: alpha(@omni_hover, 0.04);
   background-image: none;
-  border: 1px solid alpha(white, 0.16);
-  box-shadow: inset 0 1px 0 alpha(white, 0.30);
-  transition: all 220ms cubic-bezier(0.2, 0.9, 0.25, 1.35);
+  border: none;
+  box-shadow: none;
 }
 
 .omni-answer-button:hover {
-  background-color: alpha(white, 0.16);
-  transform: scale(1.05);
+  background-color: alpha(@omni_hover, 0.06);
 }
 
 .omni-answer-button:active {
-  transform: scale(0.95);
+  background-color: alpha(@omni_selected, 0.08);
 }
 
-/* ---------- right-click menu on a file (Open / Open with) ---------- */
+/* ---------- menus ---------- */
 
-/* A separate surface, so it can't show the card's blurred backdrop: a warm, mostly opaque
- * glass pane instead (black mixed with a little cyan), with the card's sheen and rim. */
 .omni-menu {
   background: transparent;
   box-shadow: none;
 }
 
 .omni-menu > contents {
-  min-width: 230px;
-  padding: 7px;
-  border-radius: 20px;
-  background-color: alpha(mix(@omni_black, @omni_cyan, 0.10), 0.93);
-  background-image:
-    radial-gradient(circle at 0% 0%, alpha(@omni_cyan, 0.22), alpha(@omni_cyan, 0.00) 55%),
-    linear-gradient(160deg, alpha(white, 0.12) 0%, alpha(white, 0.02) 35%, alpha(white, 0.00) 70%, alpha(@omni_cyan, 0.08) 100%);
-  border: 1px solid alpha(white, 0.22);
-  box-shadow:
-    inset 0 1.5px 0 alpha(white, 0.45),
-    inset 0 -1px 0 alpha(white, 0.10),
-    inset 0 0 12px alpha(white, 0.06),
-    0 14px 36px alpha(black, 0.40),
-    0 4px 14px alpha(@omni_cyan, 0.12);
-  animation: omni-menu-in 200ms ease-out;
-}
-
-/* Drops open inside the popover's fixed-size surface (which has room for the shadow). */
-@keyframes omni-menu-in {
-  from { opacity: 0; transform: translateY(-12px) scale(0.95); }
-  to { opacity: 1; transform: none; }
+  min-width: 148px;
+  padding: 4px;
+  border-radius: 0;
+  background-color: @omni_bg;
+  background-image: none;
+  border: 1px solid alpha(@omni_border, 0.08);
+  box-shadow: none;
 }
 
 .omni-menu-item {
-  min-height: 36px;
-  padding: 0 12px;
-  border-radius: 14px;
-  color: @window_fg_color;
+  min-height: 28px;
+  padding: 0 8px;
+  border-radius: 0;
+  color: @omni_text;
   background: none;
-  border: 1px solid transparent;
+  border: none;
   box-shadow: none;
-  transition:
-    background-color 180ms ease,
-    border-color 180ms ease,
-    box-shadow 220ms ease,
-    transform 260ms cubic-bezier(0.2, 0.9, 0.25, 1.35);
+  transition: background-color 100ms ease;
 }
 
-/* Hover / keyboard focus: the same accent glass bubble as a selected result row. */
 .omni-menu-item:hover,
 .omni-menu-item:focus-visible {
-  background-color: alpha(@omni_cyan, 0.22);
-  background-image: linear-gradient(180deg, alpha(white, 0.14), alpha(white, 0.00) 70%);
-  border-color: alpha(@omni_cyan, 0.45);
-  box-shadow:
-    inset 0 1px 0 alpha(white, 0.35),
-    0 6px 18px alpha(@omni_cyan, 0.18);
-  transform: scale(1.02);
+  background-color: alpha(@omni_selected, 0.06);
+  border: none;
 }
 
 .omni-menu-item:active {
-  transform: scale(0.97);
+  background-color: alpha(@omni_selected, 0.08);
 }
 
 .omni-menu-item image {
-  -gtk-icon-shadow: 0 2px 6px alpha(black, 0.30);
+  -gtk-icon-shadow: none;
 }
 
 .omni-menu-detail {
-  font-size: 12px;
-  color: alpha(@window_fg_color, 0.50);
+  font-size: 11px;
+  font-weight: 400;
+  color: @omni_text_secondary;
 }
 
 .omni-menu separator {
   min-height: 1px;
-  margin: 6px 10px;
-  background-color: alpha(white, 0.12);
+  margin: 4px 6px;
+  background-color: alpha(@omni_divider, 0.06);
 }
 
 .omni-menu-header {
-  padding: 2px 12px 6px 12px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
-  color: alpha(@omni_cyan, 0.75);
+  padding: 6px 8px 2px 8px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: @omni_text_secondary;
 }
 
-/* ---------- full path of the hovered file/folder, attached to the card's bottom ---------- */
+/* ---------- path footer (flush to panel bottom; divider full width) ---------- */
 
 .omni-path {
-  padding: 10px 22px 14px 22px;
-  border-radius: 0 0 31px 31px;
-  font-size: 12px;
-  color: alpha(@window_fg_color, 0.85);
-  background-color: alpha(black, 0.14);
-  border-top: 1px solid alpha(white, 0.14);
-  box-shadow: inset 0 1px 0 alpha(white, 0.06);
+  min-height: 32px;
+  height: 32px;
+  margin: 0 -8px 0 -8px;
+  padding: 0 14px;
+  border-radius: 0 0 10px 10px;
+  border-top: 1px solid alpha(@omni_divider, 0.06);
+  background-color: transparent;
+  box-shadow: none;
+  opacity: 1;
 }
 
-/* Filter dropdown: exactly as wide as the filter button (set in main.rs). Neutral glass,
-   the same recipe as the search bubbles, not the tinted right-click menu. */
+.omni-path-text {
+  min-height: 32px;
+  padding: 0;
+  margin: 0;
+  font-size: 12px;
+  font-weight: 400;
+  letter-spacing: 0;
+  line-height: 32px;
+  color: @omni_text_secondary;
+  opacity: 1;
+  text-shadow: none;
+}
+
+.omni-filter-menu {
+  padding: 0;
+  margin: 0;
+}
+
 .omni-filter-menu > contents {
   min-width: 0;
   padding: 4px;
-  border-radius: 18px;
-  background-color: alpha(@omni_black, 0.82);
-  background-image: linear-gradient(180deg, alpha(white, 0.10), alpha(white, 0.02) 40%, alpha(white, 0.00) 70%, alpha(white, 0.04) 100%);
-  border: 1px solid alpha(white, 0.20);
-  box-shadow:
-    inset 0 1.5px 0 alpha(white, 0.40),
-    inset 0 -1px 0 alpha(white, 0.10),
-    inset 0 0 12px alpha(white, 0.05),
-    0 12px 30px alpha(black, 0.35);
+  margin: 0;
+  border-radius: 10px;
+  background-color: @omni_bg;
+  background-image: none;
+  border: 1px solid alpha(@omni_border, 0.08);
+  box-shadow: 0 8px 24px alpha(black, 0.40);
 }
 
 .omni-filter-menu .omni-menu-item {
-  min-height: 32px;
-  padding: 0 2px;
-  font-size: 13px; /* "Services" fits the button-wide menu */
+  min-height: 30px;
+  max-height: 30px;
+  padding: 0 14px;
+  margin: 0;
+  border-radius: 6px;
+  font-size: 13px;
   outline: none;
+  transition: background-color 100ms ease;
+}
+
+.omni-filter-menu .omni-menu-item label {
+  font-size: 13px;
+  line-height: 30px;
+  padding: 0;
+  margin: 0;
 }
 
 .omni-filter-menu .omni-menu-item:hover,
 .omni-filter-menu .omni-menu-item:focus-visible {
-  background-color: alpha(white, 0.10);
-  background-image: linear-gradient(180deg, alpha(white, 0.10), alpha(white, 0.00) 70%);
-  border-color: alpha(white, 0.16);
-  box-shadow: inset 0 1px 0 alpha(white, 0.25);
+  background-color: alpha(@omni_accent, 0.12);
+  background-image: none;
+  border: none;
+  box-shadow: none;
 }
 
-/* Picked kinds: a brighter glass bubble with a light touch of accent. */
 .omni-filter-menu .omni-menu-item.omni-filter-on {
-  color: @window_fg_color;
-  background-color: alpha(mix(white, @omni_cyan, 0.25), 0.18);
-  background-image: linear-gradient(180deg, alpha(white, 0.20), alpha(white, 0.00) 70%);
-  border-color: alpha(white, 0.28);
-  box-shadow: inset 0 1px 0 alpha(white, 0.45);
+  color: @omni_accent;
+  background-color: alpha(@omni_accent, 0.12);
+  background-image: none;
+  border: none;
+  box-shadow: none;
 }
 
-/* Link confirmation ("This will close Omni, continue?"): omni dims underneath, and the box
-   sits on top of it in the centre. */
+@media (prefers-reduced-motion: reduce) {
+  .omni-filter-menu .omni-menu-item {
+    transition: none;
+  }
+}
+
+/* ---------- confirm ---------- */
+
 .omni-scrim {
-  border-radius: 32px; /* the card's */
+  border-radius: 10px;
   background-color: alpha(black, 0.55);
-  animation: omni-fade-in 160ms ease-out;
 }
 
 .omni-confirm-box {
-  padding: 16px 18px 14px 18px;
-  border-radius: 22px;
-  background-color: alpha(mix(@omni_black, @omni_cyan, 0.06), 0.96);
-  background-image: linear-gradient(160deg, alpha(white, 0.10), alpha(white, 0.00) 60%);
-  border: 1px solid alpha(white, 0.20);
-  box-shadow:
-    inset 0 1.5px 0 alpha(white, 0.35),
-    0 18px 44px alpha(black, 0.55),
-    0 0 0 1px alpha(@omni_cyan, 0.08);
-  animation: omni-confirm-in 200ms ease-out;
-}
-
-@keyframes omni-fade-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
-@keyframes omni-confirm-in {
-  from { opacity: 0; transform: scale(0.94); }
-  to { opacity: 1; transform: none; }
+  padding: 16px;
+  border-radius: 0;
+  background-color: @omni_bg;
+  background-image: none;
+  border: 1px solid alpha(@omni_border, 0.08);
+  box-shadow: none;
 }
 
 .omni-confirm-text {
-  font-weight: 600;
-  color: @window_fg_color;
+  font-weight: 500;
+  letter-spacing: 0;
+  color: @omni_text;
 }
 
 .omni-confirm-link {
   font-size: 12px;
-  color: alpha(@omni_cyan, 0.85);
+  font-weight: 400;
+  color: @omni_accent;
 }
 
 .omni-confirm-yes {
-  background-color: alpha(@omni_cyan, 0.30);
-  border-color: alpha(@omni_cyan, 0.55);
+  background-color: alpha(@omni_accent, 0.20);
+  border: none;
 }
 
-/* Claude's model and effort dropdown: a normal-width menu (the filter one is button-wide). */
 .omni-model-menu > contents {
-  min-width: 170px;
-  padding: 6px;
+  min-width: 160px;
+  padding: 4px;
 }
 
 .omni-model-menu .omni-menu-item {
-  padding: 0 10px;
+  padding: 0 8px;
 }
 
 .omni-model-menu .omni-menu-header {
-  margin: 6px 8px 2px 8px;
+  margin: 2px 0 0 0;
 }
 
 .omni-model-chip {
   padding: 0 10px;
 }
 
-/* A service's status: monospace systemctl output. */
 .omni-status-body {
   font-family: monospace;
   font-size: 12px;
-  color: alpha(@window_fg_color, 0.90);
+  color: @omni_text;
 }
 
 .omni-status-hint {
   font-size: 11px;
-  color: alpha(@window_fg_color, 0.50);
+  font-weight: 400;
+  color: @omni_text_secondary;
 }
 
-/* Permission prompts: the command or path, whole and monospace. */
 .omni-confirm-code {
   font-family: monospace;
   font-size: 12px;
-  color: @window_fg_color;
-  padding: 6px 8px;
-  border-radius: 10px;
-  background-color: alpha(white, 0.06);
+  color: @omni_text;
+  padding: 8px;
+  border-radius: 0;
+  background-color: alpha(white, 0.04);
 }
 
-/* AgentMail tile in Claude's header: the white logo on black, with an Android-style badge. */
 .omni-mail {
-  min-width: 26px;
-  min-height: 26px;
+  min-width: 28px;
+  min-height: 28px;
   padding: 0;
-  border-radius: 8px;
+  border-radius: 0;
   background-color: #000000;
   background-image: none;
-  border: 1px solid alpha(white, 0.18);
-  box-shadow: inset 0 1px 0 alpha(white, 0.15);
-  margin: 4px 6px 0 0; /* room for the badge to overhang */
+  border: none;
+  box-shadow: none;
+  margin: 4px 6px 0 0;
 }
 
 .omni-mail:hover {
-  border-color: alpha(@omni_cyan, 0.60);
+  background-color: #111111;
 }
 
 .omni-mail-badge {
-  /* A true circle for 1-2 digits (equal width and height, no side padding). */
   min-width: 13px;
   min-height: 13px;
   padding: 0;
@@ -632,8 +680,9 @@ window.omni {
   background-color: #e5303f;
   color: white;
   font-size: 8px;
-  font-weight: 800;
-  box-shadow: 0 0 0 1.5px alpha(black, 0.6);
+  font-weight: 700;
+  letter-spacing: 0;
+  box-shadow: none;
 }
 
 .omni-mail-badge.omni-mail-warn {

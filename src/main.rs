@@ -14,8 +14,9 @@ mod web;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
 use gtk::{gdk, gio, glib};
@@ -49,24 +50,41 @@ const SHOW_ALL: u8 = SHOW_APPS | SHOW_FILES | SHOW_FOLDERS | SHOW_SERVICES;
 const OLD_SHOW_ALL: u8 = SHOW_APPS | SHOW_FILES | SHOW_FOLDERS;
 /// Services shown for a query (they only match by name, so few are enough).
 const MAX_SERVICES: usize = 3;
-const MAX_CONTENT: usize = 4;
+const MAX_CONTENT: usize = 50;
 const MAX_OPEN_WITH: usize = 10;
-/// File *contents* are searched once typing pauses this long (LocalSearch is slow; names,
-/// apps, web and Claude rows update on every keystroke).
-const CONTENT_DELAY: Duration = Duration::from_millis(700);
+/// File *contents* search debounce (names/apps stay immediate).
+const CONTENT_DELAY: Duration = Duration::from_millis(120);
+/// Reuse identical Contents results for this long.
+const CONTENT_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Flush streamed content hits to the UI at least this often.
+const CONTENT_BATCH: Duration = Duration::from_millis(50);
 /// Re-walk the disk this often (new files arrive in between via LocalSearch's events).
 const REWALK: Duration = Duration::from_secs(30 * 60);
 
-/// Card geometry on screen (logical px). The backdrop capture depends on it.
-const CARD_WIDTH: i32 = 680;
-const CARD_TOP: i32 = 180;
-/// Tallest the card can get (full result list + path strip); the backdrop capture covers
-/// this much, clamped to the bottom of the monitor.
+/// Card geometry on screen (logical px).
+const CARD_WIDTH: i32 = 720;
+const CARD_TOP: i32 = 160;
+/// Tallest the card can get; capture/fit clamps to the monitor.
 const CARD_MAX_HEIGHT: i32 = 2000;
 /// The card stops this far above the bottom of the screen; longer lists scroll inside it.
 const BOTTOM_GAP: i32 = 96;
-/// Card height that isn't the result list: padding, search bar, path strip room.
-const CARD_CHROME: i32 = 150;
+/// Non-list chrome: padding + header + path footer (must match style.css).
+const CARD_CHROME: i32 = 108;
+/// Result row height and how many fit before the list scrolls (style.css --row-height).
+const ROW_HEIGHT: i32 = 52;
+const MAX_VISIBLE_ROWS: i32 = 7;
+/// Selection highlight base height for scaleY (matches row height).
+const SEL_BASE_H: f64 = ROW_HEIGHT as f64;
+/// Accent pill size / inset (style.css .omni-selection-pill).
+const SEL_PILL_H: f64 = 18.0;
+const SEL_PILL_W: i32 = 3;
+const SEL_PILL_X: i32 = 6;
+/// Selection move timing (transform only).
+const SELECT_MOTION_MS: f64 = 120.0;
+/// Path footer strip (style.css .omni-path / .omni-path-text).
+const PATH_FOOTER_HEIGHT: i32 = 32;
+const PATH_FOOTER_PAD_X: f64 = 14.0;
+const PATH_ELLIPSIS: &str = "\u{2026}";
 
 /// What Enter does on a result row.
 #[derive(Clone)]
@@ -92,16 +110,86 @@ enum Action {
     ServiceStatus(services::Service),
     /// Pin (true) or unpin an app on the quickshell dock, by desktop id.
     DockPin(String, bool),
+    /// Informational row (Contents empty / unavailable); not activatable.
+    Info,
+}
+
+/// How a file row matched the query (Contents mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatchType {
+    Name,
+    Content,
+    Both,
 }
 
 struct Hit {
     title: String,
     subtitle: String,
+    /// When true, `subtitle` is Pango markup (accent-highlighted snippet).
+    subtitle_markup: bool,
     icon: Option<gio::Icon>,
     action: Action,
-    /// A file (not a folder): right-click / Menu key opens Open and Open with.
+    /// A file: right-click / Menu key opens Open and Open with. Folders use the same
+    /// flag as false and get a smaller Open / containing-folder / copy-path menu.
     /// (App rows always have a menu: Open and the app's actions.)
     file_menu: bool,
+    /// Set for file/folder rows when Contents can classify the match.
+    match_type: Option<MatchType>,
+}
+
+/// Cache identity: search text + optional directory scope (Contents on).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContentKey {
+    query: String,
+    /// Canonical directory path string, or empty when unscoped.
+    scope: String,
+}
+
+impl ContentKey {
+    fn new(query: &str, scope: Option<&std::path::Path>) -> Self {
+        Self {
+            query: query.to_string(),
+            scope: scope.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+        }
+    }
+
+    fn scope_path(&self) -> Option<PathBuf> {
+        (!self.scope.is_empty()).then(|| PathBuf::from(&self.scope))
+    }
+}
+
+/// One contents hit: path plus optional subtitle snippet (filled lazily).
+struct ContentHit {
+    path: PathBuf,
+    snippet: Option<String>,
+}
+
+/// In-memory Contents results. Old hits stay visible until the new request's first batch.
+enum ContentCache {
+    Idle,
+    Failed { key: ContentKey, message: String },
+    Active {
+        /// Key of the hits currently shown.
+        key: ContentKey,
+        hits: Vec<ContentHit>,
+        searching: bool,
+        /// In-flight key when it differs from `key` (keep showing old hits until first batch).
+        pending_key: Option<ContentKey>,
+        /// When `searching` last became false (TTL cache).
+        ready_at: Option<Instant>,
+    },
+}
+
+impl Default for ContentCache {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+impl ContentCache {
+    fn searching(&self) -> bool {
+        matches!(self, Self::Active { searching: true, .. })
+    }
 }
 
 struct Ui {
@@ -110,10 +198,38 @@ struct Ui {
     entry: gtk::SearchEntry,
     list: gtk::ListBox,
     list_scroll: gtk::ScrolledWindow,
+    list_overlay: gtk::Overlay,
+    /// Floating selection fill (translateY + scaleY); sibling of the pill, not its parent.
+    selection_fill: gtk::Box,
+    /// Accent pill (translateY only; fixed 18px height).
+    selection_pill: gtk::Box,
+    /// CSS providers: transform values vs transition on/off (separate so snap can gate transition).
+    sel_transform_css: gtk::CssProvider,
+    sel_transition_css: gtk::CssProvider,
+    /// Owned selection: always valid while `hits` is non-empty (0..count). Not GTK focus.
+    selected_index: Cell<usize>,
+    /// Current highlight geometry (logical; driven through CSS transform, not layout).
+    sel_y: Cell<f64>,
+    sel_h: Cell<f64>,
+    /// Cached per-row (y, height) in overlay coords — measured only on list/layout updates.
+    row_geom: RefCell<Vec<(f64, f64)>>,
+    /// Snap path (results update / resize): transition disabled until next frame.
+    is_snapping: Cell<bool>,
+    /// Transition CSS currently enabled for selection chrome.
+    sel_transition_on: Cell<bool>,
+    /// True between list rebuild and deferred post-layout snap (skip resize snap).
+    sel_layout_pending: Cell<bool>,
+    /// Last pointer position for hover — ignore synthetic moves when the cursor is still.
+    hover_pointer: Cell<(f64, f64)>,
+    /// Coalesce hover selection updates to one per frame.
+    hover_frame_pending: Cell<bool>,
+    hover_pending_index: Cell<Option<usize>>,
     reveal: gtk::Revealer,
     apps: RefCell<apps::Apps>,
     web: RefCell<web::Engine>,
     hits: RefCell<Vec<Hit>>,
+    /// Parallel to list row order — keys for reuse without unsafe widget data.
+    row_keys: RefCell<Vec<String>>,
     answer: Rc<answer::Answer>,
     answer_reveal: gtk::Revealer,
     /// Self-reference for callbacks that outlive a borrow (content search results).
@@ -127,19 +243,26 @@ struct Ui {
     /// Filter dropdown button and which kinds it shows (SHOW_* bits).
     filter_button: gtk::Button,
     filter: Cell<u8>,
-    /// Contents results and the query they belong to.
-    content: RefCell<(String, Vec<PathBuf>)>,
+    /// Contents (full-text) search cache; invalidated when the toggle flips or the query changes.
+    content: RefCell<ContentCache>,
     content_gen: Cell<u64>,
+    /// Cancel flag for the in-flight Contents backends (ripgrep + drop stale batches).
+    content_cancel: RefCell<Arc<AtomicBool>>,
+    /// Live ripgrep child so a newer query can kill it immediately.
+    content_rg: Arc<Mutex<Option<std::process::Child>>>,
     path_reveal: gtk::Revealer,
+    path_box: gtk::Box,
     path_label: gtk::Label,
+    /// Full (untruncated) path for the selected row; display is derived + cached.
+    path_full: RefCell<String>,
+    /// Cache key (full path, footer content width) → displayed truncated string.
+    path_trunc_cache: RefCell<Option<(String, i32, String)>>,
     /// Bumped on every hover change, so a delayed "hide" doesn't undo a newer hover.
     hover_gen: Cell<u64>,
     /// Query the list was last built for (to keep the selection when results fill in).
     shown_query: RefCell<String>,
     /// Heartbeat timer for the watchdog; runs only while the popup is open.
     heartbeat: RefCell<Option<glib::SourceId>>,
-    /// The user moved the selection with the arrow keys for this query.
-    user_moved: Cell<bool>,
     /// In a conversation with Claude: the search bar is the reply box, typing doesn't search.
     chatting: Cell<bool>,
     /// Confirmation layer over the card: its question, detail line, and what Yes does.
@@ -473,6 +596,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .tooltip_text("Also match text inside files (Ctrl+T)")
         .css_classes(["omni-toggle"])
         .valign(gtk::Align::Center)
+        .focus_on_click(false)
         .build();
 
     let filter_label = gtk::Label::new(Some("All"));
@@ -485,11 +609,12 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .tooltip_text("Show only some kinds of results (Ctrl+F)")
         .css_classes(["omni-toggle", "omni-filter"])
         .valign(gtk::Align::Center)
+        .focus_on_click(false)
         .build();
 
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     bar.add_css_class("omni-bar");
-    // The entry wears a living cyan/black rim (ring.rs) drawn over its edge.
+    // Overlay kept for layout stability; SearchRing currently draws nothing (flat search).
     let search = gtk::Overlay::builder().child(&entry).hexpand(true).build();
     search.add_overlay(&ring::SearchRing::new());
     bar.append(&search);
@@ -497,8 +622,42 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     bar.append(&contents);
 
     let list = gtk::ListBox::new();
-    list.set_selection_mode(gtk::SelectionMode::Browse);
+    // Selection is owned by Ui::selected_index — GTK must not clear it on outside clicks.
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.set_can_focus(false); // keep keyboard focus on the search field
     list.add_css_class("omni-results");
+
+    // Floating selection chrome: fill + pill are overlay siblings so scaleY on the fill
+    // never scales the pill. Both sit at top:0; motion is CSS transform only.
+    let selection_fill = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    selection_fill.add_css_class("omni-selection");
+    selection_fill.set_can_target(false);
+    selection_fill.set_can_focus(false);
+    selection_fill.set_visible(false);
+    let selection_pill = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    selection_pill.add_css_class("omni-selection-pill");
+    selection_pill.set_can_target(false);
+    selection_pill.set_can_focus(false);
+    selection_pill.set_visible(false);
+    selection_pill.set_size_request(SEL_PILL_W, SEL_PILL_H as i32);
+
+    let sel_transform_css = gtk::CssProvider::new();
+    let sel_transition_css = gtk::CssProvider::new();
+    let display = gdk::Display::default().expect("no display");
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &sel_transition_css,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 2,
+    );
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &sel_transform_css,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 3,
+    );
+
+    let list_overlay = gtk::Overlay::builder().child(&list).build();
+    list_overlay.add_overlay(&selection_fill);
+    list_overlay.add_overlay(&selection_pill);
 
     // Results slide open below the search bar as soon as there is something to show.
     // Long lists scroll inside the card instead of running off the screen (height capped
@@ -508,8 +667,8 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         // Scrolls (wheel, keys, selection) but never shows a scrollbar.
         .vscrollbar_policy(gtk::PolicyType::External)
         .propagate_natural_height(true)
-        .max_content_height(600)
-        .child(&list)
+        .max_content_height(MAX_VISIBLE_ROWS * ROW_HEIGHT)
+        .child(&list_overlay)
         .build();
     let reveal = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::SlideDown)
@@ -517,8 +676,8 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .child(&list_scroll)
         .build();
 
-    // Card = blurred backdrop (drawn by GlassCard) + tinted glass surface + content.
-    // Glass surface = padded content + a path strip attached edge to edge at the bottom.
+    // Card = blurred backdrop (GlassCard) + metal frame + glass face + content.
+    // Face = content + path strip edge-to-edge inside the frame (mockup vessel).
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.add_css_class("omni-content");
     content.append(&bar);
@@ -575,21 +734,33 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     status_reveal.add_css_class("omni-answer-wrap");
     content.append(&status_reveal);
 
-    // Full path of the hovered file/folder: wraps to the card's width, grows downward.
+    // Footer: full path of the selected result (rows keep a shortened secondary).
+    // Truncation is measured manually — no toolkit ellipsize / max-chars (those cut early).
     let path_label = gtk::Label::builder()
         .xalign(0.0)
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
-        .max_width_chars(1)
+        .ellipsize(gtk::pango::EllipsizeMode::None)
+        .single_line_mode(true)
         .hexpand(true)
+        .halign(gtk::Align::Fill)
         .build();
-    path_label.add_css_class("omni-path");
+    path_label.add_css_class("omni-path-text");
+    let path_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    path_box.add_css_class("omni-path");
+    path_box.set_hexpand(true);
+    path_box.set_valign(gtk::Align::Center);
+    path_box.set_size_request(-1, PATH_FOOTER_HEIGHT);
+    path_box.append(&path_label);
     let path_reveal = gtk::Revealer::builder()
-        .transition_type(gtk::RevealerTransitionType::SlideDown)
-        .transition_duration(160)
-        .child(&path_label)
+        .transition_type(gtk::RevealerTransitionType::None)
+        .transition_duration(0)
+        .reveal_child(false)
+        .child(&path_box)
         .build();
     surface.append(&path_reveal);
+
+    let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    frame.add_css_class("omni-frame");
+    frame.append(&surface);
 
     let card = glass::GlassCard::new();
     card.add_css_class("omni-card");
@@ -637,7 +808,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     confirm.append(&confirm_box);
     confirm_box.set_vexpand(true);
     confirm.set_visible(false);
-    let layers = gtk::Overlay::builder().child(&surface).build();
+    let layers = gtk::Overlay::builder().child(&frame).build();
     layers.add_overlay(&confirm);
     card.append(&layers);
     window.set_child(Some(&card));
@@ -648,10 +819,26 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         entry: entry.clone(),
         list: list.clone(),
         list_scroll: list_scroll.clone(),
+        list_overlay: list_overlay.clone(),
+        selection_fill: selection_fill.clone(),
+        selection_pill: selection_pill.clone(),
+        sel_transform_css,
+        sel_transition_css,
+        selected_index: Cell::new(0),
+        sel_y: Cell::new(0.0),
+        sel_h: Cell::new(SEL_BASE_H),
+        row_geom: RefCell::default(),
+        is_snapping: Cell::new(true),
+        sel_transition_on: Cell::new(false),
+        sel_layout_pending: Cell::new(false),
+        hover_pointer: Cell::new((f64::NAN, f64::NAN)),
+        hover_frame_pending: Cell::new(false),
+        hover_pending_index: Cell::new(None),
         reveal: reveal.clone(),
         apps: RefCell::new(apps::Apps::load()),
         web: RefCell::new(web::Engine::detect()),
         hits: RefCell::default(),
+        row_keys: RefCell::default(),
         answer,
         answer_reveal,
         me: RefCell::default(),
@@ -663,12 +850,16 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         filter: Cell::new(load_filter_setting()),
         content: RefCell::default(),
         content_gen: Cell::new(0),
+        content_cancel: RefCell::new(Arc::new(AtomicBool::new(false))),
+        content_rg: Arc::new(Mutex::new(None)),
         path_reveal: path_reveal.clone(),
+        path_box: path_box.clone(),
         path_label: path_label.clone(),
+        path_full: RefCell::default(),
+        path_trunc_cache: RefCell::default(),
         hover_gen: Cell::new(0),
         shown_query: RefCell::default(),
         heartbeat: RefCell::default(),
-        user_moved: Cell::new(false),
         menu: RefCell::default(),
         chatting: Cell::new(false),
         confirm: confirm.clone(),
@@ -691,6 +882,12 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         status_gen: Cell::new(0),
     });
     *ui.me.borrow_mut() = Rc::downgrade(&ui);
+
+    // Re-measure footer truncation whenever the strip's width changes.
+    let u = ui.clone();
+    ui.path_box.connect_notify_local(Some("width"), move |_, _| {
+        apply_path_display(&u);
+    });
 
     let u = ui.clone();
     confirm_yes.connect_clicked(move |_| finish_confirm(&u, Answered::Yes));
@@ -742,20 +939,39 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     watchdog::start();
     connect_localsearch(&ui);
 
-    // Contents toggle: remembered between opens; flipping it re-runs the search.
+    // Contents toggle: remembered between opens; flipping it invalidates cache and re-runs.
+    // Defer all side effects to idle so the ToggleButton gesture can finish (sync refresh
+    // + CSS snaps from inside `toggled` froze the control).
     contents.set_active(load_contents_setting());
     let u = ui.clone();
     contents.connect_toggled(move |b| {
-        save_contents_setting(b.is_active());
-        if !u.answer_reveal.reveals_child() {
-            refresh(&u); // not while Claude's answer is showing: that would cancel it
-        }
+        let on = b.is_active();
+        save_contents_setting(on);
+        invalidate_content_cache(&u);
+        contents_log(format!("toggle → {on}; cache cleared"));
+        let u = u.clone();
+        glib::idle_add_local_once(move || {
+            if u.answer_reveal.reveals_child() {
+                return;
+            }
+            let q = u.entry.text();
+            let q = q.trim().to_string();
+            let (search_q, scope) = content_search_args(&q);
+            if on && !search_q.is_empty() {
+                start_content_search(&u, &search_q, scope.as_deref(), Instant::now());
+            }
+            refresh(&u);
+            u.entry.grab_focus();
+        });
     });
 
     // Filter dropdown: remembered between opens.
     filter_label.set_label(&filter_name(ui.filter.get()));
     let u = ui.clone();
-    filter_button.connect_clicked(move |_| show_filter_menu(&u, false));
+    filter_button.connect_clicked(move |_| {
+        show_filter_menu(&u, false);
+        u.entry.grab_focus();
+    });
 
     // Re-read apps when something is installed or removed. GIO stops sending "changed"
     // once the last reference to the monitor is gone, so it is kept for the process.
@@ -772,37 +988,210 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     std::mem::forget(app_monitor);
 
     let u = ui.clone();
-    entry.connect_search_changed(move |_| refresh(&u));
+    entry.connect_search_changed(move |_| {
+        // Typing with a menu open: dismiss first (launcher feel), then refresh.
+        if u.menu.borrow().is_some() {
+            dismiss_menu(&u);
+        }
+        refresh(&u);
+    });
 
     let u = ui.clone();
     entry.connect_activate(move |_| {
+        if u.menu.borrow().is_some() {
+            return; // menu layer owns Enter; don't activate the selected row
+        }
         if u.chatting.get() {
             return send_reply(&u);
         }
         if u.answer_reveal.reveals_child() || u.status_reveal.reveals_child() {
             return; // answer or status showing: Enter has nothing to pick
         }
-        let row = u.list.selected_row().or_else(|| u.list.row_at_index(0));
-        if let Some(row) = row {
-            activate(&u, row.index() as usize);
+        if !u.hits.borrow().is_empty() {
+            activate(&u, u.selected_index.get());
         }
     });
 
     // Act on the next idle tick: activating rebuilds this list, which shouldn't happen
-    // inside the list's own signal.
+    // inside the list's own signal. Capture the row widget so a refresh that rebuilds
+    // the list before idle runs can't activate a stale index.
     let u = ui.clone();
     list.connect_row_activated(move |_, row| {
-        let (u, index) = (u.clone(), row.index() as usize);
-        glib::idle_add_local_once(move || activate(&u, index));
+        if u.menu.borrow().is_some() {
+            return;
+        }
+        let index = row.index() as usize;
+        set_selected_index(&u, index, false);
+        let (u, row) = (u.clone(), row.clone());
+        glib::idle_add_local_once(move || {
+            if u.list.row_at_index(row.index()).as_ref() != Some(&row) {
+                return;
+            }
+            activate(&u, index);
+        });
     });
+
+    // Hover moves selection (same chrome as keyboard); leaving the list keeps the last index.
+    // Throttle to one update per frame; ignore still-cursor synthetics and same-row noise.
+    let hover = gtk::EventControllerMotion::new();
+    let u = ui.clone();
+    hover.connect_motion(move |_, x, y| {
+        if u.menu.borrow().is_some() {
+            return;
+        }
+        let (px, py) = u.hover_pointer.get();
+        if px.is_finite() && py.is_finite() && (px - x).abs() < 0.5 && (py - y).abs() < 0.5 {
+            return;
+        }
+        u.hover_pointer.set((x, y));
+        let Some(row) = u.list.row_at_y(y as i32) else {
+            return;
+        };
+        let index = row.index() as usize;
+        if index == u.selected_index.get() {
+            return;
+        }
+        u.hover_pending_index.set(Some(index));
+        if u.hover_frame_pending.replace(true) {
+            return;
+        }
+        let weak = u.me.borrow().clone();
+        u.list_overlay.add_tick_callback(move |_, _| {
+            let Some(ui) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            ui.hover_frame_pending.set(false);
+            if let Some(idx) = ui.hover_pending_index.take() {
+                if idx != ui.selected_index.get() {
+                    set_selected_index(&ui, idx, true);
+                }
+            }
+            glib::ControlFlow::Break
+        });
+    });
+    list.add_controller(hover);
+
+    // Layout slot is always top:0 with fixed sizes — transforms drive the visible move.
+    ui.list_overlay.connect_get_child_position(move |overlay, widget| {
+        let w = overlay.width().max(1);
+        if widget.has_css_class("omni-selection") {
+            return Some(gdk::Rectangle::new(0, 0, w, SEL_BASE_H as i32));
+        }
+        if widget.has_css_class("omni-selection-pill") {
+            return Some(gdk::Rectangle::new(SEL_PILL_X, 0, SEL_PILL_W, SEL_PILL_H as i32));
+        }
+        None
+    });
+
+    // Overlay-local row geometry is unchanged by scroll; don't touch chrome (avoids snap stutter).
+    let u = ui.clone();
+    ui.list_overlay.connect_map(move |_| {
+        cache_row_geometry(&u);
+        snap_selection_chrome(&u);
+    });
+    // Resize only — skip duplicate notifies and never snap while CSS from the last snap
+    // is still settling (that loop froze the whole UI, including the Contents toggle).
+    let overlay_wh = Cell::new((0i32, 0i32));
+    for prop in ["width", "height"] {
+        let u = ui.clone();
+        let overlay_wh = overlay_wh.clone();
+        ui.list_overlay.connect_notify_local(Some(prop), move |overlay, _| {
+            if u.is_snapping.get() || u.sel_layout_pending.get() {
+                return;
+            }
+            let wh = (overlay.width(), overlay.height());
+            if overlay_wh.replace(wh) == wh {
+                return;
+            }
+            cache_row_geometry(&u);
+            snap_selection_chrome(&u);
+        });
+    }
+    let u = ui.clone();
+    ui.list.connect_notify_local(Some("scale-factor"), move |_, _| {
+        if u.is_snapping.get() || u.sel_layout_pending.get() {
+            return;
+        }
+        cache_row_geometry(&u);
+        snap_selection_chrome(&u);
+    });
+
+    // Right-click on the window (capture). Menus use autohide=false so GTK/Wayland
+    // don't take a pointer grab that leaves the next click at the same point dead
+    // until the cursor moves. We dismiss ourselves on a second right-click or a
+    // primary click outside the menu.
+    let right_click = gtk::EventControllerLegacy::new();
+    right_click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let u = ui.clone();
+    right_click.connect_event(move |_, event| {
+        let Some(button) = event.downcast_ref::<gdk::ButtonEvent>() else {
+            return glib::Propagation::Proceed;
+        };
+        if event.event_type() != gdk::EventType::ButtonPress {
+            return glib::Propagation::Proceed;
+        }
+        let Some((x, y)) = event.position() else {
+            return glib::Propagation::Proceed;
+        };
+        let secondary = button.button() == gdk::BUTTON_SECONDARY;
+        let primary = button.button() == gdk::BUTTON_PRIMARY;
+
+        if u.menu.borrow().is_some() {
+            if secondary || (primary && !click_inside_menu(&u, x, y)) {
+                // Menu is a layer: outside click dismisses only — don't activate
+                // the list row (or anything else) underneath.
+                dismiss_menu(&u);
+                return glib::Propagation::Stop;
+            }
+            // Primary inside the menu: let the menu item handle it.
+            return glib::Propagation::Proceed;
+        }
+
+        if !secondary {
+            return glib::Propagation::Proceed;
+        }
+        let Some((index, at)) = row_menu_target(&u, x, y) else {
+            return glib::Propagation::Proceed;
+        };
+        if open_row_menu(&u, index, Some(at)) {
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(right_click);
 
     // Esc hides, ↑/↓ move through results while typing stays in the entry, Ctrl+T flips Contents.
     let keys = gtk::EventControllerKey::new();
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     let u = ui.clone();
     keys.connect_key_pressed(move |_, key, _, mods| {
+        // Menu is a layer: Esc dismisses it (don't hide the window); Enter activates the
+        // focused menu item if any, else dismisses. Don't fall through to row activate.
         if u.menu.borrow().is_some() {
-            return glib::Propagation::Proceed;
+            match key {
+                gdk::Key::Escape => {
+                    dismiss_menu(&u);
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::Return | gdk::Key::KP_Enter => {
+                    if let Some(focused) =
+                        gtk::prelude::GtkWindowExt::focus(&u.window).and_downcast::<gtk::Button>()
+                    {
+                        focused.emit_clicked();
+                    } else {
+                        dismiss_menu(&u);
+                    }
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::Menu => return glib::Propagation::Stop,
+                gdk::Key::F10 if mods.contains(gdk::ModifierType::SHIFT_MASK) => {
+                    return glib::Propagation::Stop;
+                }
+                // ↑/↓ Proceed so filter/model menus can move focus; we never reach
+                // move_selection while the menu is open.
+                _ => return glib::Propagation::Proceed,
+            }
         }
         // Link confirmation up: Esc = No, Enter = Yes, Tab moves between them.
         if u.confirm.is_visible() {
@@ -848,8 +1237,8 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
             }
             gdk::Key::Down => move_selection(&u, 1),
             gdk::Key::Up => move_selection(&u, -1),
-            gdk::Key::t if mods.contains(gdk::ModifierType::CONTROL_MASK) => {
-                contents.set_active(!contents.is_active())
+            gdk::Key::t | gdk::Key::T if mods.contains(gdk::ModifierType::CONTROL_MASK) => {
+                u.contents.set_active(!u.contents.is_active());
             }
             gdk::Key::f if mods.contains(gdk::ModifierType::CONTROL_MASK) => show_filter_menu(&u, true),
             _ => return glib::Propagation::Proceed,
@@ -881,9 +1270,10 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     });
     window.add_controller(scroll);
 
-    // Click anywhere outside the card closes the popup.
+    // Primary click outside the card closes the popup. (Not button 0 — that also
+    // claimed right-clicks and fought the context menu.)
     let click = gtk::GestureClick::new();
-    click.set_button(0);
+    click.set_button(gdk::BUTTON_PRIMARY);
     let u = ui.clone();
     click.connect_pressed(move |_, _, x, y| {
         if u.menu.borrow().is_some() {
@@ -922,8 +1312,14 @@ fn refresh(ui: &Ui) {
         hits.push(calc);
     } else if let Some((dir, inner)) = parse_scope(query) {
         // Don't require dir.is_dir(): ~/music must scope when the folder is ~/Music.
-        // files::search matches the directory case-insensitively.
+        // Name search and Contents FTS are independent filters (OR for match kind, AND scope).
         hits = scoped_hits(ui, &dir, inner);
+        let show = ui.filter.get();
+        if ui.contents.is_active() && show & SHOW_FILES != 0 && !inner.is_empty() {
+            merge_content_hits(ui, inner, Some(dir.as_path()), &mut hits);
+            sort_file_hits_by_match_type(&mut hits);
+            promote_content_matches(&mut hits);
+        }
     } else {
         // Fixed group order: app actions, apps, files, folders, file contents, web search,
         // Ask Claude. The web row is first only when nothing above it matches.
@@ -968,84 +1364,410 @@ fn refresh(ui: &Ui) {
         // A matching home folder (~/Documents, ...) goes above the files; other folders
         // keep their place after them.
         let (home_dirs, other_dirs): (Vec<_>, Vec<_>) = dir_hits.into_iter().partition(|h| h.home_folder);
-        let mut shown: Vec<PathBuf> = Vec::new();
         for h in home_dirs.into_iter().chain(file_hits).chain(other_dirs) {
-            hits.push(file_hit(&h.path, h.is_dir, None));
-            shown.push(h.path);
+            hits.push(file_hit(&h.path, h.is_dir, MatchType::Name, None, query));
         }
-        // File contents (LocalSearch, slow): once typing pauses, then slotted in.
+        // File contents (LocalSearch FTS + ripgrep for git trees): merge with name hits.
         if ui.contents.is_active() && show & SHOW_FILES != 0 {
-            let content = ui.content.borrow();
-            if content.0 == query {
-                for p in content.1.iter().filter(|p| !shown.contains(p)) {
-                    hits.push(file_hit(p, false, Some(query)));
-                }
-            } else {
-                drop(content);
-                schedule_content_search(ui, query);
-            }
+            merge_content_hits(ui, query, None, &mut hits);
+            sort_file_hits_by_match_type(&mut hits);
+            promote_content_matches(&mut hits);
+        } else {
+            sort_file_hits_by_match_type(&mut hits);
         }
         hits.push(web_hit(ui, query));
         hits.extend(claude_hit(ui, query));
     }
 
-    // Same query, results filling in: if the user picked a row with the arrows, keep that
-    // row selected (by what it is, since rows above it may have appeared); otherwise the
-    // top row, so Enter opens the best match.
-    let same = *ui.shown_query.borrow() == query;
-    if !same {
-        ui.user_moved.set(false);
-    }
-    let keep: Option<(String, String)> = (same && ui.user_moved.get())
-        .then(|| {
-            let i = ui.list.selected_row()?.index() as usize;
-            ui.hits.borrow().get(i).map(|h| (h.title.clone(), h.subtitle.clone()))
-        })
-        .flatten();
+    // Keep the same result if it still exists (by stable id); otherwise clamp to 0.
+    let prev_key = ui.hits.borrow().get(ui.selected_index.get()).map(hit_key);
     *ui.shown_query.borrow_mut() = query.to_string();
 
-    // Rows are being replaced: the hovered one is gone.
+    // List updates never animate the highlight (stale geometry mid-rebuild).
+    begin_selection_snap(ui);
+
+    let next = prev_key
+        .as_ref()
+        .and_then(|k| hits.iter().position(|h| &hit_key(h) == k))
+        .unwrap_or(0);
+    let keep_scroll = prev_key
+        .as_ref()
+        .is_some_and(|k| hits.iter().any(|h| &hit_key(h) == k));
+
+    apply_hits(ui, &hits);
+
+    if !keep_scroll {
+        ui.list_scroll.vadjustment().set_value(0.0);
+    }
+    let has = !hits.is_empty();
+    ui.reveal.set_reveal_child(has);
+    // Footer keeps a fixed height whenever the list is shown so the panel doesn't jump.
+    ui.path_reveal.set_reveal_child(has);
+    *ui.hits.borrow_mut() = hits;
+    if has {
+        ui.selected_index.set(next.min(ui.hits.borrow().len() - 1));
+        update_path_footer(ui, Some(ui.selected_index.get()));
+        // After layout (next frame): cache row geometry, snap highlight, restore scroll.
+        schedule_selection_snap(ui);
+        if next > 0 && keep_scroll {
+            let weak = ui.me.borrow().clone();
+            let idx = ui.selected_index.get();
+            glib::idle_add_local_once(move || {
+                // After schedule_selection_snap's layout tick has had a chance to cache.
+                let Some(ui) = weak.upgrade() else { return };
+                let weak = ui.me.borrow().clone();
+                ui.list_overlay.add_tick_callback(move |_, _| {
+                    if let Some(ui) = weak.upgrade() {
+                        scroll_to_cached(&ui, idx);
+                    }
+                    glib::ControlFlow::Break
+                });
+            });
+        }
+    } else {
+        ui.selected_index.set(0);
+        ui.sel_layout_pending.set(false);
+        ui.row_geom.borrow_mut().clear();
+        hide_selection_chrome(ui);
+        ui.is_snapping.set(false);
+        if motion_enabled() {
+            set_sel_transition_enabled(ui, true);
+        }
+        update_path_footer(ui, None);
+    }
+}
+
+/// Cancel transform transitions and hide chrome until a deferred snap.
+fn begin_selection_snap(ui: &Ui) {
     ui.hover_gen.set(ui.hover_gen.get() + 1);
-    ui.path_reveal.set_reveal_child(false);
+    ui.is_snapping.set(true);
+    ui.sel_layout_pending.set(true);
+    set_sel_transition_enabled(ui, false);
+    ui.selection_fill.set_opacity(0.0);
+    ui.selection_pill.set_opacity(0.0);
+}
+
+/// After rows are laid out: cache geometry and snap highlight (no animation).
+fn schedule_selection_snap(ui: &Ui) {
+    let weak = ui.me.borrow().clone();
+    glib::idle_add_local_once(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        ui.list.queue_allocate();
+        ui.list_overlay.queue_allocate();
+        let weak = ui.me.borrow().clone();
+        let frames = Cell::new(0u8);
+        ui.list_overlay.add_tick_callback(move |_overlay, _| {
+            let Some(ui) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let n = frames.get() + 1;
+            frames.set(n);
+            cache_row_geometry(&ui);
+            let ready = cached_sel_geom(&ui).is_some() || ui.hits.borrow().is_empty();
+            if !ready && n < 3 {
+                return glib::ControlFlow::Continue;
+            }
+            ui.sel_layout_pending.set(false);
+            snap_selection_chrome(&ui);
+            verify_selection_geometry(&ui);
+            glib::ControlFlow::Break
+        });
+    });
+}
+
+/// Reuse list rows keyed by `hit_key` so typing doesn't destroy geometry of survivors.
+fn apply_hits(ui: &Ui, hits: &[Hit]) {
+    let old_keys = std::mem::take(&mut *ui.row_keys.borrow_mut());
+    let mut old: std::collections::HashMap<String, gtk::ListBoxRow> = std::collections::HashMap::new();
+    for (i, key) in old_keys.into_iter().enumerate() {
+        if let Some(row) = ui.list.row_at_index(0) {
+            // Always take index 0 as we remove; keys were parallel to prior order.
+            let _ = i;
+            ui.list.remove(&row);
+            old.insert(key, row);
+        }
+    }
+    // Drain any leftover rows (keys out of sync).
     while let Some(row) = ui.list.row_at_index(0) {
         ui.list.remove(&row);
     }
-    for hit in &hits {
-        ui.list.append(&make_row(ui, hit));
+    let query = ui.entry.text();
+    let query = query.trim();
+    let mut new_keys = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let key = hit_key(hit);
+        let row = if let Some(row) = old.remove(&key) {
+            if refresh_row_contents(&row, hit, query) {
+                row
+            } else {
+                make_row(ui, hit)
+            }
+        } else {
+            make_row(ui, hit)
+        };
+        new_keys.push(key);
+        ui.list.append(&row);
     }
-    ui.list_scroll.vadjustment().set_value(0.0);
-    ui.reveal.set_reveal_child(!hits.is_empty());
-    let keep_index = keep.and_then(|(t, st)| hits.iter().position(|h| h.title == t && h.subtitle == st));
-    let select = keep_index.and_then(|i| ui.list.row_at_index(i as i32)).or_else(|| ui.list.row_at_index(0));
-    if let Some(row) = select {
-        ui.list.select_row(Some(&row));
-        if keep_index.is_some() {
-            // Results filled in around a row the user picked: keep it in view.
-            let (me, row) = (ui.me.borrow().upgrade(), row.clone());
-            glib::idle_add_local_once(move || {
-                if let Some(me) = me {
-                    scroll_to_row(&me, &row);
-                }
-            });
-        }
-    }
-    *ui.hits.borrow_mut() = hits;
+    *ui.row_keys.borrow_mut() = new_keys;
 }
 
-/// A file or folder row. `content_of`: it matched by contents, for this query.
-fn file_hit(path: &std::path::Path, is_dir: bool, content_of: Option<&str>) -> Hit {
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string());
-    let kind = match (is_dir, content_of) {
-        (true, _) => "Folder".to_string(),
-        (false, Some(q)) => format!("Contains \u{201c}{q}\u{201d}"),
-        (false, None) => "File".to_string(),
+/// Update labels on a reused row. Returns false if the row must be rebuilt (e.g. calc / content badge).
+fn refresh_row_contents(row: &gtk::ListBoxRow, hit: &Hit, query: &str) -> bool {
+    if row.has_css_class("omni-calc") || matches!(hit.action, Action::Copy(_) | Action::Info) {
+        return false;
+    }
+    // Badge / snippet markup rows are cheaper to rebuild than to patch.
+    if matches!(hit.match_type, Some(MatchType::Content | MatchType::Both)) || hit.subtitle_markup {
+        return false;
+    }
+    let Some(hbox) = row.child().and_downcast::<gtk::Box>() else {
+        return false;
+    };
+    let Some(vbox) = hbox.first_child().and_then(|c| c.next_sibling()).and_downcast::<gtk::Box>() else {
+        return false;
+    };
+    if let Some(title) = vbox.first_child().and_downcast::<gtk::Label>() {
+        title.set_markup(&highlight_title(&hit.title, query));
+    } else {
+        return false;
+    }
+    match (vbox.first_child().and_then(|c| c.next_sibling()), hit.subtitle.is_empty()) {
+        (Some(w), false) => {
+            if let Some(sub) = w.downcast_ref::<gtk::Label>() {
+                sub.set_text(&hit.subtitle);
+            }
+        }
+        (None, false) | (Some(_), true) => return false,
+        (None, true) => {}
+    }
+    true
+}
+
+/// A file or folder row.
+fn file_hit(
+    path: &std::path::Path,
+    is_dir: bool,
+    match_type: MatchType,
+    snippet: Option<&str>,
+    query: &str,
+) -> Hit {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string());
+    let (subtitle, subtitle_markup) = match (match_type, snippet) {
+        (MatchType::Content | MatchType::Both, Some(s)) if !s.is_empty() => {
+            (highlight_snippet(s, query), true)
+        }
+        _ => (recent::folder_label(path), false),
     };
     Hit {
         title: name,
-        subtitle: format!("{kind} \u{b7} {}", recent::folder_label(path)),
+        subtitle,
+        subtitle_markup,
         icon: Some(recent::icon(path, is_dir)),
         action: Action::Open(gio::File::for_path(path)),
         file_menu: !is_dir,
+        match_type: Some(match_type),
+    }
+}
+
+/// Accent-color markup for matched terms in a snippet (weight unchanged).
+fn highlight_snippet(snippet: &str, query: &str) -> String {
+    highlight_title(snippet, query)
+}
+
+fn contents_log(msg: impl std::fmt::Display) {
+    if std::env::var_os("OMNI_LOG_CONTENTS").is_some() {
+        eprintln!("omni[contents]: {msg}");
+    }
+}
+
+fn invalidate_content_cache(ui: &Ui) {
+    cancel_content_backends(ui);
+    ui.content_gen.set(ui.content_gen.get() + 1);
+    *ui.content.borrow_mut() = ContentCache::Idle;
+}
+
+fn match_type_rank(m: Option<MatchType>) -> u8 {
+    match m {
+        // Contents on: best content hits first (name+content, then content-only, then name).
+        Some(MatchType::Both) => 0,
+        Some(MatchType::Content) => 1,
+        Some(MatchType::Name) => 2,
+        None => 3,
+    }
+}
+
+/// Stable sort of file Open rows: both → content → name. Other rows keep relative order.
+fn sort_file_hits_by_match_type(hits: &mut Vec<Hit>) {
+    let mut start = None;
+    let mut i = 0;
+    while i <= hits.len() {
+        let is_file = hits
+            .get(i)
+            .is_some_and(|h| matches!(h.action, Action::Open(_)) && h.match_type.is_some());
+        if is_file {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start {
+            hits[s..i].sort_by_key(|h| match_type_rank(h.match_type));
+            start = None;
+        }
+        i += 1;
+    }
+}
+
+/// With Contents on, float content matches above apps/services/name-only rows.
+fn promote_content_matches(hits: &mut Vec<Hit>) {
+    let mut content = Vec::new();
+    let mut rest = Vec::new();
+    for h in hits.drain(..) {
+        if matches!(h.match_type, Some(MatchType::Content | MatchType::Both)) {
+            content.push(h);
+        } else {
+            rest.push(h);
+        }
+    }
+    content.sort_by_key(|h| match_type_rank(h.match_type));
+    hits.extend(content);
+    hits.extend(rest);
+}
+
+fn hit_path(hit: &Hit) -> Option<PathBuf> {
+    match &hit.action {
+        Action::Open(f) | Action::OpenWith(_, f) => f.path(),
+        _ => None,
+    }
+}
+
+fn apply_content_hits_to_list(query: &str, content_hits: &[ContentHit], hits: &mut Vec<Hit>) -> (usize, usize) {
+    let mut both = 0usize;
+    let mut content_only = 0usize;
+    for ch in content_hits {
+        let mut upgraded = false;
+        for hit in hits.iter_mut() {
+            if hit_path(hit).as_ref() == Some(&ch.path) {
+                hit.match_type = Some(MatchType::Both);
+                if let Some(ref snip) = ch.snippet {
+                    hit.subtitle = highlight_snippet(snip, query);
+                    hit.subtitle_markup = true;
+                }
+                upgraded = true;
+                both += 1;
+                break;
+            }
+        }
+        if !upgraded {
+            hits.push(file_hit(
+                &ch.path,
+                false,
+                MatchType::Content,
+                ch.snippet.as_deref(),
+                query,
+            ));
+            content_only += 1;
+        }
+    }
+    (both, content_only)
+}
+
+/// Merge content hits into `hits`, or schedule a search / show empty state.
+fn merge_content_hits(ui: &Ui, query: &str, scope: Option<&std::path::Path>, hits: &mut Vec<Hit>) {
+    let key = ContentKey::new(query, scope);
+    let cache = ui.content.borrow();
+    match &*cache {
+        ContentCache::Failed { key: k, message } if k == &key => {
+            let message = message.clone();
+            drop(cache);
+            hits.push(content_failed_hit(&message));
+        }
+        ContentCache::Active {
+            key: shown_key,
+            hits: content_hits,
+            searching,
+            pending_key,
+            ready_at,
+        } => {
+            let inflight_for_us = pending_key.as_ref() == Some(&key)
+                || (pending_key.is_none() && *searching && shown_key == &key);
+            let showing_us = shown_key == &key;
+
+            if showing_us {
+                let (both, content_only) = apply_content_hits_to_list(query, content_hits, hits);
+                contents_log(format!(
+                    "merge query={:?} raw={} both={both} content={content_only} searching={searching}",
+                    key.query,
+                    content_hits.len()
+                ));
+                if !*searching && content_hits.is_empty() {
+                    let scoped = key.scope_path().is_some();
+                    drop(cache);
+                    hits.push(content_empty_hit(scoped));
+                    return;
+                }
+                if !*searching {
+                    if ready_at.is_some_and(|at| at.elapsed() < CONTENT_CACHE_TTL) {
+                        return; // warm cache
+                    }
+                    drop(cache);
+                    schedule_content_search(ui, query, scope);
+                    return;
+                }
+                return; // searching this key
+            }
+
+            if inflight_for_us {
+                // Keep previous content rows on screen until the first batch for `key` arrives.
+                let (_b, _c) = apply_content_hits_to_list(query, content_hits, hits);
+                contents_log(format!(
+                    "merge query={:?} inflight (keeping {} prior hits)",
+                    key.query,
+                    content_hits.len()
+                ));
+                return;
+            }
+
+            drop(cache);
+            schedule_content_search(ui, query, scope);
+        }
+        ContentCache::Idle => {
+            drop(cache);
+            schedule_content_search(ui, query, scope);
+        }
+        ContentCache::Failed { .. } => {
+            drop(cache);
+            schedule_content_search(ui, query, scope);
+        }
+    }
+}
+
+fn content_empty_hit(scoped: bool) -> Hit {
+    Hit {
+        title: "No content matches".into(),
+        subtitle: if scoped {
+            "No content matches in this folder. It may not be content-indexed.".into()
+        } else {
+            "This folder may not be content-indexed.".into()
+        },
+        subtitle_markup: false,
+        icon: Some(gio::ThemedIcon::new("dialog-information-symbolic").upcast()),
+        action: Action::Info,
+        file_menu: false,
+        match_type: None,
+    }
+}
+
+fn content_failed_hit(message: &str) -> Hit {
+    Hit {
+        title: "Contents search unavailable".into(),
+        subtitle: message.to_string(),
+        subtitle_markup: false,
+        icon: Some(gio::ThemedIcon::new("dialog-warning-symbolic").upcast()),
+        action: Action::Info,
+        file_menu: false,
+        match_type: None,
     }
 }
 
@@ -1055,9 +1777,11 @@ fn calc_hit(query: &str) -> Option<Hit> {
     Some(Hit {
         title: result.clone(),
         subtitle: format!("{} =", calc::pretty(query)),
+        subtitle_markup: false,
         icon: None,
         action: Action::Copy(result),
         file_menu: false,
+        match_type: None,
     })
 }
 
@@ -1086,7 +1810,11 @@ fn parse_scope(query: &str) -> Option<(PathBuf, &str)> {
 /// the colon yet: the folder itself, to open.
 fn scoped_hits(ui: &Ui, dir: &std::path::Path, inner: &str) -> Vec<Hit> {
     if inner.is_empty() {
-        return if dir.is_dir() { vec![file_hit(dir, true, None)] } else { Vec::new() };
+        return if dir.is_dir() {
+            vec![file_hit(dir, true, MatchType::Name, None, "")]
+        } else {
+            Vec::new()
+        };
     }
     let show = ui.filter.get();
     let max_files = if show & SHOW_FILES == 0 { 0 } else { MAX_FILTERED };
@@ -1094,39 +1822,489 @@ fn scoped_hits(ui: &Ui, dir: &std::path::Path, inner: &str) -> Vec<Hit> {
     let (mut files, mut dirs) = files::search(&ui.files, inner, max_files.max(1), max_dirs.max(1), Some(dir));
     files.truncate(max_files);
     dirs.truncate(max_dirs);
-    files.into_iter().chain(dirs).map(|h| file_hit(&h.path, h.is_dir, None)).collect()
+    files
+        .into_iter()
+        .chain(dirs)
+        .map(|h| file_hit(&h.path, h.is_dir, MatchType::Name, None, inner))
+        .collect()
 }
 
-fn schedule_content_search(ui: &Ui, query: &str) {
+fn cancel_content_backends(ui: &Ui) {
+    ui.content_cancel.borrow().store(true, Ordering::SeqCst);
+    if let Ok(mut slot) = ui.content_rg.lock() {
+        if let Some(mut child) = slot.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn schedule_content_search(ui: &Ui, query: &str, scope: Option<&std::path::Path>) {
+    cancel_content_backends(ui);
     let generation = ui.content_gen.get() + 1;
     ui.content_gen.set(generation);
+    let key = ContentKey::new(query, scope);
+    // Mark in-flight without clearing previously shown hits.
+    {
+        let mut cache = ui.content.borrow_mut();
+        match &mut *cache {
+            ContentCache::Active {
+                pending_key,
+                searching,
+                ..
+            } => {
+                *pending_key = Some(key.clone());
+                *searching = true;
+            }
+            other => {
+                *other = ContentCache::Active {
+                    key: key.clone(),
+                    hits: Vec::new(),
+                    searching: true,
+                    pending_key: Some(key.clone()),
+                    ready_at: None,
+                };
+            }
+        }
+    }
     let Some(me) = ui.me.borrow().upgrade() else { return };
-    let query = query.to_string();
+    let entry_snapshot = ui.entry.text().trim().to_string();
+    let t0 = Instant::now();
+    contents_log(format!(
+        "timing keystroke/schedule t=0ms delay={}ms query={:?} scope={:?}",
+        CONTENT_DELAY.as_millis(),
+        key.query,
+        key.scope_path()
+    ));
     glib::timeout_add_local_once(CONTENT_DELAY, move || {
-        if me.content_gen.get() == generation && me.entry.text().trim() == query && me.window.is_visible() {
-            start_content_search(&me, &query);
+        contents_log(format!(
+            "timing debounce_fired t={}ms query={:?}",
+            t0.elapsed().as_millis(),
+            key.query
+        ));
+        if me.content_gen.get() == generation
+            && me.entry.text().trim() == entry_snapshot
+            && me.window.is_visible()
+            && me.contents.is_active()
+        {
+            start_content_search(&me, &key.query, key.scope_path().as_deref(), t0);
+        } else {
+            contents_log(format!("schedule dropped (stale) query={:?}", key.query));
         }
     });
 }
 
-/// Ask LocalSearch for files whose contents match, off the UI thread. Results for an
-/// outdated query are dropped; current ones are slotted in.
-fn start_content_search(ui: &Ui, query: &str) {
-    let generation = ui.content_gen.get() + 1;
-    ui.content_gen.set(generation);
-    let (Some(me), Some(conn)) = (ui.me.borrow().upgrade(), ui.sparql.borrow().clone()) else { return };
-    let query = query.to_string();
+/// Resolve search text + optional directory scope from the entry (or an explicit pair).
+fn content_search_args(entry_text: &str) -> (String, Option<PathBuf>) {
+    match parse_scope(entry_text) {
+        Some((dir, inner)) => (inner.to_string(), Some(dir)),
+        None => (entry_text.to_string(), None),
+    }
+}
+
+/// Apply a streamed content batch on the UI thread. Drops stale generations.
+fn apply_content_batch(
+    ui: &Ui,
+    generation: u64,
+    key: &ContentKey,
+    batch: Vec<ContentHit>,
+    done: bool,
+    err: Option<String>,
+    t0: Instant,
+    first: bool,
+) {
+    if ui.content_gen.get() != generation || !ui.contents.is_active() {
+        contents_log(format!("results dropped (stale) query={:?}", key.query));
+        return;
+    }
+    if let Some(message) = err {
+        *ui.content.borrow_mut() = ContentCache::Failed {
+            key: key.clone(),
+            message,
+        };
+        if !ui.answer_reveal.reveals_child() && ui.window.is_visible() {
+            refresh(ui);
+        }
+        return;
+    }
+    {
+        let mut cache = ui.content.borrow_mut();
+        match &mut *cache {
+            ContentCache::Active {
+                key: shown_key,
+                hits,
+                searching,
+                pending_key,
+                ready_at,
+            } if pending_key.as_ref() == Some(key) || shown_key == key => {
+                if pending_key.as_ref() == Some(key) && shown_key != key {
+                    // First batch for the new query: replace prior hits.
+                    *shown_key = key.clone();
+                    hits.clear();
+                    *pending_key = Some(key.clone());
+                }
+                for h in batch {
+                    if !hits.iter().any(|e| e.path == h.path) {
+                        hits.push(h);
+                    }
+                }
+                if done {
+                    *searching = false;
+                    *pending_key = None;
+                    *ready_at = Some(Instant::now());
+                } else {
+                    *searching = true;
+                }
+            }
+            _ => {
+                *cache = ContentCache::Active {
+                    key: key.clone(),
+                    hits: batch,
+                    searching: !done,
+                    pending_key: if done { None } else { Some(key.clone()) },
+                    ready_at: if done { Some(Instant::now()) } else { None },
+                };
+            }
+        }
+    }
+    if first {
+        contents_log(format!(
+            "timing first_result t={}ms query={:?}",
+            t0.elapsed().as_millis(),
+            key.query
+        ));
+    }
+    if done {
+        contents_log(format!(
+            "timing last_result t={}ms query={:?}",
+            t0.elapsed().as_millis(),
+            key.query
+        ));
+    }
+    if !ui.answer_reveal.reveals_child() && ui.window.is_visible() {
+        refresh(ui);
+        contents_log(format!(
+            "timing rendered t={}ms query={:?} done={done}",
+            t0.elapsed().as_millis(),
+            key.query
+        ));
+        if !done {
+            schedule_visible_snippets(ui);
+        } else {
+            schedule_visible_snippets(ui);
+        }
+    }
+}
+
+/// Fill snippets for on-screen content rows only (off-thread, 1 MB cap).
+fn schedule_visible_snippets(ui: &Ui) {
+    let Some(me) = ui.me.borrow().upgrade() else { return };
+    let expect_gen = ui.content_gen.get();
+    let query = match &*ui.content.borrow() {
+        ContentCache::Active { key, .. } => key.query.clone(),
+        _ => return,
+    };
+    let paths: Vec<PathBuf> = {
+        let hits = ui.hits.borrow();
+        let start = ui.list_scroll.vadjustment().value() as usize / ROW_HEIGHT as usize;
+        let end = (start + MAX_VISIBLE_ROWS as usize + 2).min(hits.len());
+        hits[start..end]
+            .iter()
+            .filter(|h| matches!(h.match_type, Some(MatchType::Content | MatchType::Both)))
+            .filter(|h| !h.subtitle_markup || h.subtitle.is_empty())
+            .filter_map(hit_path)
+            .collect()
+    };
+    if paths.is_empty() {
+        return;
+    }
+    let need: Vec<PathBuf> = {
+        let cache = ui.content.borrow();
+        let ContentCache::Active { hits, .. } = &*cache else {
+            return;
+        };
+        paths
+            .into_iter()
+            .filter(|p| {
+                hits.iter()
+                    .find(|h| &h.path == p)
+                    .is_some_and(|h| h.snippet.is_none())
+            })
+            .collect()
+    };
+    if need.is_empty() {
+        return;
+    }
+    let q = query.clone();
     glib::spawn_future_local(async move {
-        let q = query.clone();
-        let found = gio::spawn_blocking(move || files::content_search(&conn, &q, MAX_CONTENT)).await.unwrap_or_default();
-        if me.content_gen.get() != generation || me.entry.text().trim() != query {
+        let filled = gio::spawn_blocking(move || {
+            need.into_iter()
+                .filter_map(|path| {
+                    let snip = files::content_snippet_for(&path, &q)?;
+                    Some((path, snip))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        if me.content_gen.get() != expect_gen || filled.is_empty() {
             return;
         }
-        *me.content.borrow_mut() = (query, found);
+        {
+            let mut cache = me.content.borrow_mut();
+            let ContentCache::Active { key, hits, .. } = &mut *cache else {
+                return;
+            };
+            if key.query != query {
+                return;
+            }
+            for (path, snip) in &filled {
+                if let Some(h) = hits.iter_mut().find(|h| &h.path == path) {
+                    h.snippet = Some(snip.clone());
+                }
+            }
+        }
         if !me.answer_reveal.reveals_child() && me.window.is_visible() {
             refresh(&me);
         }
     });
+}
+
+struct ContentBatchMsg {
+    generation: u64,
+    key: ContentKey,
+    hits: Vec<ContentHit>,
+    done: bool,
+    err: Option<String>,
+    t0: Instant,
+    first: bool,
+    entry_snapshot: String,
+}
+
+/// Ask LocalSearch + ripgrep off the UI thread; stream batches as they arrive.
+fn start_content_search(ui: &Ui, query: &str, scope: Option<&std::path::Path>, t0: Instant) {
+    cancel_content_backends(ui);
+    let cancel = Arc::new(AtomicBool::new(false));
+    *ui.content_cancel.borrow_mut() = cancel.clone();
+
+    let generation = ui.content_gen.get() + 1;
+    ui.content_gen.set(generation);
+    let key = ContentKey::new(query, scope);
+    {
+        let mut cache = ui.content.borrow_mut();
+        match &mut *cache {
+            ContentCache::Active {
+                pending_key,
+                searching,
+                ..
+            } => {
+                *pending_key = Some(key.clone());
+                *searching = true;
+            }
+            other => {
+                *other = ContentCache::Active {
+                    key: key.clone(),
+                    hits: Vec::new(),
+                    searching: true,
+                    pending_key: Some(key.clone()),
+                    ready_at: None,
+                };
+            }
+        }
+    }
+
+    if ui.me.borrow().upgrade().is_none() {
+        return;
+    }
+    let conn = ui.sparql.borrow().clone();
+    let entry_snapshot = ui.entry.text().trim().to_string();
+    let rg_slot = ui.content_rg.clone();
+    let q = key.query.clone();
+    let scope_path = key.scope_path();
+    let key_for_worker = key.clone();
+
+    contents_log(format!(
+        "timing backend_start t={}ms query={:?} scope={:?} backends=rg+localsearch",
+        t0.elapsed().as_millis(),
+        key.query,
+        key.scope_path()
+    ));
+
+    // Worker → UI: std mpsc (Send) + short poll on the main loop (Rc<Ui> is !Send).
+    let (tx, rx) = std::sync::mpsc::channel::<ContentBatchMsg>();
+    let rx = Arc::new(Mutex::new(Some(rx)));
+    let weak = ui.me.borrow().clone();
+    let rx_poll = rx.clone();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        let Some(ui) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        let mut guard = match rx_poll.lock() {
+            Ok(g) => g,
+            Err(_) => return glib::ControlFlow::Break,
+        };
+        let Some(rx) = guard.as_mut() else {
+            return glib::ControlFlow::Break;
+        };
+        let mut stop = false;
+        loop {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    if ui.entry.text().trim() == msg.entry_snapshot {
+                        let done = msg.done;
+                        apply_content_batch(
+                            &ui,
+                            msg.generation,
+                            &msg.key,
+                            msg.hits,
+                            msg.done,
+                            msg.err,
+                            msg.t0,
+                            msg.first,
+                        );
+                        if done {
+                            stop = true;
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    stop = true;
+                    break;
+                }
+            }
+        }
+        if stop {
+            *guard = None;
+            glib::ControlFlow::Break
+        } else {
+            glib::ControlFlow::Continue
+        }
+    });
+
+    std::thread::Builder::new()
+        .name("omni-content".into())
+        .spawn(move || {
+            let first_flag = Arc::new(AtomicBool::new(true));
+            let (stx, srx) =
+                std::sync::mpsc::channel::<(Vec<files::FtsHit>, String, Option<String>)>();
+
+            if let Some(conn) = conn {
+                let q2 = q.clone();
+                let scope2 = scope_path.clone();
+                let cancel2 = cancel.clone();
+                std::thread::Builder::new()
+                    .name("omni-content-ls".into())
+                    .spawn(move || {
+                        if cancel2.load(Ordering::Relaxed) {
+                            let _ = stx.send((Vec::new(), String::new(), None));
+                            return;
+                        }
+                        let r = files::content_search_localsearch(
+                            &conn,
+                            &q2,
+                            MAX_CONTENT,
+                            scope2.as_deref(),
+                        );
+                        let _ = stx.send(r);
+                    })
+                    .ok();
+            } else {
+                let _ = stx.send((Vec::new(), String::new(), None));
+            }
+
+            let mut batch: Vec<ContentHit> = Vec::new();
+            let mut last_flush = Instant::now();
+            let mut total = 0usize;
+            let send_batch =
+                |chunk: Vec<ContentHit>, first_flag: &AtomicBool, tx: &std::sync::mpsc::Sender<ContentBatchMsg>| {
+                    if chunk.is_empty() {
+                        return;
+                    }
+                    let is_first = first_flag.swap(false, Ordering::SeqCst);
+                    let _ = tx.send(ContentBatchMsg {
+                        generation,
+                        key: key_for_worker.clone(),
+                        hits: chunk,
+                        done: false,
+                        err: None,
+                        t0,
+                        first: is_first,
+                        entry_snapshot: entry_snapshot.clone(),
+                    });
+                };
+
+            files::content_search_rg_stream(
+                &q,
+                MAX_CONTENT,
+                scope_path.as_deref(),
+                &cancel,
+                &rg_slot,
+                |hit| {
+                    total += 1;
+                    batch.push(ContentHit {
+                        path: hit.path,
+                        snippet: None,
+                    });
+                    if total == 1 || last_flush.elapsed() >= CONTENT_BATCH {
+                        send_batch(std::mem::take(&mut batch), &first_flag, &tx);
+                        last_flush = Instant::now();
+                    }
+                },
+            );
+            send_batch(std::mem::take(&mut batch), &first_flag, &tx);
+            contents_log(format!(
+                "timing rg_done t={}ms count={total} query={:?}",
+                t0.elapsed().as_millis(),
+                key_for_worker.query
+            ));
+
+            let (ls_hits, sparql, ls_err) = srx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| (Vec::new(), String::new(), None));
+            contents_log(format!(
+                "timing ls_done t={}ms count={} sparql_len={} err={ls_err:?} query={:?}",
+                t0.elapsed().as_millis(),
+                ls_hits.len(),
+                sparql.len(),
+                key_for_worker.query
+            ));
+
+            if cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(ContentBatchMsg {
+                    generation,
+                    key: key_for_worker,
+                    hits: Vec::new(),
+                    done: true,
+                    err: None,
+                    t0,
+                    first: false,
+                    entry_snapshot,
+                });
+                return;
+            }
+
+            let ls_batch: Vec<ContentHit> = ls_hits
+                .into_iter()
+                .map(|h| ContentHit {
+                    path: h.path,
+                    snippet: None,
+                })
+                .collect();
+            let is_first = first_flag.swap(false, Ordering::SeqCst);
+            let fail = ls_err.filter(|_| total == 0 && ls_batch.is_empty());
+            let _ = tx.send(ContentBatchMsg {
+                generation,
+                key: key_for_worker,
+                hits: ls_batch,
+                done: true,
+                err: fail,
+                t0,
+                first: is_first,
+                entry_snapshot,
+            });
+        })
+        .expect("content search thread");
 }
 
 /// Connect to LocalSearch off the UI thread; then listen for new files (added to the
@@ -1136,7 +2314,11 @@ fn connect_localsearch(ui: &Rc<Ui>) {
     glib::spawn_future_local(async move {
         let conn = match gio::spawn_blocking(sparql::Connection::new).await {
             Ok(Ok(c)) => Arc::new(c),
-            Ok(Err(e)) => return eprintln!("omni: can't connect to LocalSearch (contents search and live file updates off): {e}"),
+            Ok(Err(e)) => {
+                eprintln!("omni: can't connect to LocalSearch (contents search and live file updates off): {e}");
+                contents_log(format!("connect failed: {e}"));
+                return;
+            }
             Err(_) => return,
         };
         let Some(ui) = weak.upgrade() else { return };
@@ -1158,7 +2340,425 @@ fn connect_localsearch(ui: &Rc<Ui>) {
         });
         *ui.notifier.borrow_mut() = Some(notifier);
         *ui.sparql.borrow_mut() = Some(conn);
+        contents_log("LocalSearch connected");
+        // Retry contents search if the toggle was already on before the bus was ready.
+        if ui.contents.is_active() && ui.window.is_visible() {
+            let q = ui.entry.text();
+            let q = q.trim().to_string();
+            if !q.is_empty() && !ui.answer_reveal.reveals_child() {
+                let (search_q, scope) = content_search_args(&q);
+                if !search_q.is_empty() {
+                    contents_log(format!(
+                        "retry after connect query={search_q:?} scope={scope:?}"
+                    ));
+                    start_content_search(&ui, &search_q, scope.as_deref(), Instant::now());
+                }
+            }
+        }
     });
+}
+
+/// Footer path for the selected hit: full file path, or .desktop path for apps.
+fn footer_path_for(hit: &Hit) -> String {
+    match &hit.action {
+        Action::Open(file) | Action::OpenWith(_, file) => {
+            file.path().map(|p| p.display().to_string()).unwrap_or_default()
+        }
+        Action::App(info) | Action::AppAction(info, _) => info
+            .downcast_ref::<gio_unix::DesktopAppInfo>()
+            .and_then(|d| d.filename())
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn update_path_footer(ui: &Ui, index: Option<usize>) {
+    let mut text = index
+        .and_then(|i| ui.hits.borrow().get(i).map(footer_path_for))
+        .unwrap_or_default();
+    if ui.contents.is_active() && ui.content.borrow().searching() {
+        if text.is_empty() {
+            text = "searching\u{2026}".into();
+        } else {
+            text.push_str(" \u{b7} searching\u{2026}");
+        }
+    }
+    *ui.path_full.borrow_mut() = text;
+    apply_path_display(ui);
+}
+
+/// Pixel width of `text` with the footer label's font (size/weight from CSS).
+fn path_text_width(label: &gtk::Label, text: &str) -> f64 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let layout = label.create_pango_layout(Some(text));
+    layout.pixel_size().0 as f64
+}
+
+/// Split into (prefix including trailing slash, filename). Filename bias for truncation.
+fn split_path_file(path: &str) -> (&str, &str) {
+    match path.rfind('/') {
+        Some(i) => (&path[..=i], &path[i + 1..]),
+        None => ("", path),
+    }
+}
+
+/// Middle-truncate `path` to fit `avail` px. Filename stays fully visible; leftover width
+/// goes to the start. Binary-search the kept prefix length against real font metrics.
+fn middle_truncate_path(label: &gtk::Label, path: &str, avail: f64) -> String {
+    if path.is_empty() || avail <= 0.0 {
+        return String::new();
+    }
+    if path_text_width(label, path) <= avail {
+        return path.to_string();
+    }
+
+    let (prefix, file) = split_path_file(path);
+    let ellipsis = PATH_ELLIPSIS;
+    let ell_w = path_text_width(label, ellipsis);
+
+    // Filename must stay fully visible when possible.
+    if !file.is_empty() {
+        let file_w = path_text_width(label, file);
+        if file_w > avail {
+            // Filename alone is wider than the strip — keep the end of the name.
+            return truncate_end_to_width(label, file, avail, ellipsis, ell_w);
+        }
+        if prefix.is_empty() {
+            return file.to_string();
+        }
+        // remaining width for prefix + ellipsis
+        let budget = avail - file_w;
+        if ell_w >= budget {
+            // No room for any prefix — show ellipsis + file if that fits, else file only.
+            let with_ell = format!("{ellipsis}{file}");
+            return if path_text_width(label, &with_ell) <= avail {
+                with_ell
+            } else {
+                file.to_string()
+            };
+        }
+        let chars: Vec<char> = prefix.chars().collect();
+        let mut lo = 0usize;
+        let mut hi = chars.len();
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            let kept: String = chars[..mid].iter().collect();
+            let candidate = format!("{kept}{ellipsis}{file}");
+            if path_text_width(label, &candidate) <= avail {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let kept: String = chars[..lo].iter().collect();
+        return format!("{kept}{ellipsis}{file}");
+    }
+
+    // No filename segment (e.g. "/"): generic middle truncate on the whole string.
+    middle_truncate_chars(label, path, avail, ellipsis, ell_w)
+}
+
+fn truncate_end_to_width(label: &gtk::Label, text: &str, avail: f64, ellipsis: &str, ell_w: f64) -> String {
+    if path_text_width(label, text) <= avail {
+        return text.to_string();
+    }
+    if ell_w >= avail {
+        return ellipsis.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut lo = 0usize;
+    let mut hi = chars.len();
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let kept: String = chars[chars.len() - mid..].iter().collect();
+        let candidate = format!("{ellipsis}{kept}");
+        if path_text_width(label, &candidate) <= avail {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let kept: String = chars[chars.len() - lo..].iter().collect();
+    format!("{ellipsis}{kept}")
+}
+
+fn middle_truncate_chars(label: &gtk::Label, text: &str, avail: f64, ellipsis: &str, ell_w: f64) -> String {
+    if ell_w >= avail {
+        return ellipsis.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let left = mid / 2;
+        let right = mid - left;
+        let kept_l: String = chars[..left].iter().collect();
+        let kept_r: String = chars[n - right..].iter().collect();
+        let candidate = format!("{kept_l}{ellipsis}{kept_r}");
+        if path_text_width(label, &candidate) <= avail {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    let left = lo / 2;
+    let right = lo - left;
+    let kept_l: String = chars[..left].iter().collect();
+    let kept_r: String = chars[n - right..].iter().collect();
+    format!("{kept_l}{ellipsis}{kept_r}")
+}
+
+/// Apply cached or freshly measured truncation to the footer label.
+fn apply_path_display(ui: &Ui) {
+    let full = ui.path_full.borrow().clone();
+    let box_w = ui.path_box.width();
+    if box_w <= 0 {
+        ui.path_label.set_text("");
+        return;
+    }
+    if let Some((ref p, w, ref d)) = *ui.path_trunc_cache.borrow() {
+        if p == &full && w == box_w {
+            ui.path_label.set_text(d);
+            return;
+        }
+    }
+    let avail = (box_w as f64) - 2.0 * PATH_FOOTER_PAD_X;
+    let display = middle_truncate_path(&ui.path_label, &full, avail);
+    *ui.path_trunc_cache.borrow_mut() = Some((full, box_w, display.clone()));
+    ui.path_label.set_text(&display);
+}
+
+fn motion_enabled() -> bool {
+    gtk::Settings::default().is_some_and(|s| s.is_gtk_enable_animations())
+}
+
+/// Stable identity for keeping selection across list rebuilds.
+fn hit_key(hit: &Hit) -> String {
+    match &hit.action {
+        Action::Open(file) | Action::OpenWith(_, file) => file.uri().to_string(),
+        Action::App(info) => format!("app:{}", info.id().unwrap_or_default()),
+        Action::AppAction(info, action) => {
+            format!("app-action:{}:{}", info.id().unwrap_or_default(), action.name)
+        }
+        Action::Web(q) => format!("web:{q}"),
+        Action::WebIn(q, w) => format!("web-in:{q}:{w:?}"),
+        Action::Claude(q) => format!("claude:{q}"),
+        Action::Copy(t) => format!("copy:{t}"),
+        Action::Service(s) => format!("svc:{}", s.unit),
+        Action::ServiceStatus(s) => format!("svc-status:{}", s.unit),
+        Action::ServiceVerb(s, verb) => format!("svc-verb:{}:{}", s.unit, verb.label()),
+        Action::DockPin(id, on) => format!("dock:{id}:{on}"),
+        Action::Info => format!("info:{}", hit.title),
+    }
+}
+
+/// Measure all row y/height once (list updates / resize). Selection moves read the cache only.
+fn cache_row_geometry(ui: &Ui) {
+    let n = ui.hits.borrow().len();
+    let mut geom = Vec::with_capacity(n);
+    for i in 0..n {
+        let entry = ui
+            .list
+            .row_at_index(i as i32)
+            .and_then(|row| row.compute_bounds(&ui.list_overlay))
+            .map(|b| (b.y() as f64, b.height() as f64))
+            .unwrap_or((0.0, 0.0));
+        geom.push(entry);
+    }
+    *ui.row_geom.borrow_mut() = geom;
+}
+
+fn cached_sel_geom(ui: &Ui) -> Option<(f64, f64)> {
+    if ui.hits.borrow().is_empty() {
+        return None;
+    }
+    let index = ui.selected_index.get().min(ui.hits.borrow().len() - 1);
+    ui.selected_index.set(index);
+    let (y, h) = *ui.row_geom.borrow().get(index)?;
+    (h >= 1.0).then_some((y, h))
+}
+
+/// Drive fill (translateY + scaleY) and pill (translateY only) — no layout properties.
+fn apply_sel_transform(ui: &Ui, y: f64, h: f64) {
+    let h = h.max(1.0);
+    // Skip identical updates: CssProvider reloads can re-enter size notifies and freeze GTK.
+    if (ui.sel_y.get() - y).abs() < 0.05 && (ui.sel_h.get() - h).abs() < 0.05 {
+        return;
+    }
+    ui.sel_y.set(y);
+    ui.sel_h.set(h);
+    let scale = h / SEL_BASE_H;
+    let pill_y = y + (h - SEL_PILL_H) * 0.5;
+    ui.sel_transform_css.load_from_string(&format!(
+        ".omni-selection {{\n  transform: translateY({y:.2}px) scaleY({scale:.5});\n}}\n\
+         .omni-selection-pill {{\n  transform: translateY({pill_y:.2}px);\n}}\n"
+    ));
+}
+
+fn set_sel_transition_enabled(ui: &Ui, on: bool) {
+    if ui.sel_transition_on.get() == on {
+        return;
+    }
+    ui.sel_transition_on.set(on);
+    let css = if on {
+        format!(
+            ".omni-selection, .omni-selection-pill {{\n  \
+             transition: transform {SELECT_MOTION_MS:.0}ms cubic-bezier(0.2, 0, 0, 1);\n  \
+             will-change: transform;\n}}\n"
+        )
+    } else {
+        ".omni-selection, .omni-selection-pill {\n  transition: none;\n  will-change: transform;\n}\n"
+            .into()
+    };
+    ui.sel_transition_css.load_from_string(&css);
+}
+
+fn hide_selection_chrome(ui: &Ui) {
+    ui.selection_fill.set_opacity(0.0);
+    ui.selection_pill.set_opacity(0.0);
+    ui.selection_fill.set_visible(false);
+    ui.selection_pill.set_visible(false);
+}
+
+fn show_selection_chrome(ui: &Ui) {
+    ui.selection_fill.set_visible(true);
+    ui.selection_pill.set_visible(true);
+    ui.selection_fill.set_opacity(1.0);
+    ui.selection_pill.set_opacity(1.0);
+}
+
+/// Snap with transition off; re-enable transition on the next frame (never same tick).
+fn snap_selection_chrome(ui: &Ui) {
+    let Some((y, h)) = cached_sel_geom(ui) else {
+        ui.is_snapping.set(true);
+        set_sel_transition_enabled(ui, false);
+        hide_selection_chrome(ui);
+        let weak = ui.me.borrow().clone();
+        ui.list_overlay.add_tick_callback(move |_, _| {
+            if let Some(ui) = weak.upgrade() {
+                ui.is_snapping.set(false);
+                if motion_enabled() {
+                    set_sel_transition_enabled(&ui, true);
+                }
+            }
+            glib::ControlFlow::Break
+        });
+        return;
+    };
+    // Already on target — do not reload CSS (avoids notify ↔ snap feedback loops).
+    if ui.selection_fill.is_visible()
+        && (ui.sel_y.get() - y).abs() < 0.5
+        && (ui.sel_h.get() - h).abs() < 0.5
+    {
+        return;
+    }
+    ui.is_snapping.set(true);
+    set_sel_transition_enabled(ui, false);
+    apply_sel_transform(ui, y, h);
+    show_selection_chrome(ui);
+    let weak = ui.me.borrow().clone();
+    ui.list_overlay.add_tick_callback(move |_, _| {
+        if let Some(ui) = weak.upgrade() {
+            ui.is_snapping.set(false);
+            if motion_enabled() {
+                set_sel_transition_enabled(&ui, true);
+            }
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+/// Set owned selection; starts transform animation first, defers footer off the hot path.
+fn set_selected_index(ui: &Ui, index: usize, animate: bool) {
+    let t0 = std::time::Instant::now();
+    let count = ui.hits.borrow().len();
+    if count == 0 {
+        ui.selected_index.set(0);
+        hide_selection_chrome(ui);
+        let weak = ui.me.borrow().clone();
+        glib::idle_add_local_once(move || {
+            if let Some(ui) = weak.upgrade() {
+                update_path_footer(&ui, None);
+            }
+        });
+        return;
+    }
+    let index = index.min(count - 1);
+    if index == ui.selected_index.get() && animate {
+        return;
+    }
+    ui.selected_index.set(index);
+    sync_selection_chrome(ui, animate);
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if ms > 2.0 {
+        eprintln!("omni: selection handler {ms:.2}ms (want <2ms before animation)");
+    }
+    let weak = ui.me.borrow().clone();
+    glib::idle_add_local_once(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.selected_index.get() == index {
+            update_path_footer(&ui, Some(index));
+        }
+    });
+}
+
+/// Apply highlight from cached row geometry. Animates via CSS transform retarget.
+fn sync_selection_chrome(ui: &Ui, animate: bool) {
+    if ui.hits.borrow().is_empty() {
+        hide_selection_chrome(ui);
+        return;
+    }
+    let Some((y, h)) = cached_sel_geom(ui) else {
+        hide_selection_chrome(ui);
+        return;
+    };
+    let snap = ui.is_snapping.get() || !animate || !motion_enabled();
+    if snap {
+        snap_selection_chrome(ui);
+        return;
+    }
+    // Retarget: keep transition on and set the new transform (CSS continues from current).
+    set_sel_transition_enabled(ui, true);
+    apply_sel_transform(ui, y, h);
+    show_selection_chrome(ui);
+}
+
+/// Log-only check after list updates — never on selection moves.
+fn verify_selection_geometry(ui: &Ui) {
+    if ui.hits.borrow().is_empty() {
+        return;
+    }
+    let index = ui.selected_index.get();
+    let Some(row) = ui.list.row_at_index(index as i32) else {
+        eprintln!("omni: selection self-check: no row at selected_index={index}");
+        return;
+    };
+    let Some(bounds) = row.compute_bounds(&ui.list_overlay) else {
+        return;
+    };
+    let cached = ui.row_geom.borrow().get(index).copied();
+    if let Some((cy, ch)) = cached {
+        if (cy - bounds.y() as f64).abs() > 1.0 || (ch - bounds.height() as f64).abs() > 1.0 {
+            eprintln!(
+                "omni: selection self-check: cache ({cy:.1},{ch:.1}) != row ({:.1},{:.1}) at {index}",
+                bounds.y(),
+                bounds.height()
+            );
+        }
+    }
+    let (y, h) = (ui.sel_y.get(), ui.sel_h.get());
+    if (y - bounds.y() as f64).abs() > 1.0 || (h - bounds.height() as f64).abs() > 1.0 {
+        eprintln!(
+            "omni: selection self-check: highlight ({y:.1},{h:.1}) != row ({:.1},{:.1}) at {index}",
+            bounds.y(),
+            bounds.height()
+        );
+    }
 }
 
 fn contents_setting_path() -> PathBuf {
@@ -1224,7 +2824,11 @@ fn filter_click(bits: u8, clicked: u8) -> u8 {
 /// kinds are picked, and the results update behind it on every click.
 fn show_filter_menu(ui: &Ui, keyboard: bool) {
     let Some(me) = ui.me.borrow().upgrade() else { return };
-    let menu = gtk::Popover::builder().has_arrow(false).position(gtk::PositionType::Bottom).build();
+    let menu = gtk::Popover::builder()
+        .has_arrow(false)
+        .autohide(false)
+        .position(gtk::PositionType::Bottom)
+        .build();
     menu.add_css_class("omni-menu");
     let items = gtk::Box::new(gtk::Orientation::Vertical, 2);
 
@@ -1234,8 +2838,19 @@ fn show_filter_menu(ui: &Ui, keyboard: bool) {
     let buttons: Rc<Vec<(u8, gtk::Button)>> = Rc::new(
         rows.iter()
             .map(|(bit, name)| {
-                let label = gtk::Label::builder().label(*name).ellipsize(gtk::pango::EllipsizeMode::End).build();
-                (*bit, gtk::Button::builder().child(&label).css_classes(["flat", "omni-menu-item"]).build())
+                let label = gtk::Label::builder()
+                    .label(*name)
+                    .xalign(0.0)
+                    .halign(gtk::Align::Start)
+                    .ellipsize(gtk::pango::EllipsizeMode::End)
+                    .build();
+                (
+                    *bit,
+                    gtk::Button::builder()
+                        .child(&label)
+                        .css_classes(["flat", "omni-menu-item"])
+                        .build(),
+                )
             })
             .collect(),
     );
@@ -1287,13 +2902,28 @@ fn show_filter_menu(ui: &Ui, keyboard: bool) {
     menu.add_css_class("omni-filter-menu");
     menu.set_child(Some(&items));
     menu.set_parent(&ui.filter_button);
-    // Exactly as wide as the filter button, centred under it. Centring (not start-aligning)
-    // because the popover's surface has invisible shadow margins. The popover can't be
-    // resized once open (Wayland dismisses it), so the width is fixed here.
+    // Fit-content width, min = All button + 24px. Centered under the button, 6px below;
+    // clamp so the popup stays 8px inside the panel's right edge.
     let button = &ui.filter_button;
-    items.set_size_request((button.width() - 10).max(1), -1); // minus the menu's padding + border
+    let mut widest = 0;
+    for (_, b) in buttons.iter() {
+        let (_, nat, _, _) = b.measure(gtk::Orientation::Horizontal, -1);
+        widest = widest.max(nat);
+    }
+    let pad = 8; // contents padding 4px × 2
+    let width = (widest + pad).max(button.width() + 24).max(1);
+    items.set_size_request(width, -1);
     menu.set_halign(gtk::Align::Center);
-    menu.set_offset(0, 6);
+    let mut ox = 0i32;
+    if let (Some(panel), Some(btn)) = (ui.card.compute_bounds(&ui.window), button.compute_bounds(&ui.window)) {
+        let btn_cx = btn.x() + btn.width() / 2.0;
+        let panel_right = panel.x() + panel.width() - 8.0;
+        let pop_right = btn_cx + width as f32 / 2.0;
+        if pop_right > panel_right {
+            ox = (panel_right - pop_right).round() as i32;
+        }
+    }
+    menu.set_offset(ox, 6);
     menu.set_pointing_to(Some(&gdk::Rectangle::new(0, 0, button.width(), button.height())));
 
     let weak = Rc::downgrade(&me);
@@ -1324,7 +2954,11 @@ fn show_filter_menu(ui: &Ui, keyboard: bool) {
 /// message (mid-conversation the conversation carries on with the new model).
 fn show_model_menu(ui: &Ui) {
     let Some(me) = ui.me.borrow().upgrade() else { return };
-    let menu = gtk::Popover::builder().has_arrow(false).position(gtk::PositionType::Bottom).build();
+    let menu = gtk::Popover::builder()
+        .has_arrow(false)
+        .autohide(false)
+        .position(gtk::PositionType::Bottom)
+        .build();
     menu.add_css_class("omni-menu");
     menu.add_css_class("omni-filter-menu");
     menu.add_css_class("omni-model-menu");
@@ -1413,9 +3047,11 @@ fn app_hit(info: &gio::AppInfo, name: &str) -> Hit {
     Hit {
         title: name.to_string(),
         subtitle: info.description().map(|d| d.to_string()).unwrap_or_default(),
+        subtitle_markup: false,
         icon: info.icon(),
         action: Action::App(info.clone()),
         file_menu: false,
+        match_type: None,
     }
 }
 
@@ -1423,9 +3059,11 @@ fn action_hit(app: &apps::App, action: &apps::AppAction) -> Hit {
     Hit {
         title: action.name.clone(),
         subtitle: app.name.clone(),
+        subtitle_markup: false,
         icon: app.info.icon(),
         action: Action::AppAction(app.info.clone(), action.clone()),
         file_menu: false,
+        match_type: None,
     }
 }
 
@@ -1444,15 +3082,16 @@ fn recent_hits(ui: &Ui) -> Vec<Hit> {
             continue;
         }
         let name = f.path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let kind = if f.is_dir { "Folder" } else { "File" };
         items.push((
             f.time,
             Hit {
                 title: name,
-                subtitle: format!("{kind} \u{b7} {}", recent::folder_label(&f.path)),
+                subtitle: recent::folder_label(&f.path),
+                subtitle_markup: false,
                 icon: Some(recent::icon(&f.path, f.is_dir)),
                 action: Action::Open(f.file),
                 file_menu: !f.is_dir,
+                match_type: Some(MatchType::Name),
             },
         ));
     }
@@ -1469,9 +3108,11 @@ fn web_hit(ui: &Ui, query: &str) -> Hit {
             Some(b) => format!("{} \u{b7} {b}", engine.name),
             None => engine.name.clone(),
         },
+        subtitle_markup: false,
         icon: engine.browser.as_ref().and_then(|b| b.icon()).or_else(|| Some(gio::ThemedIcon::new("web-browser").upcast())),
         action: Action::Web(query.to_string()),
         file_menu: false,
+        match_type: None,
     }
 }
 
@@ -1482,9 +3123,11 @@ fn service_hit(s: &services::Service) -> Hit {
     Hit {
         title,
         subtitle: format!("{} \u{b7} {} \u{b7} right-click for actions", s.unit, s.summary()),
+        subtitle_markup: false,
         icon: Some(gio::ThemedIcon::new(if s.active == "failed" { "dialog-warning-symbolic" } else { "system-run-symbolic" }).upcast()),
         action: Action::Service(s.clone()),
         file_menu: false,
+        match_type: None,
     }
 }
 
@@ -1495,9 +3138,11 @@ fn claude_hit(ui: &Ui, query: &str) -> Option<Hit> {
     Some(Hit {
         title: format!("Ask Claude \u{201c}{query}\u{201d}"),
         subtitle: format!("Quick answer \u{b7} {} \u{b7} Shift+Enter", ui.answer.choice_label()),
+        subtitle_markup: false,
         icon,
         action: Action::Claude(query.to_string()),
         file_menu: false,
+        match_type: None,
     })
 }
 
@@ -1509,78 +3154,117 @@ fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
         Some(i) => gtk::Image::from_gicon(i),
         None => gtk::Image::from_icon_name("application-x-executable"),
     };
-    icon.set_pixel_size(36);
+    icon.set_pixel_size(28);
+    icon.set_halign(gtk::Align::Center);
+    icon.set_valign(gtk::Align::Center);
 
-    // Long names/paths never widen the popup: labels ask for (almost) no natural width,
-    // fill whatever the fixed-width card gives them, and end in "…".
-    let label = |text: &str, class: &str| {
-        let l = gtk::Label::builder()
-            .label(text)
+    let query = ui.entry.text();
+    let title = gtk::Label::builder()
+        .use_markup(true)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(1)
+        .hexpand(true)
+        .build();
+    title.add_css_class("omni-title");
+    if matches!(hit.action, Action::Info) {
+        title.set_text(&hit.title);
+    } else {
+        title.set_markup(&highlight_title(&hit.title, query.trim()));
+    }
+
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    text.set_valign(gtk::Align::Center);
+    text.set_hexpand(true);
+    text.append(&title);
+    if !hit.subtitle.is_empty() {
+        let sub = gtk::Label::builder()
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .max_width_chars(1)
             .hexpand(true)
             .build();
-        l.add_css_class(class);
-        l
-    };
-    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    text.set_valign(gtk::Align::Center);
-    text.set_hexpand(true);
-    text.append(&label(&hit.title, "omni-title"));
-    if !hit.subtitle.is_empty() {
-        text.append(&label(&hit.subtitle, "omni-subtitle"));
+        sub.add_css_class("omni-subtitle");
+        if hit.subtitle_markup {
+            sub.set_use_markup(true);
+            sub.set_markup(&hit.subtitle);
+        } else {
+            sub.set_text(&hit.subtitle);
+        }
+        text.append(&sub);
     }
 
     let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    row_box.set_valign(gtk::Align::Center);
     row_box.append(&icon);
     row_box.append(&text);
+    if matches!(hit.match_type, Some(MatchType::Content | MatchType::Both)) {
+        let badge = gtk::Label::new(Some("content"));
+        badge.add_css_class("omni-content-badge");
+        badge.set_valign(gtk::Align::Center);
+        badge.set_halign(gtk::Align::End);
+        row_box.append(&badge);
+    }
 
     let row = gtk::ListBoxRow::builder().child(&row_box).build();
-    // Files and folders: hovering shows the full path in the strip at the bottom of the card.
-    if let Action::Open(file) = &hit.action {
-        if let Some(path) = file.path() {
-            let hover = gtk::EventControllerMotion::new();
-            let (me, path) = (ui.me.borrow().clone(), path.to_string_lossy().to_string());
-            hover.connect_enter(move |_, _, _| {
-                if let Some(ui) = me.upgrade() {
-                    ui.hover_gen.set(ui.hover_gen.get() + 1);
-                    ui.path_label.set_text(&path);
-                    ui.path_reveal.set_reveal_child(true);
-                }
-            });
-            let me = ui.me.borrow().clone();
-            hover.connect_leave(move |_| {
-                let Some(ui) = me.upgrade() else { return };
-                // Hide a moment later, unless the pointer has moved onto another file.
-                let generation = ui.hover_gen.get() + 1;
-                ui.hover_gen.set(generation);
-                let me = me.clone();
-                glib::timeout_add_local_once(Duration::from_millis(120), move || {
-                    if let Some(ui) = me.upgrade() {
-                        if ui.hover_gen.get() == generation {
-                            ui.path_reveal.set_reveal_child(false);
-                        }
-                    }
-                });
-            });
-            row.add_controller(hover);
-        }
-    }
-    if hit.file_menu || matches!(hit.action, Action::App(_) | Action::Web(_) | Action::Service(_)) {
-        let right_click = gtk::GestureClick::new();
-        right_click.set_button(gdk::BUTTON_SECONDARY);
-        let me = ui.me.borrow().clone();
-        right_click.connect_pressed(move |gesture, _, x, y| {
-            let (Some(ui), Some(row)) = (me.upgrade(), gesture.widget()) else { return };
-            let Some(row) = row.downcast_ref::<gtk::ListBoxRow>() else { return };
-            let at = row.compute_point(&ui.list, &gtk::graphene::Point::new(x as f32, y as f32));
-            let at = at.map(|p| gdk::Rectangle::new(p.x() as i32, p.y() as i32, 1, 1));
-            open_row_menu(&ui, row.index() as usize, at);
-        });
-        row.add_controller(right_click);
+    if matches!(hit.action, Action::Info) {
+        row.set_activatable(false);
+        row.set_selectable(false);
     }
     row
+}
+
+/// Accent-color markup for query matches in a title (weight unchanged).
+fn highlight_title(title: &str, query: &str) -> String {
+    const ACCENT: &str = "#7aa2f7";
+    let words: Vec<Vec<char>> = query
+        .split_whitespace()
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_lowercase().chars().collect())
+        .collect();
+    if words.is_empty() {
+        return glib::markup_escape_text(title).to_string();
+    }
+    let title_chars: Vec<char> = title.chars().collect();
+    let lower: Vec<char> = title.to_lowercase().chars().collect();
+    if title_chars.len() != lower.len() {
+        return glib::markup_escape_text(title).to_string();
+    }
+    let mut mark = vec![false; title_chars.len()];
+    for w in &words {
+        if w.is_empty() {
+            continue;
+        }
+        let mut i = 0;
+        while i + w.len() <= lower.len() {
+            if lower[i..i + w.len()] == w[..] {
+                for bit in &mut mark[i..i + w.len()] {
+                    *bit = true;
+                }
+                i += w.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut i = 0;
+    while i < title_chars.len() {
+        let on = mark[i];
+        let mut j = i + 1;
+        while j < title_chars.len() && mark[j] == on {
+            j += 1;
+        }
+        let chunk: String = title_chars[i..j].iter().collect();
+        let esc = glib::markup_escape_text(&chunk);
+        if on {
+            out.push_str(&format!("<span foreground=\"{ACCENT}\">{esc}</span>"));
+        } else {
+            out.push_str(&esc);
+        }
+        i = j;
+    }
+    out
 }
 
 /// The calculator's result, shown as the answer: expression small on top, result large
@@ -1613,8 +3297,8 @@ fn calc_row(hit: &Hit) -> gtk::ListBoxRow {
 }
 
 fn open_selected_menu(ui: &Ui) {
-    if let Some(row) = ui.list.selected_row() {
-        open_row_menu(ui, row.index() as usize, None);
+    if !ui.hits.borrow().is_empty() {
+        open_row_menu(ui, ui.selected_index.get(), None);
     }
 }
 
@@ -1680,29 +3364,89 @@ enum MenuEntry {
     Header(&'static str),
 }
 
+fn dismiss_menu(ui: &Ui) {
+    // Leave ui.menu set so connect_closed still matches, unparents, clears, and
+    // restores entry focus. take()+popdown() skipped that grab_focus path.
+    if let Some(menu) = ui.menu.borrow().as_ref().cloned() {
+        menu.popdown();
+    }
+}
+
+fn click_inside_menu(ui: &Ui, win_x: f64, win_y: f64) -> bool {
+    let Some(menu) = ui.menu.borrow().as_ref().cloned() else {
+        return false;
+    };
+    let Some(picked) = ui.window.pick(win_x, win_y, gtk::PickFlags::DEFAULT) else {
+        // Popover is often its own surface — pick on the window misses it.
+        // Treat that as outside the menu chrome on the main surface.
+        return false;
+    };
+    let mut widget = Some(picked);
+    while let Some(w) = widget {
+        if w == menu {
+            return true;
+        }
+        widget = w.parent();
+    }
+    false
+}
+
+/// Row under a window-surface point, for right-click. Prefer pick(), fall back to
+/// list row_at_y — neither needs a Wayland enter event.
+fn row_menu_target(ui: &Ui, win_x: f64, win_y: f64) -> Option<(usize, gdk::Rectangle)> {
+    let at = ui
+        .window
+        .compute_point(&ui.list, &gtk::graphene::Point::new(win_x as f32, win_y as f32))
+        .map(|p| gdk::Rectangle::new(p.x().round() as i32, p.y().round() as i32, 1, 1))?;
+
+    let row = ui
+        .window
+        .pick(win_x, win_y, gtk::PickFlags::DEFAULT)
+        .and_then(|picked| {
+            let mut widget = Some(picked);
+            while let Some(w) = widget {
+                if let Ok(r) = w.clone().downcast::<gtk::ListBoxRow>() {
+                    return Some(r);
+                }
+                widget = w.parent();
+            }
+            None
+        })
+        .or_else(|| ui.list.row_at_y(at.y()))?;
+
+    Some((row.index() as usize, at))
+}
+
 /// The right-click menu of a file or app row, pointing at `at` (list coordinates) or,
 /// from the keyboard, the row itself.
 /// Files: Open, then "Open with" apps registered for the file's type, guessed from its
-/// name so opening the menu never touches the disk. Apps: Open, then the app's actions.
-/// Web search: Search, then the browser's private (and Brave's Tor) window.
-fn open_row_menu(ui: &Ui, index: usize, at: Option<gdk::Rectangle>) {
+/// name so opening the menu never touches the disk. Folders: Open, containing folder,
+/// copy path. Apps: Open, then the app's actions. Web search: Search, then the browser's
+/// private (and Brave's Tor) window.
+/// Returns false when this row has no menu (caller should not swallow the click).
+fn open_row_menu(ui: &Ui, index: usize, at: Option<gdk::Rectangle>) -> bool {
     let entries = match ui.hits.borrow().get(index) {
         Some(Hit { action: Action::Open(file), file_menu: true, .. }) => file_menu_entries(file),
+        Some(Hit { action: Action::Open(file), file_menu: false, .. }) => folder_menu_entries(file),
         Some(Hit { action: Action::App(info), .. }) => app_menu_entries(ui, info),
         Some(Hit { action: Action::Web(query), .. }) => web_menu_entries(ui, query),
         Some(Hit { action: Action::Service(service), .. }) => service_menu_entries(service),
-        _ => return,
+        _ => return false,
     };
-    let Some(row) = ui.list.row_at_index(index as i32) else { return };
-    ui.list.select_row(Some(&row));
+    if entries.is_empty() {
+        return false;
+    }
+    let Some(row) = ui.list.row_at_index(index as i32) else { return false };
+    set_selected_index(ui, index, false);
     // From the keyboard there's no cursor: drop from just inside the row's bottom-left.
     let Some(target) = at.or_else(|| {
         let b = row.compute_bounds(&ui.list)?;
         Some(gdk::Rectangle::new(b.x() as i32 + 48, (b.y() + b.height()) as i32 - 8, 1, 1))
     }) else {
-        return;
+        return false;
     };
     show_menu(ui, entries, target);
+    true
 }
 
 fn file_menu_entries(file: &gio::File) -> Vec<MenuEntry> {
@@ -1735,6 +3479,37 @@ fn file_menu_entries(file: &gio::File) -> Vec<MenuEntry> {
             });
         }
     }
+    entries
+}
+
+/// Folder right-click: Open, open the parent, copy the path (no "Open with" list).
+fn folder_menu_entries(file: &gio::File) -> Vec<MenuEntry> {
+    let icon = |name: &str| Some(gio::ThemedIcon::new(name).upcast::<gio::Icon>());
+    let default = gio::AppInfo::default_for_type("inode/directory", false)
+        .map(|a| a.display_name().to_string());
+    let mut entries = vec![MenuEntry::Item {
+        label: "Open".into(),
+        detail: default,
+        icon: icon("document-open-symbolic"),
+        action: Action::Open(file.clone()),
+    }];
+    let Some(path) = file.path() else { return entries };
+    if let Some(parent) = path.parent() {
+        if parent != path {
+            entries.push(MenuEntry::Item {
+                label: "Open containing folder".into(),
+                detail: None,
+                icon: icon("folder-symbolic"),
+                action: Action::Open(gio::File::for_path(parent)),
+            });
+        }
+    }
+    entries.push(MenuEntry::Item {
+        label: "Copy path".into(),
+        detail: None,
+        icon: icon("edit-copy-symbolic"),
+        action: Action::Copy(path.display().to_string()),
+    });
     entries
 }
 
@@ -1798,9 +3573,13 @@ fn web_menu_entries(ui: &Ui, query: &str) -> Vec<MenuEntry> {
 
 fn show_menu(ui: &Ui, entries: Vec<MenuEntry>, target: gdk::Rectangle) {
     let Some(me) = ui.me.borrow().upgrade() else { return };
-    let menu = gtk::Popover::builder().has_arrow(false).position(gtk::PositionType::Bottom).build();
+    let menu = gtk::Popover::builder()
+        .has_arrow(false)
+        .autohide(false) // we dismiss ourselves; autohide steals the pointer on Wayland
+        .position(gtk::PositionType::Bottom)
+        .build();
     menu.add_css_class("omni-menu");
-    let items = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let items = gtk::Box::new(gtk::Orientation::Vertical, 1);
     let fired = Rc::new(Cell::new(false));
     for entry in entries {
         let (label, detail, icon, action) = match entry {
@@ -1813,16 +3592,28 @@ fn show_menu(ui: &Ui, entries: Vec<MenuEntry>, target: gdk::Rectangle) {
             }
             MenuEntry::Item { label, detail, icon, action } => (label, detail, icon, action),
         };
-        let content = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         if let Some(icon) = icon {
             let image = gtk::Image::from_gicon(&icon);
-            image.set_pixel_size(20);
+            image.set_pixel_size(16);
             content.append(&image);
         }
-        content.append(&gtk::Label::builder().label(label).xalign(0.0).hexpand(true).build());
+        // Cap natural width so long labels (e.g. Tor window) don't stretch the menu.
+        let title = gtk::Label::builder()
+            .label(label)
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(22)
+            .build();
+        content.append(&title);
         if let Some(detail) = detail {
-            let detail = gtk::Label::new(Some(&detail));
-            detail.add_css_class("omni-menu-detail");
+            let detail = gtk::Label::builder()
+                .label(detail)
+                .css_classes(["omni-menu-detail"])
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .max_width_chars(10)
+                .build();
             content.append(&detail);
         }
         let button = gtk::Button::builder().child(&content).css_classes(["flat", "omni-menu-item"]).build();
@@ -1840,19 +3631,13 @@ fn show_menu(ui: &Ui, entries: Vec<MenuEntry>, target: gdk::Rectangle) {
         items.append(&button);
     }
 
-    // The drop-open animation is CSS only (style.css, omni-menu-in): resizing an open
-    // popover makes Wayland dismiss it, so the menu must appear at its full size.
-    let first = items.first_child();
-    items.connect_map(move |_| {
-        if let Some(first) = &first {
-            first.grab_focus();
-        }
-    });
+    // Don't grab_focus the first item — right-click menus shouldn't open with a
+    // keyboard focus ring on the top option (looks selected; easy to activate by mistake).
     menu.set_child(Some(&items));
     menu.set_parent(&ui.list);
     // Top-left corner just right of and below the pointer.
     menu.set_halign(gtk::Align::Start);
-    menu.set_offset(4, 6);
+    menu.set_offset(2, 4);
     menu.set_pointing_to(Some(&target));
 
     let weak = Rc::downgrade(&me);
@@ -1884,20 +3669,24 @@ fn move_selection(ui: &Ui, delta: i32) {
     if count == 0 {
         return;
     }
-    let cur = ui.list.selected_row().map(|r| r.index()).unwrap_or(0);
-    let next = (cur + delta).rem_euclid(count);
-    if let Some(row) = ui.list.row_at_index(next) {
-        ui.list.select_row(Some(&row));
-        ui.user_moved.set(true);
-        scroll_to_row(ui, &row);
-    }
+    let cur = ui.selected_index.get() as i32;
+    let next = (cur + delta).clamp(0, count - 1) as usize;
+    // Animation first; scroll (layout) waits for the next idle.
+    set_selected_index(ui, next, true);
+    let weak = ui.me.borrow().clone();
+    glib::idle_add_local_once(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        scroll_to_cached(&ui, ui.selected_index.get());
+    });
 }
 
-/// Scroll the result list just enough that `row` is fully in view.
-fn scroll_to_row(ui: &Ui, row: &gtk::ListBoxRow) {
-    let Some(bounds) = row.compute_bounds(&ui.list) else { return };
+/// Scroll using cached row geometry — no layout reads on the selection hot path.
+fn scroll_to_cached(ui: &Ui, index: usize) {
+    let Some(&(top, h)) = ui.row_geom.borrow().get(index) else {
+        return;
+    };
+    let bottom = top + h;
     let adj = ui.list_scroll.vadjustment();
-    let (top, bottom) = (bounds.y() as f64, (bounds.y() + bounds.height()) as f64);
     if top < adj.value() {
         adj.set_value(top);
     } else if bottom > adj.value() + adj.page_size() {
@@ -1907,10 +3696,16 @@ fn scroll_to_row(ui: &Ui, row: &gtk::ListBoxRow) {
 
 fn activate(ui: &Ui, index: usize) {
     let Some(action) = ui.hits.borrow().get(index).map(|h| h.action.clone()) else { return };
+    if matches!(action, Action::Info) {
+        return;
+    }
     run(ui, action);
 }
 
 fn run(ui: &Ui, action: Action) {
+    if matches!(action, Action::Info) {
+        return;
+    }
     if let Action::Claude(query) = action {
         // Stays open: the answer streams into the popup.
         ui.reveal.set_reveal_child(false);
@@ -1967,32 +3762,62 @@ fn run(ui: &Ui, action: Action) {
         Action::WebIn(query, window) => ui.web.borrow().search_in(&query, window),
         Action::App(info) => match info.launch(&[], Some(&ctx)) {
             Ok(()) => ui.apps.borrow_mut().record_launch(&info),
-            Err(e) => eprintln!("omni: failed to launch {}: {e}", info.display_name()),
+            Err(e) => {
+                let name = info.display_name();
+                eprintln!("omni: failed to launch {name}: {e}");
+                notify_user(&format!("Couldn't launch {name}"), &e.to_string());
+            }
         },
         Action::AppAction(info, action) => match apps::launch_action(&info, &action, ctx.upcast_ref()) {
             Ok(()) => ui.apps.borrow_mut().record_launch(&info),
-            Err(e) => eprintln!("omni: failed to launch {} ({}): {e}", info.display_name(), action.name),
+            Err(e) => {
+                let name = info.display_name();
+                eprintln!("omni: failed to launch {name} ({}): {e}", action.name);
+                notify_user(&format!("Couldn't launch {name}"), &e.to_string());
+            }
         },
         Action::Open(file) => match gio::AppInfo::launch_default_for_uri(&file.uri(), Some(&ctx)) {
             Ok(()) => recent::record(&file),
-            Err(e) => eprintln!("omni: couldn't open {}: {e}", file.uri()),
+            Err(e) => {
+                eprintln!("omni: couldn't open {}: {e}", file.uri());
+                notify_user("Couldn't open", &e.to_string());
+            }
         },
         Action::OpenWith(info, file) => match info.launch(&[file.clone()], Some(&ctx)) {
             Ok(()) => recent::record(&file),
-            Err(e) => eprintln!("omni: couldn't open {} with {}: {e}", file.uri(), info.display_name()),
+            Err(e) => {
+                let name = info.display_name();
+                eprintln!("omni: couldn't open {} with {name}: {e}", file.uri());
+                notify_user(&format!("Couldn't open with {name}"), &e.to_string());
+            }
         },
         Action::Copy(_) => {}
         Action::DockPin(id, pinned) => dock::set_pinned(&id, pinned),
+        Action::Info => {}
         Action::Claude(_) | Action::Service(_) | Action::ServiceVerb(..) | Action::ServiceStatus(_) => unreachable!(),
     }
+}
+
+/// Desktop notification after the popup has closed (same pattern as services.rs).
+fn notify_user(title: &str, body: &str) {
+    let body = glib::markup_escape_text(body);
+    let _ = gio::Subprocess::newv(
+        &["notify-send", "-a", "omni", "-i", "dialog-error", "--", title, body.as_str()]
+            .map(std::ffi::OsStr::new),
+        gio::SubprocessFlags::NONE,
+    );
 }
 
 fn toggle(ui: &Rc<Ui>) {
     if ui.window.is_visible() {
         hide(ui);
     } else {
-        // Fresh recents each time it opens.
+        // Fresh recents each time it opens; selection starts at 0 (snapped).
+        ui.selected_index.set(0);
+        ui.is_snapping.set(true);
+        set_sel_transition_enabled(ui, false);
         refresh(ui);
+        set_selected_index(ui, 0, false);
         load_services(ui);
         capture_backdrop(ui);
         // Re-read the default browser/engine in case it changed since last time.
@@ -2330,7 +4155,9 @@ fn capture_backdrop(ui: &Ui) {
 /// of a screen `height` logical pixels tall.
 fn fit_to_monitor(ui: &Ui, height: i32) {
     let room = (height - CARD_TOP - BOTTOM_GAP - CARD_CHROME).max(200);
-    ui.list_scroll.set_max_content_height(room);
+    // List: at most 7 rows; shrinks with content below that.
+    let list_cap = (MAX_VISIBLE_ROWS * ROW_HEIGHT).min(room);
+    ui.list_scroll.set_max_content_height(list_cap);
     ui.answer.set_max_height(room);
     ui.status_scroll.set_max_content_height(room);
 }

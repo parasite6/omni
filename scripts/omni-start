@@ -4,7 +4,39 @@
 #
 # Healthy = has a Wayland display (GTK hangs without one at early login) and answers
 # a ping on its socket (omni-toggle --ping never opens the popup).
+set -euo pipefail
+
 bin="$HOME/.local/share/omni/bin"
+runtime="${XDG_RUNTIME_DIR:-}"
+
+# A zombie omni still matches pgrep and can keep the GTK app-id / a half-dead
+# socket. ensure-running cannot reap zombies (kill is a no-op on them) and would
+# start a second instance that never becomes healthy. Refuse instead.
+omni_state() { awk '{print $3}' "/proc/$1/stat" 2>/dev/null || true; }
+
+zombies=()
+live=()
+for pid in $(pgrep -x omni 2>/dev/null || true); do
+    case "$(omni_state "$pid")" in
+        Z) zombies+=("$pid") ;;
+        ""|X) ;;
+        *) live+=("$pid") ;;
+    esac
+done
+
+if ((${#zombies[@]} > 0)); then
+    msg="zombie omni still present (${zombies[*]}); not starting a second instance"
+    logger -t ensure-running "[omni] $msg"
+    echo "omni-start: $msg" >&2
+    echo "omni-start: reap it (or restart the session) before starting omni again" >&2
+    exit 1
+fi
+
+# Stale socket after a dead peer makes connect hang; drop it when nothing live is using it.
+if ((${#live[@]} == 0)) && [ -n "$runtime" ]; then
+    rm -f "$runtime/omni.sock"
+fi
+
 exec /usr/local/bin/ensure-running \
     --name omni \
     --comm omni \

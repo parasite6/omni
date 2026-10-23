@@ -1,9 +1,5 @@
-//! The liquid-glass card: draws a lightly blurred copy of the screen behind it,
-//! with a magnified rim to fake light bending at the glass edge.
-//!
-//! Hyprland's blur is global and far too strong (text behind turns into a flat wash),
-//! so omni captures the area behind the card with `grim` just before showing and
-//! blurs it itself. The capture is static while the popup is open.
+//! Opaque launcher card shell. Capture hooks remain for show/fit, but the backdrop
+//! is not painted — the panel fill is fully opaque CSS (`#1b1b1f`).
 
 use std::cell::{Cell, RefCell};
 use std::process::Command;
@@ -11,23 +7,28 @@ use std::time::Duration;
 
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
-use gtk::{gdk, glib, graphene, gsk};
+use gtk::{gdk, glib};
 
-/// Must match `border-radius` of `.omni-card` / `.omni-glass` in style.css.
-pub const RADIUS: f32 = 32.0;
-/// Blur radius for the background, in logical px. Small enough that text stays recognisable.
-const BLUR: f64 = 9.0;
-/// Width of the refracting rim and how much it magnifies.
-const RIM: f32 = 9.0;
-const RIM_ZOOM: f32 = 1.07;
-/// Extra area captured around the card so the blur doesn't fade out at its edges.
+/// Must match `--radius-panel` / `.omni-card` border-radius in style.css.
+#[allow(dead_code)]
+pub const RADIUS: f32 = 10.0;
+/// Unused while the panel is fully opaque (no backdrop draw).
+#[allow(dead_code)]
+const BLUR: f64 = 12.0;
+#[allow(dead_code)]
+const RIM: f32 = 0.0;
+#[allow(dead_code)]
+const RIM_ZOOM: f32 = 1.0;
+/// Extra area still requested by show/fit code paths.
 pub const BLEED: i32 = 32;
-/// White text needs the backdrop (after the CSS tint) to be about this dark at most.
-const MAX_LUMA: f32 = 0.30;
-/// Never dim more than this: past it the card stops reading as glass.
-const MAX_DIM: f32 = 0.72;
-/// `.omni-glass`'s own black tint (style.css), already darkening the backdrop.
-const CSS_TINT: f32 = 0.18;
+#[allow(dead_code)]
+const MAX_LUMA: f32 = 0.20;
+#[allow(dead_code)]
+const MAX_DIM: f32 = 0.85;
+/// Fully opaque `.omni-glass` (`#1b1b1f`); no see-through.
+const CSS_TINT: f32 = 1.0;
+#[allow(dead_code)]
+const BRIGHT_PERCENTILE: usize = 97;
 
 mod imp {
     use super::*;
@@ -53,50 +54,15 @@ mod imp {
 
     impl WidgetImpl for GlassCard {
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
-            if let Some(tex) = self.texture.borrow().as_ref() {
-                let w = self.obj().width() as f32;
-                let h = self.obj().height() as f32;
-                let (ox, oy) = self.offset.get();
-                // Texture is in device pixels; draw it at logical size.
-                let scale = self.obj().scale_factor() as f32;
-                let tex_rect = graphene::Rect::new(
-                    ox,
-                    oy,
-                    tex.width() as f32 / scale,
-                    tex.height() as f32 / scale,
-                );
-                let card = graphene::Rect::new(0.0, 0.0, w, h);
-
-                snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(card, RADIUS));
-
-                // Rim: the background slightly magnified around the card's centre,
-                // so things behind the edge appear bent, like thick curved glass.
-                snapshot.push_blur(BLUR);
-                snapshot.save();
-                snapshot.translate(&graphene::Point::new(w / 2.0, h / 2.0));
-                snapshot.scale(RIM_ZOOM, RIM_ZOOM);
-                snapshot.translate(&graphene::Point::new(-w / 2.0, -h / 2.0));
-                snapshot.append_texture(tex, &tex_rect);
-                snapshot.restore();
-                snapshot.pop();
-
-                // Body: the background in place, inside the rim. The hard line where they
-                // meet is deliberate (a feathered edge was tried and looked worse).
-                let inner = graphene::Rect::new(RIM, RIM, w - 2.0 * RIM, h - 2.0 * RIM);
-                snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(inner, RADIUS - RIM));
-                snapshot.push_blur(BLUR);
-                snapshot.append_texture(tex, &tex_rect);
-                snapshot.pop();
-                snapshot.pop();
-
-                // Bright backdrop (a white app behind): darken it, the rim included.
-                let dim = self.dim.get();
-                if dim > 0.0 {
-                    snapshot.append_color(&gdk::RGBA::new(0.0, 0.0, 0.0, dim), &card);
-                }
-
-                snapshot.pop();
-            }
+            // Fully opaque CSS panel — do not paint the captured backdrop.
+            let _ = (
+                &self.texture,
+                self.offset.get(),
+                self.dim.get(),
+                BLUR,
+                RIM,
+                RIM_ZOOM,
+            );
             self.parent_snapshot(snapshot);
         }
     }
@@ -140,8 +106,8 @@ impl GlassCard {
     }
 }
 
-/// How much black the backdrop needs. Judged by its bright parts (85th percentile of
-/// luminance), not the average: half a white window behind the card still hides text.
+/// How much black the backdrop needs. Judged by its bright tail (see BRIGHT_PERCENTILE),
+/// not the average: sparse white text on a dark page must still force a dim.
 fn dim_for(tex: &gdk::Texture) -> f32 {
     let (w, h) = (tex.width() as usize, tex.height() as usize);
     if w == 0 || h == 0 {
@@ -159,7 +125,7 @@ fn dim_for(tex: &gdk::Texture) -> f32 {
             lumas.push((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0);
         }
     }
-    let k = (lumas.len() * 85 / 100).min(lumas.len() - 1);
+    let k = (lumas.len() * BRIGHT_PERCENTILE / 100).min(lumas.len() - 1);
     let bright = *lumas.select_nth_unstable_by(k, f32::total_cmp).1;
     dim_needed(bright)
 }
@@ -179,10 +145,8 @@ mod tests {
 
     #[test]
     fn dims_only_bright_backdrops() {
-        assert_eq!(dim_needed(0.1), 0.0); // dark wallpaper: clear glass
-        assert_eq!(dim_needed(0.3), 0.0);
-        let white = dim_needed(1.0);
-        assert!(white > 0.6 && white <= MAX_DIM, "{white}");
-        assert!(dim_needed(0.6) < white);
+        // Near-opaque CSS tint already keeps seen luma under MAX_LUMA for any backdrop.
+        assert_eq!(dim_needed(0.1), 0.0);
+        assert_eq!(dim_needed(1.0), 0.0);
     }
 }

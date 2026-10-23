@@ -430,7 +430,8 @@ impl Index {
             return (Vec::new(), Vec::new()); // the folder isn't in the index
         }
         let query = bounded_query(query);
-        let words: Vec<Vec<u8>> = query.split_whitespace().map(|w| w.to_ascii_lowercase().into_bytes()).collect();
+        let tokens = parse_query_tokens(query);
+        let words: Vec<Vec<u8>> = tokens.iter().map(QueryToken::name_needle).collect();
         if words.is_empty() {
             return (Vec::new(), Vec::new());
         }
@@ -772,7 +773,11 @@ impl Extras {
     pub fn search(&self, query: &str, scope: Option<&std::path::Path>) -> Vec<FileHit> {
         let query = bounded_query(query);
         let scope = scope.map(|s| s.to_string_lossy().to_ascii_lowercase().trim_end_matches('/').to_string() + "/");
-        let words: Vec<Vec<u8>> = query.split_whitespace().map(|w| w.to_ascii_lowercase().into_bytes()).collect();
+        let tokens = parse_query_tokens(query);
+        let words: Vec<Vec<u8>> = tokens.iter().map(QueryToken::name_needle).collect();
+        if words.is_empty() {
+            return Vec::new();
+        }
         let whole = query.trim().to_ascii_lowercase().into_bytes();
         let home = glib::home_dir();
         let home_dirs = home_folders(&home);
@@ -1168,28 +1173,427 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     gio::File::for_uri(uri).path()
 }
 
-/// Files whose *contents* match `query` (LocalSearch full-text index), up to `limit`.
-pub fn content_search(conn: &crate::sparql::Connection, query: &str, limit: usize) -> Vec<PathBuf> {
-    // Every word as a prefix match, all required.
-    let terms: Vec<String> = query
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(|w| format!("{}*", crate::sparql::escape(w)))
-        .collect();
-    if terms.is_empty() {
-        return Vec::new();
-    }
-    let sparql = format!(
-        "SELECT DISTINCT ?u WHERE {{ ?d fts:match \"{}\" ; nie:isStoredAs ?f . ?f nie:url ?u . }} LIMIT {limit}",
-        terms.join(" ")
-    );
-    match conn.query(&sparql) {
-        Ok(rows) => rows.iter().filter_map(|r| uri_to_path(r.first()?)).filter(|p| p.exists()).collect(),
-        Err(e) => {
-            eprintln!("omni: content search failed: {e}");
-            Vec::new()
+/// One LocalSearch FTS hit: path plus optional `fts:snippet` text.
+#[derive(Clone, Debug)]
+pub struct FtsHit {
+    pub path: PathBuf,
+    pub snippet: Option<String>,
+}
+
+/// One whitespace-separated unit of a file/contents query. Double-quoted spans are phrases.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryToken {
+    Word(String),
+    Phrase(String),
+}
+
+impl QueryToken {
+    /// Lowercase bytes to require in a file name (phrase = contiguous substring).
+    fn name_needle(&self) -> Vec<u8> {
+        match self {
+            Self::Word(s) | Self::Phrase(s) => s.to_ascii_lowercase().into_bytes(),
         }
     }
+}
+
+/// Split `query` on whitespace; keep `"quoted phrases"` as one token. Same tokens feed
+/// filename matching and LocalSearch `fts:match`.
+pub fn parse_query_tokens(query: &str) -> Vec<QueryToken> {
+    let query = bounded_query(query);
+    let mut tokens = Vec::new();
+    let mut rest = query;
+    while !rest.is_empty() {
+        let trimmed = rest.trim_start();
+        if trimmed.is_empty() {
+            break;
+        }
+        rest = trimmed;
+        if let Some(after_quote) = rest.strip_prefix('"') {
+            if let Some(end) = after_quote.find('"') {
+                let phrase = &after_quote[..end];
+                if !phrase.is_empty() {
+                    tokens.push(QueryToken::Phrase(phrase.to_string()));
+                }
+                rest = &after_quote[end + 1..];
+            } else {
+                // Unclosed quote: treat the remainder as a phrase.
+                if !after_quote.is_empty() {
+                    tokens.push(QueryToken::Phrase(after_quote.to_string()));
+                }
+                break;
+            }
+        } else {
+            let end = rest.find(|c: char| c.is_whitespace() || c == '"').unwrap_or(rest.len());
+            let word = &rest[..end];
+            if !word.is_empty() {
+                tokens.push(QueryToken::Word(word.to_string()));
+            }
+            rest = &rest[end..];
+        }
+    }
+    tokens
+}
+
+/// Escape one FTS atom so `AND`/`OR`/`NOT`/`NEAR` and FTS punctuation are literal.
+fn escape_fts_atom(text: &str) -> String {
+    let upper = text.to_ascii_uppercase();
+    let needs_quote = matches!(upper.as_str(), "AND" | "OR" | "NOT" | "NEAR")
+        || text.chars().any(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+    if needs_quote {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text.to_string()
+    }
+}
+
+/// LocalSearch FTS expression: every token AND-ed (implicit), `*` only on the last bare word.
+pub fn fts_match_expression(tokens: &[QueryToken]) -> Option<String> {
+    if tokens.is_empty() {
+        return None;
+    }
+    let last = tokens.len() - 1;
+    let parts: Vec<String> = tokens
+        .iter()
+        .enumerate()
+        .map(|(i, tok)| match tok {
+            QueryToken::Phrase(p) => format!("\"{}\"", p.replace('"', "\"\"")),
+            QueryToken::Word(w) => {
+                let atom = escape_fts_atom(w);
+                if i == last && !atom.starts_with('"') {
+                    format!("{atom}*")
+                } else {
+                    atom
+                }
+            }
+        })
+        .collect();
+    Some(parts.join(" "))
+}
+
+/// `file://` URI for a directory scope, with a trailing `/` for STRSTARTS matching.
+/// Resolves symlinks when possible so the URI matches LocalSearch's indexed paths.
+pub fn scope_file_uri(dir: &std::path::Path) -> String {
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut uri = gio::File::for_path(&dir).uri().to_string();
+    if !uri.ends_with('/') {
+        uri.push('/');
+    }
+    uri
+}
+
+/// Build the LocalSearch FTS SPARQL for `query` (content via `fts:match`, not filename).
+/// Optional `scope` restricts to files under that directory (recursive STRSTARTS on nie:url).
+/// Paths only (no `fts:snippet`): snippets are filled lazily for visible rows.
+pub fn content_search_sparql(query: &str, limit: usize, scope: Option<&std::path::Path>) -> Option<String> {
+    let tokens = parse_query_tokens(query);
+    let fts = fts_match_expression(&tokens)?;
+    let fts = crate::sparql::escape(&fts);
+    let scope_filter = scope
+        .map(|dir| {
+            let uri = crate::sparql::escape(&scope_file_uri(dir));
+            format!(" FILTER(STRSTARTS(?u, \"{uri}\"))")
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "SELECT DISTINCT ?u WHERE {{ \
+         ?d fts:match \"{fts}\" ; nie:isStoredAs ?f . ?f nie:url ?u .{scope_filter} \
+         }} ORDER BY DESC(fts:rank(?d)) LIMIT {limit}"
+    ))
+}
+
+/// Files whose *contents* match `query` (LocalSearch full-text index), up to `limit`.
+#[allow(dead_code)]
+pub fn content_search(
+    conn: &crate::sparql::Connection,
+    query: &str,
+    limit: usize,
+    scope: Option<&std::path::Path>,
+) -> Vec<PathBuf> {
+    content_search_localsearch(conn, query, limit, scope)
+        .0
+        .into_iter()
+        .map(|h| h.path)
+        .collect()
+}
+
+/// LocalSearch only (no ripgrep). Returns `(hits, sparql, error)`.
+pub fn content_search_localsearch(
+    conn: &crate::sparql::Connection,
+    query: &str,
+    limit: usize,
+    scope: Option<&std::path::Path>,
+) -> (Vec<FtsHit>, String, Option<String>) {
+    let Some(sparql) = content_search_sparql(query, limit, scope) else {
+        return (Vec::new(), String::new(), None);
+    };
+    match conn.query(&sparql) {
+        Ok(rows) => {
+            let hits = rows
+                .iter()
+                .filter_map(|r| {
+                    let path = uri_to_path(r.first()?)?;
+                    if !path.exists() {
+                        return None;
+                    }
+                    Some(FtsHit {
+                        path,
+                        snippet: None,
+                    })
+                })
+                .collect();
+            (hits, sparql, None)
+        }
+        Err(e) => {
+            eprintln!("omni: content search failed: {e}");
+            (Vec::new(), sparql, Some(e.to_string()))
+        }
+    }
+}
+
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Roots to scan with ripgrep: the scope folder, or configured trees when unscoped
+/// (`~/Documents/github`, `~/Projects`, `~/Documents` — never `$HOME`).
+fn content_rg_roots(scope: Option<&std::path::Path>) -> Vec<PathBuf> {
+    if let Some(dir) = scope {
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        return if dir.is_dir() { vec![dir] } else { Vec::new() };
+    }
+    let home = glib::home_dir();
+    let mut roots = Vec::new();
+    for rel in ["Documents/github", "Projects", "Documents"] {
+        let p = home.join(rel);
+        if p.is_dir() {
+            roots.push(p);
+        }
+    }
+    roots
+}
+
+/// Whether `query` tokens need regex (prefix on last word, or special chars). Else `-F`.
+fn rg_use_fixed_strings(tokens: &[QueryToken]) -> bool {
+    if tokens.is_empty() {
+        return true;
+    }
+    let last = tokens.len() - 1;
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok {
+            QueryToken::Phrase(_) => {}
+            QueryToken::Word(w) if i == last => return false, // prefix `\w*`
+            QueryToken::Word(w) => {
+                if w.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '-') {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn rg_binary() -> Option<&'static str> {
+    static RG: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *RG.get_or_init(|| {
+        for cand in ["/usr/bin/rg", "rg"] {
+            let ok = std::process::Command::new(cand)
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if ok {
+                return Some(cand);
+            }
+        }
+        None
+    })
+}
+
+/// Escape a literal for ripgrep's default regex mode (prefix `term*`).
+fn rg_regex_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for c in s.chars() {
+        if matches!(c, '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Blocking collect helper (tests). Prefer [`content_search_rg_stream`] in production.
+pub fn content_search_rg(query: &str, limit: usize, scope: Option<&std::path::Path>) -> Vec<FtsHit> {
+    let cancel = AtomicBool::new(false);
+    let slot = Mutex::new(None);
+    let mut hits = Vec::new();
+    content_search_rg_stream(query, limit, scope, &cancel, &slot, |hit| {
+        hits.push(hit);
+    });
+    hits
+}
+
+/// Stream ripgrep hits via `on_hit`. Kills the process at `limit` or when `cancel` is set.
+/// No snippets here — callers fill those lazily for visible rows.
+pub fn content_search_rg_stream(
+    query: &str,
+    limit: usize,
+    scope: Option<&std::path::Path>,
+    cancel: &AtomicBool,
+    child_slot: &Mutex<Option<std::process::Child>>,
+    mut on_hit: impl FnMut(FtsHit),
+) -> usize {
+    if limit == 0 || cancel.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let tokens = parse_query_tokens(query);
+    if tokens.is_empty() {
+        return 0;
+    }
+    let roots = content_rg_roots(scope);
+    if roots.is_empty() {
+        return 0;
+    }
+    let Some(rg) = rg_binary() else {
+        return 0;
+    };
+
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
+    let mut cmd = std::process::Command::new(rg);
+    cmd.args([
+        "--files-with-matches",
+        "--max-count",
+        "1",
+        "--max-filesize",
+        "1M",
+        "--max-columns",
+        "300",
+        "--smart-case",
+        "--no-messages",
+        "--color=never",
+        "--threads",
+        &threads.to_string(),
+    ]);
+    // Hidden dirs skipped by default (node_modules/.git via gitignore + these globs).
+    // Explicit scope may be a hidden folder — still search it as the root.
+    if scope.is_none() {
+        cmd.args(["--glob", "!.*/**"]);
+    }
+    cmd.args([
+        "--glob",
+        "!.git/**",
+        "--glob",
+        "!**/node_modules/**",
+        "--glob",
+        "!**/target/**",
+        "--glob",
+        "!**/.venv/**",
+        "--glob",
+        "!**/.cache/**",
+    ]);
+    if tokens.len() > 1 {
+        cmd.arg("--all-match");
+    }
+    let fixed = rg_use_fixed_strings(&tokens);
+    if fixed {
+        cmd.arg("--fixed-strings");
+    }
+    let last = tokens.len() - 1;
+    for (i, tok) in tokens.iter().enumerate() {
+        let pat = match tok {
+            QueryToken::Phrase(p) if fixed => p.clone(),
+            QueryToken::Phrase(p) => rg_regex_literal(p),
+            QueryToken::Word(w) if fixed => w.clone(),
+            QueryToken::Word(w) if i == last => format!("{}\\w*", rg_regex_literal(w)),
+            QueryToken::Word(w) => rg_regex_literal(w),
+        };
+        cmd.arg("-e");
+        cmd.arg(pat);
+    }
+    for root in &roots {
+        cmd.arg(root);
+    }
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("omni: ripgrep content search failed: {e}");
+            return 0;
+        }
+    };
+    let stdout = child.stdout.take();
+    {
+        let mut slot = child_slot.lock().unwrap();
+        if let Some(mut old) = slot.take() {
+            let _ = old.kill();
+            let _ = old.wait();
+        }
+        *slot = Some(child);
+    }
+    let Some(stdout) = stdout else {
+        return 0;
+    };
+    use std::io::{BufRead, BufReader};
+    let reader = BufReader::new(stdout);
+    let mut count = 0usize;
+    for line in reader.lines() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let Ok(line) = line else { break };
+        let path = PathBuf::from(line.trim());
+        if !path.is_file() {
+            continue;
+        }
+        on_hit(FtsHit {
+            path,
+            snippet: None,
+        });
+        count += 1;
+        if count >= limit {
+            break;
+        }
+    }
+    // Cap reached or EOF: kill so a rare-term scan of a huge tree doesn't keep running.
+    if let Some(mut child) = child_slot.lock().unwrap().take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    count
+}
+
+/// Read a short snippet for a content hit (lazy, off the search hot path). Caps at 1 MB.
+pub fn content_snippet_for(path: &std::path::Path, query: &str) -> Option<String> {
+    use std::io::Read;
+    let needles: Vec<String> = parse_query_tokens(query)
+        .into_iter()
+        .map(|t| match t {
+            QueryToken::Word(s) | QueryToken::Phrase(s) => s.to_ascii_lowercase(),
+        })
+        .collect();
+    if needles.is_empty() {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 1024 * 1024];
+    let n = file.read(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf[..n]);
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if needles.iter().any(|n| lower.contains(n.as_str())) {
+            let trimmed = collapse_ws(line.trim());
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.chars().count() > 120 {
+                return Some(trimmed.chars().take(120).collect::<String>() + "\u{2026}");
+            }
+            return Some(trimmed);
+        }
+    }
+    None
 }
 
 /// Paths for LocalSearch resource URNs (from its change events).
@@ -1214,6 +1618,85 @@ pub fn resolve_urns(conn: &crate::sparql::Connection, urns: &[String]) -> Vec<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_sparql_uses_fts_match_not_filename() {
+        let q = content_search_sparql("omnicontentprobeQUUX42XYZ", 4, None).expect("terms");
+        assert!(q.contains("fts:match"), "{q}");
+        assert!(!q.contains("fts:snippet"), "{q}");
+        assert!(q.contains("omnicontentprobeQUUX42XYZ*"), "{q}");
+        assert!(q.contains("ORDER BY DESC(fts:rank(?d))"), "{q}");
+        assert!(!q.contains("nfo:fileName"), "{q}");
+        assert!(!q.contains("STRSTARTS"), "{q}");
+        // Multi-word: AND all terms; prefix * only on the last bare word.
+        let multi = content_search_sparql("hello world", 4, None).unwrap();
+        assert!(multi.contains("hello world*"), "{multi}");
+        assert!(!multi.contains("hello*"), "{multi}");
+        let phrase = content_search_sparql("\"crystal clear water\"", 4, None).unwrap();
+        assert!(phrase.contains("crystal clear water"), "{phrase}");
+        assert!(!phrase.contains("water*"), "{phrase}");
+    }
+
+    #[test]
+    fn content_sparql_scope_uses_strstarts_on_file_uri() {
+        let dir = PathBuf::from("/home/someone/Documents");
+        let q = content_search_sparql("needle", 4, Some(&dir)).unwrap();
+        assert!(q.contains("STRSTARTS(?u,"), "{q}");
+        assert!(q.contains("file:///home/someone/Documents/"), "{q}");
+        assert!(q.contains("fts:match"), "{q}");
+        assert!(q.contains("ORDER BY DESC(fts:rank(?d))"), "{q}");
+    }
+
+    #[test]
+    fn content_rg_finds_file_under_git_scope() {
+        if rg_binary().is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("omni-rg-{}-git", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        struct Rm(PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _rm = Rm(dir.clone());
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let path = dir.join("note.txt");
+        std::fs::write(&path, b"unique zebrafluxcapacitor token here\n").unwrap();
+        let hits = content_search_rg("zebrafluxcapacitor", 4, Some(&dir));
+        assert!(
+            hits.iter().any(|h| h.path == path),
+            "rg must find content inside a .git tree LocalSearch skips: {hits:?}"
+        );
+        let miss = content_search_rg("zebrafluxcapacitor nowhere", 4, Some(&dir));
+        assert!(miss.is_empty(), "{miss:?}");
+    }
+
+    #[test]
+    fn query_tokens_split_whitespace_and_phrases() {
+        assert_eq!(
+            parse_query_tokens(r#"alpha beta"#),
+            vec![QueryToken::Word("alpha".into()), QueryToken::Word("beta".into())]
+        );
+        assert_eq!(
+            parse_query_tokens(r#""crystal clear water""#),
+            vec![QueryToken::Phrase("crystal clear water".into())]
+        );
+        assert_eq!(
+            parse_query_tokens(r#"alpha "crystal clear" water"#),
+            vec![
+                QueryToken::Word("alpha".into()),
+                QueryToken::Phrase("crystal clear".into()),
+                QueryToken::Word("water".into()),
+            ]
+        );
+        assert_eq!(fts_match_expression(&parse_query_tokens("alpha beta")).as_deref(), Some("alpha beta*"));
+        assert_eq!(
+            fts_match_expression(&parse_query_tokens(r#""crystal clear water""#)).as_deref(),
+            Some(r#""crystal clear water""#)
+        );
+    }
 
     #[test]
     fn files_query_is_capped_at_eight_words_and_256_bytes() {

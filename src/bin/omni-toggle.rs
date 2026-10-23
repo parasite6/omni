@@ -7,11 +7,15 @@
 //
 // `omni-toggle --ping`: health check for ensure-running. Exits 0 only if omni answers
 // "pong" within a second; never toggles the popup.
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Duration;
+
+const ROUND_TRIP: Duration = Duration::from_secs(1);
 
 fn main() -> ExitCode {
     // Same socket as omni. Unset or empty: stop. /tmp is shared, so it is not a fallback.
@@ -62,8 +66,10 @@ fn ping(socket: &Path) -> bool {
 }
 
 fn request(socket: &Path, msg: &[u8], expect: &[u8]) -> bool {
-    let Ok(mut stream) = UnixStream::connect(socket) else { return false };
-    let timeout = Some(Duration::from_secs(1));
+    let Ok(mut stream) = connect_timeout(socket, ROUND_TRIP) else {
+        return false;
+    };
+    let timeout = Some(ROUND_TRIP);
     if stream.set_read_timeout(timeout).is_err() || stream.set_write_timeout(timeout).is_err() {
         return false;
     }
@@ -72,6 +78,95 @@ fn request(socket: &Path, msg: &[u8], expect: &[u8]) -> bool {
     }
     let mut reply = vec![0u8; expect.len()];
     stream.read_exact(&mut reply).is_ok() && reply == expect
+}
+
+/// `UnixStream::connect` can block forever on a half-dead peer (zombie omni still
+/// "listening"). Nonblocking connect + poll caps that to `timeout`.
+fn connect_timeout(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let bytes = path.as_os_str().as_bytes();
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    if bytes.len() >= addr.sun_path.len() {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "socket path too long"));
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr() as *const libc::c_char,
+            addr.sun_path.as_mut_ptr(),
+            bytes.len(),
+        );
+    }
+    // pathname socket: include the trailing NUL in the address length
+    let addr_len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as libc::socklen_t;
+
+    let rc = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const libc::sockaddr_un as *const libc::sockaddr,
+            addr_len,
+        )
+    };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINPROGRESS) {
+            unsafe { libc::close(fd) };
+            return Err(err);
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let pr = unsafe { libc::poll(&mut pfd, 1, ms) };
+        if pr == 0 {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out"));
+        }
+        if pr < 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        let mut so_error: libc::c_int = 0;
+        let mut sol = std::mem::size_of_val(&so_error) as libc::socklen_t;
+        let g = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut so_error as *mut _ as *mut libc::c_void,
+                &mut sol,
+            )
+        };
+        if g < 0 {
+            let e = io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        if so_error != 0 {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::from_raw_os_error(so_error));
+        }
+    }
+
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+    }
+    Ok(unsafe { UnixStream::from_raw_fd(fd) })
 }
 
 /// Wait up to 5 s for a freshly started omni to answer.
