@@ -219,6 +219,12 @@ struct Ui {
     sel_transition_on: Cell<bool>,
     /// True between list rebuild and deferred post-layout snap (skip resize snap).
     sel_layout_pending: Cell<bool>,
+    /// Resize/scale changed while a snap was in flight — re-place once snap finishes.
+    sel_needs_replace: Cell<bool>,
+    /// Bumped on each results visual update (for paint-frame accounting).
+    sel_update_gen: Cell<u64>,
+    /// FrameClock paint callbacks counted for the current `sel_update_gen`.
+    sel_paint_frames: Cell<u32>,
     /// Last pointer position for hover — ignore synthetic moves when the cursor is still.
     hover_pointer: Cell<(f64, f64)>,
     /// Coalesce hover selection updates to one per frame.
@@ -831,6 +837,9 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         is_snapping: Cell::new(true),
         sel_transition_on: Cell::new(false),
         sel_layout_pending: Cell::new(false),
+        sel_needs_replace: Cell::new(false),
+        sel_update_gen: Cell::new(0),
+        sel_paint_frames: Cell::new(0),
         hover_pointer: Cell::new((f64::NAN, f64::NAN)),
         hover_frame_pending: Cell::new(false),
         hover_pending_index: Cell::new(None),
@@ -947,6 +956,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     contents.connect_toggled(move |b| {
         let on = b.is_active();
         save_contents_setting(on);
+        // Always cancel + clear searching/pending (Idle) so the footer never sticks.
         invalidate_content_cache(&u);
         contents_log(format!("toggle → {on}; cache cleared"));
         let u = u.clone();
@@ -989,11 +999,17 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
 
     let u = ui.clone();
     entry.connect_search_changed(move |_| {
+        sel_log(format!(
+            "keystroke text={:?} selectedIndex={}",
+            u.entry.text().to_string(),
+            u.selected_index.get()
+        ));
         // Typing with a menu open: dismiss first (launcher feel), then refresh.
         if u.menu.borrow().is_some() {
             dismiss_menu(&u);
         }
         refresh(&u);
+        sel_log_state(&u, "after_keystroke_refresh");
     });
 
     let u = ui.clone();
@@ -1096,11 +1112,12 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         let u = ui.clone();
         let overlay_wh = overlay_wh.clone();
         ui.list_overlay.connect_notify_local(Some(prop), move |overlay, _| {
-            if u.is_snapping.get() || u.sel_layout_pending.get() {
-                return;
-            }
             let wh = (overlay.width(), overlay.height());
             if overlay_wh.replace(wh) == wh {
+                return;
+            }
+            if u.is_snapping.get() || u.sel_layout_pending.get() {
+                u.sel_needs_replace.set(true);
                 return;
             }
             cache_row_geometry(&u);
@@ -1110,6 +1127,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     let u = ui.clone();
     ui.list.connect_notify_local(Some("scale-factor"), move |_, _| {
         if u.is_snapping.get() || u.sel_layout_pending.get() {
+            u.sel_needs_replace.set(true);
             return;
         }
         cache_row_geometry(&u);
@@ -1380,11 +1398,11 @@ fn refresh(ui: &Ui) {
     }
 
     // Keep the same result if it still exists (by stable id); otherwise clamp to 0.
-    let prev_key = ui.hits.borrow().get(ui.selected_index.get()).map(hit_key);
+    let prev_index = ui.selected_index.get();
+    let prev_key = ui.hits.borrow().get(prev_index).map(hit_key);
+    let chrome_was_shown =
+        ui.selection_fill.is_visible() && ui.selection_fill.opacity() >= 1.0 && !ui.hits.borrow().is_empty();
     *ui.shown_query.borrow_mut() = query.to_string();
-
-    // List updates never animate the highlight (stale geometry mid-rebuild).
-    begin_selection_snap(ui);
 
     let next = prev_key
         .as_ref()
@@ -1393,27 +1411,43 @@ fn refresh(ui: &Ui) {
     let keep_scroll = prev_key
         .as_ref()
         .is_some_and(|k| hits.iter().any(|h| &hit_key(h) == k));
+    // While typing the selected *slot* usually stays put (index 0). Same index ⇒ same
+    // chrome geometry — skip place entirely even if the hit id at that slot changed.
+    // (Re-applying transform / toggling transition CSS was a flicker source.)
+    let same_selection = chrome_was_shown && next == prev_index;
 
+    // Invalidate hover targets; do NOT hide chrome (that caused the typing blink).
+    ui.hover_gen.set(ui.hover_gen.get() + 1);
+
+    arm_sel_paint_count(ui);
     apply_hits(ui, &hits);
 
     if !keep_scroll {
         ui.list_scroll.vadjustment().set_value(0.0);
     }
     let has = !hits.is_empty();
-    ui.reveal.set_reveal_child(has);
+    if ui.reveal.reveals_child() != has {
+        ui.reveal.set_reveal_child(has);
+    }
     // Footer keeps a fixed height whenever the list is shown so the panel doesn't jump.
-    ui.path_reveal.set_reveal_child(has);
+    if ui.path_reveal.reveals_child() != has {
+        ui.path_reveal.set_reveal_child(has);
+    }
     *ui.hits.borrow_mut() = hits;
     if has {
         ui.selected_index.set(next.min(ui.hits.borrow().len() - 1));
+        sel_log(format!(
+            "refresh results count={} selectedIndex={} id={:?} keep_scroll={keep_scroll} same_selection={same_selection}",
+            ui.hits.borrow().len(),
+            ui.selected_index.get(),
+            ui.hits.borrow().get(ui.selected_index.get()).map(hit_key),
+        ));
         update_path_footer(ui, Some(ui.selected_index.get()));
-        // After layout (next frame): cache row geometry, snap highlight, restore scroll.
-        schedule_selection_snap(ui);
+        finish_results_selection_visual(ui, same_selection, chrome_was_shown);
         if next > 0 && keep_scroll {
             let weak = ui.me.borrow().clone();
             let idx = ui.selected_index.get();
             glib::idle_add_local_once(move || {
-                // After schedule_selection_snap's layout tick has had a chance to cache.
                 let Some(ui) = weak.upgrade() else { return };
                 let weak = ui.me.borrow().clone();
                 ui.list_overlay.add_tick_callback(move |_, _| {
@@ -1434,26 +1468,114 @@ fn refresh(ui: &Ui) {
             set_sel_transition_enabled(ui, true);
         }
         update_path_footer(ui, None);
+        sel_log("refresh empty → hide chrome");
     }
 }
 
-/// Cancel transform transitions and hide chrome until a deferred snap.
-fn begin_selection_snap(ui: &Ui) {
-    ui.hover_gen.set(ui.hover_gen.get() + 1);
+/// After a non-empty results update: keep chrome visible; skip place when selection id is unchanged.
+fn finish_results_selection_visual(ui: &Ui, same_selection: bool, chrome_was_shown: bool) {
+    // Same id at same index: leave highlight alone (no transform/CSS/opacity touch).
+    if same_selection {
+        ui.sel_layout_pending.set(false);
+        ui.is_snapping.set(false);
+        if ui.selection_fill.opacity() < 1.0 {
+            show_selection_chrome(ui);
+        }
+        sel_log_verify(ui);
+        let op = ui.selection_fill.opacity();
+        let weak = ui.me.borrow().clone();
+        let update_gen = ui.sel_update_gen.get();
+        glib::timeout_add_local_once(Duration::from_millis(50), move || {
+            let Some(ui) = weak.upgrade() else { return };
+            if ui.sel_update_gen.get() != update_gen {
+                return;
+            }
+            sel_log(format!(
+                "UPDATE highlight=skipped same_slot opacity={op:.2} chrome_place=0 paints={}",
+                ui.sel_paint_frames.get()
+            ));
+        });
+        return;
+    }
+
     ui.is_snapping.set(true);
     ui.sel_layout_pending.set(true);
     set_sel_transition_enabled(ui, false);
-    ui.selection_fill.set_opacity(0.0);
-    ui.selection_pill.set_opacity(0.0);
+    // Keep an existing highlight visible for the whole update. First show stays
+    // hidden until place+show below (no opacity blink on an already-shown chrome).
+    if chrome_was_shown {
+        show_selection_chrome(ui);
+    }
+
+    cache_row_geometry(ui);
+    // Prefer live bounds; if GTK hasn't allocated yet after a diff, estimate from row height
+    // so we can snap in this same update without blinking.
+    let geom = cached_sel_geom(ui).or_else(|| estimate_sel_geom(ui));
+    if let Some((y, h)) = geom {
+        ui.sel_layout_pending.set(false);
+        apply_sel_transform(ui, y, h);
+        show_selection_chrome(ui);
+        sel_log(format!(
+            "UPDATE highlight=moved y={y:.1} h={h:.1} opacity={:.2} same_frame=1 chrome_place=1",
+            ui.selection_fill.opacity()
+        ));
+        sel_log_verify(ui);
+        let weak = ui.me.borrow().clone();
+        let update_gen = ui.sel_update_gen.get();
+        ui.list_overlay.add_tick_callback(move |_, _| {
+            if let Some(ui) = weak.upgrade() {
+                // Refine from real bounds once allocated (no opacity change).
+                cache_row_geometry(&ui);
+                if let Some((y2, h2)) = cached_sel_geom(&ui) {
+                    apply_sel_transform(&ui, y2, h2);
+                }
+                ui.is_snapping.set(false);
+                if motion_enabled() {
+                    set_sel_transition_enabled(&ui, true);
+                }
+                flush_sel_needs_replace(&ui);
+                sel_log(format!(
+                    "UPDATE done opacity={:.2} chrome_place=1 paints={}",
+                    ui.selection_fill.opacity(),
+                    ui.sel_paint_frames.get()
+                ));
+                let _ = update_gen;
+            }
+            glib::ControlFlow::Break
+        });
+    } else {
+        // Genuine no-geometry (no row widget): keep prior visible position; retry without hiding.
+        sel_log("UPDATE highlight=defer no_geom (keep prior visible)");
+        schedule_selection_snap(ui);
+    }
 }
 
-/// After rows are laid out: cache geometry and snap highlight (no animation).
+/// Count FrameClock paints for the current results update (OMNI_LOG_SEL).
+fn arm_sel_paint_count(ui: &Ui) {
+    let update_gen = ui.sel_update_gen.get() + 1;
+    ui.sel_update_gen.set(update_gen);
+    ui.sel_paint_frames.set(0);
+    if std::env::var_os("OMNI_LOG_SEL").is_none() {
+        return;
+    }
+    let Some(clock) = ui.list_overlay.frame_clock() else {
+        return;
+    };
+    let weak = ui.me.borrow().clone();
+    clock.connect_after_paint(move |_| {
+        let Some(ui) = weak.upgrade() else { return };
+        if ui.sel_update_gen.get() != update_gen {
+            return;
+        }
+        ui.sel_paint_frames.set(ui.sel_paint_frames.get().saturating_add(1));
+    });
+}
+
+/// After rows are laid out: place highlight from fresh geometry (no animation, no hide).
 fn schedule_selection_snap(ui: &Ui) {
     let weak = ui.me.borrow().clone();
     glib::idle_add_local_once(move || {
         let Some(ui) = weak.upgrade() else { return };
-        ui.list.queue_allocate();
-        ui.list_overlay.queue_allocate();
         let weak = ui.me.borrow().clone();
         let frames = Cell::new(0u8);
         ui.list_overlay.add_tick_callback(move |_overlay, _| {
@@ -1464,68 +1586,105 @@ fn schedule_selection_snap(ui: &Ui) {
             frames.set(n);
             cache_row_geometry(&ui);
             let ready = cached_sel_geom(&ui).is_some() || ui.hits.borrow().is_empty();
-            if !ready && n < 3 {
+            if !ready && n < 5 {
+                sel_log(format!("schedule_selection_snap frame={n} waiting for row height"));
                 return glib::ControlFlow::Continue;
             }
             ui.sel_layout_pending.set(false);
-            snap_selection_chrome(&ui);
+            sel_log(format!(
+                "schedule_selection_snap frame={n} ready={ready} → update_selection_visual"
+            ));
+            update_selection_visual(&ui);
+            sel_log_state(&ui, "after_schedule_snap");
             verify_selection_geometry(&ui);
             glib::ControlFlow::Break
         });
     });
 }
 
-/// Reuse list rows keyed by `hit_key` so typing doesn't destroy geometry of survivors.
+/// Diff list rows by `hit_key`: update survivors in place, insert/remove only deltas.
+/// Never clears the list to empty between queries.
 fn apply_hits(ui: &Ui, hits: &[Hit]) {
     let old_keys = std::mem::take(&mut *ui.row_keys.borrow_mut());
-    let mut old: std::collections::HashMap<String, gtk::ListBoxRow> = std::collections::HashMap::new();
-    for (i, key) in old_keys.into_iter().enumerate() {
-        if let Some(row) = ui.list.row_at_index(0) {
-            // Always take index 0 as we remove; keys were parallel to prior order.
-            let _ = i;
-            ui.list.remove(&row);
-            old.insert(key, row);
-        }
-    }
-    // Drain any leftover rows (keys out of sync).
-    while let Some(row) = ui.list.row_at_index(0) {
-        ui.list.remove(&row);
-    }
+    let new_keys: Vec<String> = hits.iter().map(hit_key).collect();
     let query = ui.entry.text();
     let query = query.trim();
-    let mut new_keys = Vec::with_capacity(hits.len());
-    for hit in hits {
-        let key = hit_key(hit);
-        let row = if let Some(row) = old.remove(&key) {
-            if refresh_row_contents(&row, hit, query) {
-                row
-            } else {
-                make_row(ui, hit)
+
+    // Fast path: identical identity sequence — patch labels only, no reparent.
+    if old_keys == new_keys {
+        for (i, hit) in hits.iter().enumerate() {
+            if let Some(row) = ui.list.row_at_index(i as i32) {
+                if !refresh_row_contents(&row, hit, query) {
+                    let fresh = make_row(ui, hit);
+                    ui.list.remove(&row);
+                    ui.list.insert(&fresh, i as i32);
+                }
+            }
+        }
+        *ui.row_keys.borrow_mut() = new_keys;
+        return;
+    }
+
+    let mut by_key: std::collections::HashMap<String, gtk::ListBoxRow> =
+        std::collections::HashMap::with_capacity(old_keys.len());
+    for (i, key) in old_keys.iter().enumerate() {
+        if let Some(row) = ui.list.row_at_index(i as i32) {
+            by_key.insert(key.clone(), row);
+        }
+    }
+
+    let new_set: std::collections::HashSet<&str> = new_keys.iter().map(|s| s.as_str()).collect();
+    // Drop rows that disappeared — list never goes fully empty if any key survives.
+    for (key, row) in by_key.iter() {
+        if !new_set.contains(key.as_str()) {
+            ui.list.remove(row);
+        }
+    }
+    by_key.retain(|k, _| new_set.contains(k.as_str()));
+
+    for (i, hit) in hits.iter().enumerate() {
+        let key = &new_keys[i];
+        if let Some(row) = by_key.remove(key) {
+            if row.index() != i as i32 {
+                ui.list.remove(&row);
+                ui.list.insert(&row, i as i32);
+            }
+            if !refresh_row_contents(&row, hit, query) {
+                let fresh = make_row(ui, hit);
+                ui.list.remove(&row);
+                ui.list.insert(&fresh, i as i32);
             }
         } else {
-            make_row(ui, hit)
-        };
-        new_keys.push(key);
-        ui.list.append(&row);
+            let row = make_row(ui, hit);
+            ui.list.insert(&row, i as i32);
+        }
+    }
+    // Strip any stragglers past the new length (keys out of sync).
+    while let Some(row) = ui.list.row_at_index(hits.len() as i32) {
+        ui.list.remove(&row);
     }
     *ui.row_keys.borrow_mut() = new_keys;
 }
 
-/// Update labels on a reused row. Returns false if the row must be rebuilt (e.g. calc / content badge).
+/// Update labels on a reused row. Returns false if structure must be rebuilt.
 fn refresh_row_contents(row: &gtk::ListBoxRow, hit: &Hit, query: &str) -> bool {
     if row.has_css_class("omni-calc") || matches!(hit.action, Action::Copy(_) | Action::Info) {
-        return false;
-    }
-    // Badge / snippet markup rows are cheaper to rebuild than to patch.
-    if matches!(hit.match_type, Some(MatchType::Content | MatchType::Both)) || hit.subtitle_markup {
         return false;
     }
     let Some(hbox) = row.child().and_downcast::<gtk::Box>() else {
         return false;
     };
+    // Expect: icon | text-vbox [| badge]
     let Some(vbox) = hbox.first_child().and_then(|c| c.next_sibling()).and_downcast::<gtk::Box>() else {
         return false;
     };
+    let wants_badge = matches!(hit.match_type, Some(MatchType::Content | MatchType::Both));
+    let has_badge = vbox
+        .next_sibling()
+        .is_some_and(|w| w.has_css_class("omni-content-badge"));
+    if wants_badge != has_badge {
+        return false;
+    }
     if let Some(title) = vbox.first_child().and_downcast::<gtk::Label>() {
         title.set_markup(&highlight_title(&hit.title, query));
     } else {
@@ -1533,7 +1692,14 @@ fn refresh_row_contents(row: &gtk::ListBoxRow, hit: &Hit, query: &str) -> bool {
     }
     match (vbox.first_child().and_then(|c| c.next_sibling()), hit.subtitle.is_empty()) {
         (Some(w), false) => {
-            if let Some(sub) = w.downcast_ref::<gtk::Label>() {
+            let Some(sub) = w.downcast_ref::<gtk::Label>() else {
+                return false;
+            };
+            if hit.subtitle_markup {
+                sub.set_use_markup(true);
+                sub.set_markup(&hit.subtitle);
+            } else {
+                sub.set_use_markup(false);
                 sub.set_text(&hit.subtitle);
             }
         }
@@ -1581,6 +1747,68 @@ fn contents_log(msg: impl std::fmt::Display) {
     if std::env::var_os("OMNI_LOG_CONTENTS").is_some() {
         eprintln!("omni[contents]: {msg}");
     }
+}
+
+fn sel_log(msg: impl std::fmt::Display) {
+    if std::env::var_os("OMNI_LOG_SEL").is_some() {
+        eprintln!("omni[sel]: {msg}");
+    }
+}
+
+/// Snapshot highlight + selection for diagnostics (OMNI_LOG_SEL).
+fn sel_log_state(ui: &Ui, phase: &str) {
+    if std::env::var_os("OMNI_LOG_SEL").is_none() {
+        return;
+    }
+    let count = ui.hits.borrow().len();
+    let idx = ui.selected_index.get();
+    let id = ui.hits.borrow().get(idx).map(hit_key).unwrap_or_else(|| "-".into());
+    let fill = &ui.selection_fill;
+    let pill = &ui.selection_pill;
+    let parent = fill
+        .parent()
+        .map(|p| p.type_().name().to_string())
+        .unwrap_or_else(|| "none".into());
+    let row_geom = ui.row_geom.borrow().get(idx).copied();
+    sel_log(format!(
+        "{phase} count={count} selectedIndex={idx} id={id:?} \
+         fill(vis={},opacity={:.2},parent={parent}) pill(vis={},opacity={:.2}) \
+         transform(y={:.1},h={:.1}) isSnapping={} sel_layout_pending={} transition_on={} \
+         row_geom={row_geom:?}",
+        fill.is_visible(),
+        fill.opacity(),
+        pill.is_visible(),
+        pill.opacity(),
+        ui.sel_y.get(),
+        ui.sel_h.get(),
+        ui.is_snapping.get(),
+        ui.sel_layout_pending.get(),
+        ui.sel_transition_on.get(),
+    ));
+}
+
+/// Per-keystroke verify line: opacity + chrome y/h vs selected row y/h.
+fn sel_log_verify(ui: &Ui) {
+    if std::env::var_os("OMNI_LOG_SEL").is_none() {
+        return;
+    }
+    let count = ui.hits.borrow().len();
+    let idx = ui.selected_index.get();
+    let row = ui.row_geom.borrow().get(idx).copied();
+    let (ry, rh) = row.unwrap_or((f64::NAN, f64::NAN));
+    let cy = ui.sel_y.get();
+    let ch = ui.sel_h.get();
+    let op = ui.selection_fill.opacity();
+    // During defer, row height may be 0 while chrome holds the prior place — still ok if opacity is 1.
+    let ok = count == 0
+        || (op >= 1.0
+            && ch >= 1.0
+            && (rh < 1.0 || ((cy - ry).abs() < 0.5 && (ch - rh).abs() < 0.5)));
+    sel_log(format!(
+        "VERIFY ok={ok} text={:?} count={count} selectedIndex={idx} opacity={op:.2} \
+         chrome(y={cy:.1},h={ch:.1}) row(y={ry:.1},h={rh:.1})",
+        ui.entry.text().to_string(),
+    ));
 }
 
 fn invalidate_content_cache(ui: &Ui) {
@@ -1890,8 +2118,26 @@ fn schedule_content_search(ui: &Ui, query: &str, scope: Option<&std::path::Path>
             start_content_search(&me, &key.query, key.scope_path().as_deref(), t0);
         } else {
             contents_log(format!("schedule dropped (stale) query={:?}", key.query));
+            // If no newer search owns the cache, clear searching so the footer can't stick.
+            clear_content_searching_if_gen(&me, generation);
         }
     });
+}
+
+/// Drop `searching` / `pending_key` when `generation` still owns the cache (no newer schedule).
+fn clear_content_searching_if_gen(ui: &Ui, generation: u64) {
+    if ui.content_gen.get() != generation {
+        return;
+    }
+    if let ContentCache::Active {
+        searching,
+        pending_key,
+        ..
+    } = &mut *ui.content.borrow_mut()
+    {
+        *searching = false;
+        *pending_key = None;
+    }
 }
 
 /// Resolve search text + optional directory scope from the entry (or an explicit pair).
@@ -2384,6 +2630,10 @@ fn update_path_footer(ui: &Ui, index: Option<usize>) {
             text.push_str(" \u{b7} searching\u{2026}");
         }
     }
+    // Skip truncation/redraw when the full path string is unchanged.
+    if *ui.path_full.borrow() == text {
+        return;
+    }
     *ui.path_full.borrow_mut() = text;
     apply_path_display(ui);
 }
@@ -2518,17 +2768,26 @@ fn apply_path_display(ui: &Ui) {
     let full = ui.path_full.borrow().clone();
     let box_w = ui.path_box.width();
     if box_w <= 0 {
-        ui.path_label.set_text("");
+        if !ui.path_label.text().is_empty() {
+            ui.path_label.set_text("");
+        }
         return;
     }
     if let Some((ref p, w, ref d)) = *ui.path_trunc_cache.borrow() {
         if p == &full && w == box_w {
-            ui.path_label.set_text(d);
+            // Already showing this truncation — do not set_text again (avoids redraw).
+            if ui.path_label.text().as_str() != d.as_str() {
+                ui.path_label.set_text(d);
+            }
             return;
         }
     }
     let avail = (box_w as f64) - 2.0 * PATH_FOOTER_PAD_X;
     let display = middle_truncate_path(&ui.path_label, &full, avail);
+    if ui.path_label.text().as_str() == display.as_str() {
+        *ui.path_trunc_cache.borrow_mut() = Some((full, box_w, display));
+        return;
+    }
     *ui.path_trunc_cache.borrow_mut() = Some((full, box_w, display.clone()));
     ui.path_label.set_text(&display);
 }
@@ -2583,6 +2842,19 @@ fn cached_sel_geom(ui: &Ui) -> Option<(f64, f64)> {
     (h >= 1.0).then_some((y, h))
 }
 
+/// When `compute_bounds` is still 0 after an in-place list diff, estimate from fixed row height.
+/// Matches measured index-0 origin (list padding ≈ 4px) used by the overlay chrome.
+fn estimate_sel_geom(ui: &Ui) -> Option<(f64, f64)> {
+    if ui.hits.borrow().is_empty() {
+        return None;
+    }
+    let index = ui.selected_index.get().min(ui.hits.borrow().len() - 1);
+    ui.list.row_at_index(index as i32)?;
+    const LIST_PAD_Y: f64 = 4.0;
+    let y = LIST_PAD_Y + (index as f64) * ROW_HEIGHT as f64;
+    Some((y, ROW_HEIGHT as f64))
+}
+
 /// Drive fill (translateY + scaleY) and pill (translateY only) — no layout properties.
 fn apply_sel_transform(ui: &Ui, y: f64, h: f64) {
     let h = h.max(1.0);
@@ -2632,35 +2904,106 @@ fn show_selection_chrome(ui: &Ui) {
     ui.selection_pill.set_opacity(1.0);
 }
 
-/// Snap with transition off; re-enable transition on the next frame (never same tick).
-fn snap_selection_chrome(ui: &Ui) {
+/// Place highlight from cached geometry with transition off; re-enable on the next frame.
+/// Called after every results update, open, resize, and filter/scope/toggle change.
+/// No early return for "selection unchanged" — that left opacity at 0 after snaps.
+fn update_selection_visual(ui: &Ui) {
+    update_selection_visual_attempt(ui, 0);
+}
+
+/// Retry until the selected row has nonzero height. Cap at 60 frames (warn + stop).
+/// Transition is re-enabled only after a successful place — never on give-up.
+fn update_selection_visual_attempt(ui: &Ui, attempt: u8) {
+    if !ui.window.is_visible() {
+        sel_log("update_selection_visual: window closed → stop");
+        hide_selection_chrome(ui);
+        ui.is_snapping.set(false);
+        ui.sel_layout_pending.set(false);
+        return;
+    }
+    if ui.hits.borrow().is_empty() {
+        sel_log("update_selection_visual: empty → hide");
+        hide_selection_chrome(ui);
+        ui.is_snapping.set(false);
+        ui.sel_layout_pending.set(false);
+        if motion_enabled() {
+            set_sel_transition_enabled(ui, true);
+        }
+        flush_sel_needs_replace(ui);
+        return;
+    }
+    let count = ui.hits.borrow().len();
+    let idx = ui.selected_index.get().min(count - 1);
+    ui.selected_index.set(idx);
+    // Selected row gone (list shrunk and clamp still leaves us without a widget).
+    if ui.list.row_at_index(idx as i32).is_none() {
+        sel_log(format!(
+            "update_selection_visual: no row at index={idx} → stop"
+        ));
+        hide_selection_chrome(ui);
+        ui.is_snapping.set(false);
+        return;
+    }
+    cache_row_geometry(ui);
     let Some((y, h)) = cached_sel_geom(ui) else {
+        // Keep prior highlight visible while waiting; hide only if that row is gone.
+        let row_gone = ui.list.row_at_index(idx as i32).is_none();
+        sel_log(format!(
+            "update_selection_visual: no geom attempt={attempt} row_gone={row_gone} → keep prior, retry"
+        ));
         ui.is_snapping.set(true);
         set_sel_transition_enabled(ui, false);
-        hide_selection_chrome(ui);
+        if row_gone {
+            hide_selection_chrome(ui);
+        } else if ui.selection_fill.is_visible() {
+            // Stay at last transform/opacity — do not blink.
+            ui.selection_fill.set_opacity(1.0);
+            ui.selection_pill.set_opacity(1.0);
+        }
+        if attempt >= 60 {
+            eprintln!(
+                "omni: update_selection_visual gave up after 60 frames (no row geometry)"
+            );
+            sel_log("update_selection_visual: WARNING 60-frame safety cap hit");
+            ui.is_snapping.set(false);
+            flush_sel_needs_replace(ui);
+            return;
+        }
         let weak = ui.me.borrow().clone();
         ui.list_overlay.add_tick_callback(move |_, _| {
             if let Some(ui) = weak.upgrade() {
-                ui.is_snapping.set(false);
-                if motion_enabled() {
-                    set_sel_transition_enabled(&ui, true);
-                }
+                update_selection_visual_attempt(&ui, attempt.saturating_add(1));
             }
             glib::ControlFlow::Break
         });
         return;
     };
-    // Already on target — do not reload CSS (avoids notify ↔ snap feedback loops).
-    if ui.selection_fill.is_visible()
-        && (ui.sel_y.get() - y).abs() < 0.5
-        && (ui.sel_h.get() - h).abs() < 0.5
-    {
+    // Skip no-op place when transform already matches and chrome is shown.
+    let same_geom =
+        (ui.sel_y.get() - y).abs() < 0.05 && (ui.sel_h.get() - h).abs() < 0.05;
+    let chrome_ok = ui.selection_fill.is_visible() && ui.selection_fill.opacity() >= 1.0;
+    if same_geom && chrome_ok {
+        sel_log(format!(
+            "update_selection_visual: skip place (geom unchanged) attempt={attempt}"
+        ));
+        ui.is_snapping.set(false);
+        ui.sel_layout_pending.set(false);
+        if motion_enabled() {
+            set_sel_transition_enabled(ui, true);
+        }
+        sel_log_verify(ui);
+        flush_sel_needs_replace(ui);
         return;
     }
+    sel_log(format!(
+        "update_selection_visual: place y={y:.1} h={h:.1} opacity→1 (was {:.2}) attempt={attempt}",
+        ui.selection_fill.opacity()
+    ));
     ui.is_snapping.set(true);
     set_sel_transition_enabled(ui, false);
-    apply_sel_transform(ui, y, h);
+    apply_sel_transform(ui, y, h); // may no-op if transform already matches
     show_selection_chrome(ui);
+    sel_log_verify(ui);
     let weak = ui.me.borrow().clone();
     ui.list_overlay.add_tick_callback(move |_, _| {
         if let Some(ui) = weak.upgrade() {
@@ -2668,15 +3011,36 @@ fn snap_selection_chrome(ui: &Ui) {
             if motion_enabled() {
                 set_sel_transition_enabled(&ui, true);
             }
+            sel_log_state(&ui, "update_selection_visual_done");
+            flush_sel_needs_replace(&ui);
         }
         glib::ControlFlow::Break
     });
+}
+
+/// If a resize/scale hit during snap, re-place now that snapping has finished.
+fn flush_sel_needs_replace(ui: &Ui) {
+    if !ui.sel_needs_replace.replace(false) {
+        return;
+    }
+    sel_log("flush_sel_needs_replace → update_selection_visual");
+    cache_row_geometry(ui);
+    update_selection_visual(ui);
+}
+
+/// Snap path used by resize/map — same as update_selection_visual.
+fn snap_selection_chrome(ui: &Ui) {
+    update_selection_visual(ui);
 }
 
 /// Set owned selection; starts transform animation first, defers footer off the hot path.
 fn set_selected_index(ui: &Ui, index: usize, animate: bool) {
     let t0 = std::time::Instant::now();
     let count = ui.hits.borrow().len();
+    sel_log(format!(
+        "set_selected_index index={index} animate={animate} count={count} prev={}",
+        ui.selected_index.get()
+    ));
     if count == 0 {
         ui.selected_index.set(0);
         hide_selection_chrome(ui);
@@ -2690,10 +3054,20 @@ fn set_selected_index(ui: &Ui, index: usize, animate: bool) {
     }
     let index = index.min(count - 1);
     if index == ui.selected_index.get() && animate {
+        let chrome_ok = ui.selection_fill.is_visible() && ui.selection_fill.opacity() >= 1.0;
+        if !chrome_ok {
+            sel_log(
+                "set_selected_index: unchanged but chrome hidden/dim → update_selection_visual",
+            );
+            update_selection_visual(ui);
+        } else {
+            sel_log("set_selected_index: skip (unchanged + animate)");
+        }
         return;
     }
     ui.selected_index.set(index);
     sync_selection_chrome(ui, animate);
+    sel_log_state(ui, "after_set_selected_index");
     let ms = t0.elapsed().as_secs_f64() * 1000.0;
     if ms > 2.0 {
         eprintln!("omni: selection handler {ms:.2}ms (want <2ms before animation)");
@@ -2713,8 +3087,10 @@ fn sync_selection_chrome(ui: &Ui, animate: bool) {
         hide_selection_chrome(ui);
         return;
     }
-    let Some((y, h)) = cached_sel_geom(ui) else {
-        hide_selection_chrome(ui);
+    cache_row_geometry(ui);
+    let Some((y, h)) = cached_sel_geom(ui).or_else(|| estimate_sel_geom(ui)) else {
+        // Keep prior chrome visible; retry via update path — never hide mid-navigation.
+        update_selection_visual(ui);
         return;
     };
     let snap = ui.is_snapping.get() || !animate || !motion_enabled();
@@ -3835,6 +4211,8 @@ fn toggle(ui: &Rc<Ui>) {
         ui.window.set_keyboard_mode(KeyboardMode::Exclusive);
         ui.window.present();
         ui.entry.grab_focus();
+        sel_log_state(ui, "toggle_open");
+        maybe_run_sel_diag(ui);
         // Re-read the installed apps too. GIO's "changed" signal normally keeps the
         // list current, but it has been missed at least once (an app stayed hidden
         // until omni restarted). This is ~30 ms, so it runs after the popup is drawn,
@@ -3850,6 +4228,93 @@ fn toggle(ui: &Rc<Ui>) {
             glib::ControlFlow::Break
         });
     }
+}
+
+/// OMNI_SEL_DIAG=claude — type letter-by-letter, backspace to empty, retype, then fast paste.
+fn maybe_run_sel_diag(ui: &Rc<Ui>) {
+    let Some(text) = std::env::var_os("OMNI_SEL_DIAG") else {
+        return;
+    };
+    let text = text.to_string_lossy().into_owned();
+    if text.is_empty() {
+        return;
+    }
+    sel_log(format!("SEL_DIAG start typing {text:?}"));
+    let weak = Rc::downgrade(ui);
+    let chars: Vec<char> = text.chars().collect();
+    // Phases: 0=type, 1=backspace, 2=retype slow, 3=clear+fast full string, 4=done
+    let phase = Cell::new(0u8);
+    let step = Cell::new(0usize);
+    glib::timeout_add_local(Duration::from_millis(220), move || {
+        let Some(ui) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if !ui.window.is_visible() {
+            return glib::ControlFlow::Break;
+        }
+        let p = phase.get();
+        match p {
+            0 | 2 => {
+                let i = step.get();
+                if i >= chars.len() {
+                    if p == 0 {
+                        phase.set(1);
+                        step.set(chars.len());
+                        sel_log("SEL_DIAG phase=backspace");
+                    } else {
+                        phase.set(3);
+                        step.set(0);
+                        sel_log("SEL_DIAG phase=fast");
+                    }
+                    return glib::ControlFlow::Continue;
+                }
+                let so_far: String = chars[..=i].iter().collect();
+                step.set(i + 1);
+                sel_log(format!(
+                    "SEL_DIAG type phase={p} step={} text={so_far:?}",
+                    i + 1
+                ));
+                ui.entry.set_text(&so_far);
+            }
+            1 => {
+                let i = step.get();
+                if i == 0 {
+                    phase.set(2);
+                    step.set(0);
+                    sel_log("SEL_DIAG phase=retype");
+                    return glib::ControlFlow::Continue;
+                }
+                let next = i - 1;
+                step.set(next);
+                let so_far: String = chars[..next].iter().collect();
+                sel_log(format!("SEL_DIAG backspace to {so_far:?}"));
+                ui.entry.set_text(&so_far);
+            }
+            3 => {
+                // Quick: clear then set full string in one shot (burst typing).
+                ui.entry.set_text("");
+                sel_log("SEL_DIAG fast clear");
+                let full = text.clone();
+                let weak = Rc::downgrade(&ui);
+                glib::timeout_add_local_once(Duration::from_millis(40), move || {
+                    if let Some(ui) = weak.upgrade() {
+                        sel_log(format!("SEL_DIAG fast set {full:?}"));
+                        ui.entry.set_text(&full);
+                        let weak = Rc::downgrade(&ui);
+                        glib::timeout_add_local_once(Duration::from_millis(500), move || {
+                            if let Some(ui) = weak.upgrade() {
+                                sel_log("SEL_DIAG done");
+                                hide(&ui);
+                            }
+                        });
+                    }
+                });
+                phase.set(4);
+            }
+            _ => return glib::ControlFlow::Break,
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// Enter in a conversation: send the bar's text as a follow-up. While Claude is still
@@ -4062,7 +4527,8 @@ fn hide(ui: &Ui) {
     close_answer(ui);
     ui.chatting.set(false);
     ui.entry.set_placeholder_text(Some(SEARCH_PLACEHOLDER));
-    *ui.content.borrow_mut() = Default::default();
+    // Cancel Contents backends and bump gen so in-flight batches can't revive "searching…".
+    invalidate_content_cache(ui);
     ui.entry.set_text("");
     refresh(ui);
     ui.reveal.set_reveal_child(false);
