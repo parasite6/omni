@@ -86,16 +86,32 @@ impl GlassCard {
     /// to the card. On failure the card just shows its CSS tint.
     pub fn capture(&self, x: i32, y: i32, w: i32, h: i32, offset: (f32, f32)) {
         let geometry = format!("{x},{y} {w}x{h}");
+        let log = std::env::var_os("OMNI_LOG_OPEN").is_some();
+        let t0 = std::time::Instant::now();
         // Time-limited: a hung grim would otherwise freeze omni for good.
         let texture = crate::util::output_with_timeout(
             Command::new("grim").args(["-g", &geometry, "-t", "png", "-l", "0", "-"]),
             Duration::from_millis(500),
         )
         .and_then(|png| gdk::Texture::from_bytes(&glib::Bytes::from_owned(png)).ok());
+        if log {
+            eprintln!(
+                "omni[open]:   grim_png ({:.1}ms) ok={}",
+                t0.elapsed().as_secs_f64() * 1000.0,
+                texture.is_some()
+            );
+        }
         if texture.is_none() {
             eprintln!("omni: couldn't capture the background ({geometry})");
         }
+        let t1 = std::time::Instant::now();
         self.imp().dim.set(texture.as_ref().map_or(0.0, dim_for));
+        if log {
+            eprintln!(
+                "omni[open]:   dim_for ({:.1}ms)",
+                t1.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         self.imp().texture.replace(texture);
         self.imp().offset.set(offset);
         self.queue_draw();

@@ -136,6 +136,10 @@ fn words(s: &str) -> Vec<String> {
 }
 
 impl Apps {
+    pub fn len(&self) -> usize {
+        self.apps.len()
+    }
+
     pub fn load() -> Self {
         let mut apps = Self { apps: Vec::new(), usage: load_usage(), default_browser: None };
         apps.reload();

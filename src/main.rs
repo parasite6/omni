@@ -225,6 +225,14 @@ struct Ui {
     sel_update_gen: Cell<u64>,
     /// FrameClock paint callbacks counted for the current `sel_update_gen`.
     sel_paint_frames: Cell<u32>,
+    /// Monotonic start of the current open (OMNI_LOG_OPEN staging).
+    open_t0: Cell<Option<Instant>>,
+    /// Bumped on hide / cancel so deferred snap/retry ticks become no-ops.
+    sel_place_gen: Cell<u64>,
+    /// Allow place while the window is still unmapped (open path, before present).
+    place_while_hidden: Cell<bool>,
+    /// Ignore hover-driven selection until this monotonic time (µs), and until real motion.
+    hover_suppress_until: Cell<i64>,
     /// Last pointer position for hover — ignore synthetic moves when the cursor is still.
     hover_pointer: Cell<(f64, f64)>,
     /// Coalesce hover selection updates to one per frame.
@@ -840,6 +848,10 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         sel_needs_replace: Cell::new(false),
         sel_update_gen: Cell::new(0),
         sel_paint_frames: Cell::new(0),
+        open_t0: Cell::new(None),
+        sel_place_gen: Cell::new(0),
+        place_while_hidden: Cell::new(false),
+        hover_suppress_until: Cell::new(0),
         hover_pointer: Cell::new((f64::NAN, f64::NAN)),
         hover_frame_pending: Cell::new(false),
         hover_pending_index: Cell::new(None),
@@ -1055,8 +1067,19 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         if u.menu.borrow().is_some() {
             return;
         }
+        // After show: ignore stationary pointer / synthetic enters until suppress ends
+        // and a real move is seen (hover_pointer starts as NaN on each open).
+        let now = glib::monotonic_time();
+        if now < u.hover_suppress_until.get() {
+            return;
+        }
         let (px, py) = u.hover_pointer.get();
-        if px.is_finite() && py.is_finite() && (px - x).abs() < 0.5 && (py - y).abs() < 0.5 {
+        if !px.is_finite() || !py.is_finite() {
+            // First motion after suppress: record position, do not change selection.
+            u.hover_pointer.set((x, y));
+            return;
+        }
+        if (px - x).abs() < 0.5 && (py - y).abs() < 0.5 {
             return;
         }
         u.hover_pointer.set((x, y));
@@ -1077,6 +1100,9 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
                 return glib::ControlFlow::Break;
             };
             ui.hover_frame_pending.set(false);
+            if glib::monotonic_time() < ui.hover_suppress_until.get() {
+                return glib::ControlFlow::Break;
+            }
             if let Some(idx) = ui.hover_pending_index.take() {
                 if idx != ui.selected_index.get() {
                     set_selected_index(&ui, idx, true);
@@ -2587,6 +2613,7 @@ fn connect_localsearch(ui: &Rc<Ui>) {
         *ui.notifier.borrow_mut() = Some(notifier);
         *ui.sparql.borrow_mut() = Some(conn);
         contents_log("LocalSearch connected");
+        open_log(&ui, "indexer_connection_ready (LocalSearch)");
         // Retry contents search if the toggle was already on before the bus was ready.
         if ui.contents.is_active() && ui.window.is_visible() {
             let q = ui.entry.text();
@@ -2630,11 +2657,11 @@ fn update_path_footer(ui: &Ui, index: Option<usize>) {
             text.push_str(" \u{b7} searching\u{2026}");
         }
     }
-    // Skip truncation/redraw when the full path string is unchanged.
-    if *ui.path_full.borrow() == text {
-        return;
+    let same_full = *ui.path_full.borrow() == text;
+    if !same_full {
+        *ui.path_full.borrow_mut() = text;
     }
-    *ui.path_full.borrow_mut() = text;
+    // Always re-apply: path_full may be correct while the label was cleared (width 0 on hide).
     apply_path_display(ui);
 }
 
@@ -2905,16 +2932,20 @@ fn show_selection_chrome(ui: &Ui) {
 }
 
 /// Place highlight from cached geometry with transition off; re-enable on the next frame.
-/// Called after every results update, open, resize, and filter/scope/toggle change.
-/// No early return for "selection unchanged" — that left opacity at 0 after snaps.
+/// Always refreshes the footer from `selected_index`. Called after every results update,
+/// open, resize, and filter/scope/toggle change.
 fn update_selection_visual(ui: &Ui) {
-    update_selection_visual_attempt(ui, 0);
+    update_selection_visual_attempt(ui, 0, ui.sel_place_gen.get());
 }
 
 /// Retry until the selected row has nonzero height. Cap at 60 frames (warn + stop).
 /// Transition is re-enabled only after a successful place — never on give-up.
-fn update_selection_visual_attempt(ui: &Ui, attempt: u8) {
-    if !ui.window.is_visible() {
+fn update_selection_visual_attempt(ui: &Ui, attempt: u8, place_gen: u64) {
+    if place_gen != ui.sel_place_gen.get() {
+        sel_log("update_selection_visual: stale place_gen → abort");
+        return;
+    }
+    if !ui.window.is_visible() && !ui.place_while_hidden.get() {
         sel_log("update_selection_visual: window closed → stop");
         hide_selection_chrome(ui);
         ui.is_snapping.set(false);
@@ -2926,7 +2957,8 @@ fn update_selection_visual_attempt(ui: &Ui, attempt: u8) {
         hide_selection_chrome(ui);
         ui.is_snapping.set(false);
         ui.sel_layout_pending.set(false);
-        if motion_enabled() {
+        update_path_footer(ui, None);
+        if motion_enabled() && ui.window.is_visible() {
             set_sel_transition_enabled(ui, true);
         }
         flush_sel_needs_replace(ui);
@@ -2942,10 +2974,11 @@ fn update_selection_visual_attempt(ui: &Ui, attempt: u8) {
         ));
         hide_selection_chrome(ui);
         ui.is_snapping.set(false);
+        update_path_footer(ui, None);
         return;
     }
     cache_row_geometry(ui);
-    let Some((y, h)) = cached_sel_geom(ui) else {
+    let Some((y, h)) = cached_sel_geom(ui).or_else(|| estimate_sel_geom(ui)) else {
         // Keep prior highlight visible while waiting; hide only if that row is gone.
         let row_gone = ui.list.row_at_index(idx as i32).is_none();
         sel_log(format!(
@@ -2960,6 +2993,8 @@ fn update_selection_visual_attempt(ui: &Ui, attempt: u8) {
             ui.selection_fill.set_opacity(1.0);
             ui.selection_pill.set_opacity(1.0);
         }
+        // Footer from selection even while geom retries.
+        update_path_footer(ui, Some(idx));
         if attempt >= 60 {
             eprintln!(
                 "omni: update_selection_visual gave up after 60 frames (no row geometry)"
@@ -2972,23 +3007,25 @@ fn update_selection_visual_attempt(ui: &Ui, attempt: u8) {
         let weak = ui.me.borrow().clone();
         ui.list_overlay.add_tick_callback(move |_, _| {
             if let Some(ui) = weak.upgrade() {
-                update_selection_visual_attempt(&ui, attempt.saturating_add(1));
+                update_selection_visual_attempt(&ui, attempt.saturating_add(1), place_gen);
             }
             glib::ControlFlow::Break
         });
         return;
     };
+    // Footer always tracks selectedIndex when chrome is placed / confirmed.
+    update_path_footer(ui, Some(idx));
     // Skip no-op place when transform already matches and chrome is shown.
     let same_geom =
         (ui.sel_y.get() - y).abs() < 0.05 && (ui.sel_h.get() - h).abs() < 0.05;
     let chrome_ok = ui.selection_fill.is_visible() && ui.selection_fill.opacity() >= 1.0;
     if same_geom && chrome_ok {
         sel_log(format!(
-            "update_selection_visual: skip place (geom unchanged) attempt={attempt}"
+            "update_selection_visual: skip place (geom unchanged) attempt={attempt} y={y:.1}"
         ));
         ui.is_snapping.set(false);
         ui.sel_layout_pending.set(false);
-        if motion_enabled() {
+        if motion_enabled() && ui.window.is_visible() && !ui.place_while_hidden.get() {
             set_sel_transition_enabled(ui, true);
         }
         sel_log_verify(ui);
@@ -2996,7 +3033,7 @@ fn update_selection_visual_attempt(ui: &Ui, attempt: u8) {
         return;
     }
     sel_log(format!(
-        "update_selection_visual: place y={y:.1} h={h:.1} opacity→1 (was {:.2}) attempt={attempt}",
+        "update_selection_visual: place y={y:.1} h={h:.1} opacity→1 (was {:.2}) attempt={attempt} transition=off",
         ui.selection_fill.opacity()
     ));
     ui.is_snapping.set(true);
@@ -3007,8 +3044,11 @@ fn update_selection_visual_attempt(ui: &Ui, attempt: u8) {
     let weak = ui.me.borrow().clone();
     ui.list_overlay.add_tick_callback(move |_, _| {
         if let Some(ui) = weak.upgrade() {
+            if place_gen != ui.sel_place_gen.get() {
+                return glib::ControlFlow::Break;
+            }
             ui.is_snapping.set(false);
-            if motion_enabled() {
+            if motion_enabled() && ui.window.is_visible() && !ui.place_while_hidden.get() {
                 set_sel_transition_enabled(&ui, true);
             }
             sel_log_state(&ui, "update_selection_visual_done");
@@ -3016,6 +3056,24 @@ fn update_selection_visual_attempt(ui: &Ui, attempt: u8) {
         }
         glib::ControlFlow::Break
     });
+}
+
+/// Cancel deferred snaps/retries and reset highlight session state (hide / reopen).
+fn cancel_selection_session(ui: &Ui) {
+    ui.sel_place_gen.set(ui.sel_place_gen.get() + 1);
+    ui.sel_layout_pending.set(false);
+    ui.sel_needs_replace.set(false);
+    ui.is_snapping.set(true);
+    ui.hover_gen.set(ui.hover_gen.get() + 1);
+    ui.hover_frame_pending.set(false);
+    ui.hover_pending_index.set(None);
+    ui.hover_pointer.set((f64::NAN, f64::NAN));
+    set_sel_transition_enabled(ui, false);
+    ui.selected_index.set(0);
+    ui.list_scroll.vadjustment().set_value(0.0);
+    // Reset transform to row-0 slot so reopen never inherits a lower-row y.
+    const LIST_PAD_Y: f64 = 4.0;
+    apply_sel_transform(ui, LIST_PAD_Y, ROW_HEIGHT as f64);
 }
 
 /// If a resize/scale hit during snap, re-place now that snapping has finished.
@@ -3033,7 +3091,7 @@ fn snap_selection_chrome(ui: &Ui) {
     update_selection_visual(ui);
 }
 
-/// Set owned selection; starts transform animation first, defers footer off the hot path.
+/// Set owned selection; chrome placement updates the footer (no separate selection signal).
 fn set_selected_index(ui: &Ui, index: usize, animate: bool) {
     let t0 = std::time::Instant::now();
     let count = ui.hits.borrow().len();
@@ -3044,12 +3102,7 @@ fn set_selected_index(ui: &Ui, index: usize, animate: bool) {
     if count == 0 {
         ui.selected_index.set(0);
         hide_selection_chrome(ui);
-        let weak = ui.me.borrow().clone();
-        glib::idle_add_local_once(move || {
-            if let Some(ui) = weak.upgrade() {
-                update_path_footer(&ui, None);
-            }
-        });
+        update_path_footer(ui, None);
         return;
     }
     let index = index.min(count - 1);
@@ -3062,6 +3115,7 @@ fn set_selected_index(ui: &Ui, index: usize, animate: bool) {
             update_selection_visual(ui);
         } else {
             sel_log("set_selected_index: skip (unchanged + animate)");
+            update_path_footer(ui, Some(index));
         }
         return;
     }
@@ -3072,19 +3126,13 @@ fn set_selected_index(ui: &Ui, index: usize, animate: bool) {
     if ms > 2.0 {
         eprintln!("omni: selection handler {ms:.2}ms (want <2ms before animation)");
     }
-    let weak = ui.me.borrow().clone();
-    glib::idle_add_local_once(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        if ui.selected_index.get() == index {
-            update_path_footer(&ui, Some(index));
-        }
-    });
 }
 
 /// Apply highlight from cached row geometry. Animates via CSS transform retarget.
 fn sync_selection_chrome(ui: &Ui, animate: bool) {
     if ui.hits.borrow().is_empty() {
         hide_selection_chrome(ui);
+        update_path_footer(ui, None);
         return;
     }
     cache_row_geometry(ui);
@@ -3102,6 +3150,7 @@ fn sync_selection_chrome(ui: &Ui, animate: bool) {
     set_sel_transition_enabled(ui, true);
     apply_sel_transform(ui, y, h);
     show_selection_chrome(ui);
+    update_path_footer(ui, Some(ui.selected_index.get()));
 }
 
 /// Log-only check after list updates — never on selection moves.
@@ -4188,16 +4237,60 @@ fn toggle(ui: &Rc<Ui>) {
     if ui.window.is_visible() {
         hide(ui);
     } else {
-        // Fresh recents each time it opens; selection starts at 0 (snapped).
-        ui.selected_index.set(0);
-        ui.is_snapping.set(true);
-        set_sel_transition_enabled(ui, false);
+        ui.open_t0.set(Some(Instant::now()));
+        let apps_n = ui.apps.borrow().len();
+        let sparql_ready = ui.sparql.borrow().is_some();
+        open_log(
+            ui,
+            &format!("show_request apps_cached={apps_n} indexer_ready={sparql_ready}"),
+        );
+        // Suppress hover until a real pointer move after show (~150ms).
+        ui.hover_suppress_until
+            .set(glib::monotonic_time() + 150_000);
+        ui.hover_pointer.set((f64::NAN, f64::NAN));
+        ui.hover_pending_index.set(None);
+        ui.hover_frame_pending.set(false);
+
+        // Fresh session: row 0, top scroll, transition off — place before present.
+        cancel_selection_session(ui);
+        ui.place_while_hidden.set(true);
+        open_log(ui, "before_refresh");
         refresh(ui);
-        set_selected_index(ui, 0, false);
+        ui.selected_index.set(0);
+        ui.list_scroll.vadjustment().set_value(0.0);
+        open_log(
+            ui,
+            &format!(
+                "first_results_displayed count={} (apps+icons from cache)",
+                ui.hits.borrow().len()
+            ),
+        );
+        // Unconditional snap to row 0 (no animation) + footer from selectedIndex.
+        set_sel_transition_enabled(ui, false);
+        ui.is_snapping.set(true);
+        update_selection_visual(ui);
+        reopen_log(
+            ui,
+            &format!(
+                "pre_present snap y={:.1} h={:.1} selectedIndex={} footer={:?} transition_on={}",
+                ui.sel_y.get(),
+                ui.sel_h.get(),
+                ui.selected_index.get(),
+                ui.path_full.borrow().clone(),
+                ui.sel_transition_on.get(),
+            ),
+        );
         load_services(ui);
+        open_log(ui, "before_capture_backdrop");
         capture_backdrop(ui);
+        open_log(ui, "after_capture_backdrop");
         // Re-read the default browser/engine in case it changed since last time.
+        let t_web = Instant::now();
         *ui.web.borrow_mut() = web::Engine::detect();
+        open_log(
+            ui,
+            &format!("web_engine_detect done ({:.1}ms)", t_web.elapsed().as_secs_f64() * 1000.0),
+        );
         // From here on the popup holds the keyboard: the watchdog must hear from us.
         watchdog::set_open(true);
         let beat = glib::timeout_add_local(Duration::from_millis(100), || {
@@ -4209,10 +4302,64 @@ fn toggle(ui: &Rc<Ui>) {
         }
         // hide() drops the grab to None; take it back as the surface is shown.
         ui.window.set_keyboard_mode(KeyboardMode::Exclusive);
+        open_log(ui, "before_present");
         ui.window.present();
+        ui.place_while_hidden.set(false);
+        // Re-apply footer now that the path strip has a real width.
+        update_path_footer(ui, if ui.hits.borrow().is_empty() {
+            None
+        } else {
+            Some(ui.selected_index.get())
+        });
+        open_log(
+            ui,
+            &format!(
+                "window_presented mapped={}",
+                ui.window.is_mapped()
+            ),
+        );
         ui.entry.grab_focus();
+        open_log(ui, "search_entry_focused");
+        // Next frame: confirm snap, re-enable transition, log assertions.
+        let weak = Rc::downgrade(ui);
+        ui.window.add_tick_callback(move |_, _| {
+            if let Some(ui) = weak.upgrade() {
+                open_log(&ui, "first_frame_rendered");
+                cache_row_geometry(&ui);
+                if let Some((y, h)) = cached_sel_geom(&ui).or_else(|| estimate_sel_geom(&ui)) {
+                    set_sel_transition_enabled(&ui, false);
+                    apply_sel_transform(&ui, y, h);
+                    show_selection_chrome(&ui);
+                    update_path_footer(&ui, Some(ui.selected_index.get()));
+                }
+                reopen_log(
+                    &ui,
+                    &format!(
+                        "first_frame y={:.1} row0={:?} selectedIndex={} footer={:?} transition_on={} query={:?}",
+                        ui.sel_y.get(),
+                        ui.row_geom.borrow().first().copied(),
+                        ui.selected_index.get(),
+                        ui.path_full.borrow().clone(),
+                        ui.sel_transition_on.get(),
+                        ui.entry.text().to_string(),
+                    ),
+                );
+                let weak = ui.me.borrow().clone();
+                ui.list_overlay.add_tick_callback(move |_, _| {
+                    if let Some(ui) = weak.upgrade() {
+                        ui.is_snapping.set(false);
+                        if motion_enabled() {
+                            set_sel_transition_enabled(&ui, true);
+                        }
+                    }
+                    glib::ControlFlow::Break
+                });
+            }
+            glib::ControlFlow::Break
+        });
         sel_log_state(ui, "toggle_open");
         maybe_run_sel_diag(ui);
+        maybe_run_reopen_diag(ui);
         // Re-read the installed apps too. GIO's "changed" signal normally keeps the
         // list current, but it has been missed at least once (an app stayed hidden
         // until omni restarted). This is ~30 ms, so it runs after the popup is drawn,
@@ -4220,7 +4367,15 @@ fn toggle(ui: &Rc<Ui>) {
         let weak = Rc::downgrade(ui);
         glib::idle_add_local_full(glib::Priority::LOW, move || {
             if let Some(ui) = weak.upgrade() {
+                let t = Instant::now();
                 ui.apps.borrow_mut().reload();
+                open_log(
+                    &ui,
+                    &format!(
+                        "apps_reload_idle done ({:.1}ms)",
+                        t.elapsed().as_secs_f64() * 1000.0
+                    ),
+                );
                 if ui.window.is_visible() && !ui.chatting.get() && !ui.entry.text().trim().is_empty() {
                     refresh(&ui);
                 }
@@ -4228,6 +4383,128 @@ fn toggle(ui: &Rc<Ui>) {
             glib::ControlFlow::Break
         });
     }
+}
+
+fn reopen_log(ui: &Ui, msg: impl std::fmt::Display) {
+    if std::env::var_os("OMNI_LOG_REOPEN").is_none() && std::env::var_os("OMNI_LOG_SEL").is_none()
+    {
+        return;
+    }
+    let _ = ui;
+    eprintln!("omni[reopen]: {msg}");
+}
+
+/// OMNI_REOPEN_DIAG=1 — automated A–D checks for reopen snap + footer.
+fn maybe_run_reopen_diag(ui: &Rc<Ui>) {
+    if std::env::var_os("OMNI_REOPEN_DIAG").is_none() {
+        return;
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return; // only once per process (toggle-from-diag must not re-enter)
+    }
+    sel_log("REOPEN_DIAG start");
+    let weak = Rc::downgrade(ui);
+    // Delay so first open settles, then run A→D.
+    glib::timeout_add_local_once(Duration::from_millis(200), move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let n = ui.hits.borrow().len();
+        if n == 0 {
+            eprintln!("omni[reopen]: DIAG abort — no hits");
+            return;
+        }
+        let bottom = n - 1;
+        // Test A: select bottom, close, reopen — highlight must be at row 0, no transition.
+        set_selected_index(&ui, bottom, false);
+        reopen_log(
+            &ui,
+            &format!("A_prep selectedIndex={} y={:.1}", ui.selected_index.get(), ui.sel_y.get()),
+        );
+        let weak = Rc::downgrade(&ui);
+        glib::timeout_add_local_once(Duration::from_millis(80), move || {
+            let Some(ui) = weak.upgrade() else { return };
+            hide(&ui);
+            let weak = Rc::downgrade(&ui);
+            glib::timeout_add_local_once(Duration::from_millis(80), move || {
+                let Some(ui) = weak.upgrade() else { return };
+                toggle(&ui);
+                let weak = Rc::downgrade(&ui);
+                glib::timeout_add_local_once(Duration::from_millis(120), move || {
+                    let Some(ui) = weak.upgrade() else { return };
+                    let y = ui.sel_y.get();
+                    let row0 = ui.row_geom.borrow().first().copied();
+                    let footer = ui.path_full.borrow().clone();
+                    let idx = ui.selected_index.get();
+                    let trans = ui.sel_transition_on.get();
+                    let expect_y = row0.map(|(y, _)| y).unwrap_or(4.0);
+                    let ok_a = idx == 0 && (y - expect_y).abs() < 1.0 && !trans;
+                    let ok_b = !footer.is_empty()
+                        || ui
+                            .hits
+                            .borrow()
+                            .first()
+                            .map(footer_path_for)
+                            .is_some_and(|p| p.is_empty());
+                    let footer_matches = ui
+                        .hits
+                        .borrow()
+                        .get(0)
+                        .map(|h| footer_path_for(h) == footer)
+                        .unwrap_or(footer.is_empty());
+                    eprintln!(
+                        "omni[reopen]: TEST_A ok={ok_a} y={y:.1} expect={expect_y:.1} selectedIndex={idx} transition_on={trans}"
+                    );
+                    eprintln!(
+                        "omni[reopen]: TEST_B ok={} selectedIndex={idx} footer={footer:?} matches_row0={footer_matches}",
+                        ok_b && footer_matches && idx == 0
+                    );
+                    eprintln!(
+                        "omni[reopen]: TEST_C ok={} selectedIndex={idx} (hover suppressed; expect 0)",
+                        idx == 0
+                    );
+                    // Test D: type, close, reopen — empty query, row 0, footer set.
+                    ui.entry.set_text("claude");
+                    let weak = Rc::downgrade(&ui);
+                    glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                        let Some(ui) = weak.upgrade() else { return };
+                        hide(&ui);
+                        let weak = Rc::downgrade(&ui);
+                        glib::timeout_add_local_once(Duration::from_millis(80), move || {
+                            let Some(ui) = weak.upgrade() else { return };
+                            toggle(&ui);
+                            let weak = Rc::downgrade(&ui);
+                            glib::timeout_add_local_once(Duration::from_millis(120), move || {
+                                let Some(ui) = weak.upgrade() else { return };
+                                let q = ui.entry.text().to_string();
+                                let idx = ui.selected_index.get();
+                                let footer = ui.path_full.borrow().clone();
+                                let ok_d = q.is_empty() && idx == 0 && (!footer.is_empty()
+                                    || ui.hits.borrow().first().map(footer_path_for).is_some_and(|p| p.is_empty()));
+                                eprintln!(
+                                    "omni[reopen]: TEST_D ok={ok_d} query={q:?} selectedIndex={idx} footer={footer:?}"
+                                );
+                                eprintln!("omni[reopen]: DIAG done");
+                                hide(&ui);
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+}
+
+fn open_log(ui: &Ui, stage: &str) {
+    if std::env::var_os("OMNI_LOG_OPEN").is_none() {
+        return;
+    }
+    let ms = ui
+        .open_t0
+        .get()
+        .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    eprintln!("omni[open]: +{ms:7.1}ms {stage}");
 }
 
 /// OMNI_SEL_DIAG=claude — type letter-by-letter, backspace to empty, retype, then fast paste.
@@ -4527,12 +4804,28 @@ fn hide(ui: &Ui) {
     close_answer(ui);
     ui.chatting.set(false);
     ui.entry.set_placeholder_text(Some(SEARCH_PLACEHOLDER));
+    // Cancel snaps/retries and reset selection chrome so reopen never animates from a lower row.
+    cancel_selection_session(ui);
     // Cancel Contents backends and bump gen so in-flight batches can't revive "searching…".
     invalidate_content_cache(ui);
     ui.entry.set_text("");
+    // Clear footer so reopen reapplies from selectedIndex (no stale skip / flash).
+    *ui.path_full.borrow_mut() = String::new();
+    *ui.path_trunc_cache.borrow_mut() = None;
+    ui.path_label.set_text("");
     refresh(ui);
+    // After clear+refresh, force row 0 + top scroll again (refresh may have kept an id).
+    ui.selected_index.set(0);
+    ui.list_scroll.vadjustment().set_value(0.0);
+    set_sel_transition_enabled(ui, false);
+    const LIST_PAD_Y: f64 = 4.0;
+    apply_sel_transform(ui, LIST_PAD_Y, ROW_HEIGHT as f64);
+    update_path_footer(ui, None);
     ui.reveal.set_reveal_child(false);
+    // Keep path strip height reserved when results exist next open; hide with the list.
+    ui.path_reveal.set_reveal_child(false);
     ui.window.set_visible(false);
+    ui.place_while_hidden.set(false);
     ui.card.clear();
     watchdog::set_open(false);
     if let Some(beat) = ui.heartbeat.take() {
@@ -4585,10 +4878,20 @@ mod watchdog {
 /// Put the popup on the focused monitor and grab the screen area behind the card,
 /// before the popup is visible (otherwise we'd capture ourselves).
 fn capture_backdrop(ui: &Ui) {
+    let t_mon = Instant::now();
     let Some(mon) = focused_monitor() else {
         eprintln!("omni: couldn't find the focused monitor");
+        open_log(ui, "focused_monitor FAILED");
         return;
     };
+    open_log(
+        ui,
+        &format!(
+            "focused_monitor ready ({:.1}ms) name={}",
+            t_mon.elapsed().as_secs_f64() * 1000.0,
+            mon.name
+        ),
+    );
     // Put the surface on that monitor so the card lands where we captured.
     if let Some(display) = gdk::Display::default() {
         let monitors = display.monitors();
@@ -4608,12 +4911,22 @@ fn capture_backdrop(ui: &Ui) {
     let y0 = (CARD_TOP - glass::BLEED).max(0);
     let x1 = (card_x + CARD_WIDTH + glass::BLEED).min(mon.width);
     let y1 = (CARD_TOP + CARD_MAX_HEIGHT + glass::BLEED).min(mon.height);
+    let t_cap = Instant::now();
     ui.card.capture(
         mon.x + x0,
         mon.y + y0,
         x1 - x0,
         y1 - y0,
         ((x0 - card_x) as f32, (y0 - CARD_TOP) as f32),
+    );
+    open_log(
+        ui,
+        &format!(
+            "grim_capture+dim done ({:.1}ms) size={}x{}",
+            t_cap.elapsed().as_secs_f64() * 1000.0,
+            x1 - x0,
+            y1 - y0
+        ),
     );
 }
 
