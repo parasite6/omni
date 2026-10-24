@@ -64,8 +64,6 @@ const REWALK: Duration = Duration::from_secs(30 * 60);
 /// Card geometry on screen (logical px).
 const CARD_WIDTH: i32 = 720;
 const CARD_TOP: i32 = 160;
-/// Tallest the card can get; capture/fit clamps to the monitor.
-const CARD_MAX_HEIGHT: i32 = 2000;
 /// The card stops this far above the bottom of the screen; longer lists scroll inside it.
 const BOTTOM_GAP: i32 = 96;
 /// Non-list chrome: padding + header + path footer (must match style.css).
@@ -4281,9 +4279,9 @@ fn toggle(ui: &Rc<Ui>) {
             ),
         );
         load_services(ui);
-        open_log(ui, "before_capture_backdrop");
-        capture_backdrop(ui);
-        open_log(ui, "after_capture_backdrop");
+        open_log(ui, "before_place_on_focused_monitor");
+        place_on_focused_monitor(ui);
+        open_log(ui, "after_place_on_focused_monitor");
         // Re-read the default browser/engine in case it changed since last time.
         let t_web = Instant::now();
         *ui.web.borrow_mut() = web::Engine::detect();
@@ -4360,28 +4358,8 @@ fn toggle(ui: &Rc<Ui>) {
         sel_log_state(ui, "toggle_open");
         maybe_run_sel_diag(ui);
         maybe_run_reopen_diag(ui);
-        // Re-read the installed apps too. GIO's "changed" signal normally keeps the
-        // list current, but it has been missed at least once (an app stayed hidden
-        // until omni restarted). This is ~30 ms, so it runs after the popup is drawn,
-        // not before; results already showing for typed text are refreshed.
-        let weak = Rc::downgrade(ui);
-        glib::idle_add_local_full(glib::Priority::LOW, move || {
-            if let Some(ui) = weak.upgrade() {
-                let t = Instant::now();
-                ui.apps.borrow_mut().reload();
-                open_log(
-                    &ui,
-                    &format!(
-                        "apps_reload_idle done ({:.1}ms)",
-                        t.elapsed().as_secs_f64() * 1000.0
-                    ),
-                );
-                if ui.window.is_visible() && !ui.chatting.get() && !ui.entry.text().trim().is_empty() {
-                    refresh(&ui);
-                }
-            }
-            glib::ControlFlow::Break
-        });
+        // AppInfoMonitor keeps the app list current. Do not reload here: AppInfo::all()
+        // blocks GTK's UI thread and made the just-presented popup unresponsive.
     }
 }
 
@@ -4826,7 +4804,6 @@ fn hide(ui: &Ui) {
     ui.path_reveal.set_reveal_child(false);
     ui.window.set_visible(false);
     ui.place_while_hidden.set(false);
-    ui.card.clear();
     watchdog::set_open(false);
     if let Some(beat) = ui.heartbeat.take() {
         beat.remove();
@@ -4875,9 +4852,8 @@ mod watchdog {
     }
 }
 
-/// Put the popup on the focused monitor and grab the screen area behind the card,
-/// before the popup is visible (otherwise we'd capture ourselves).
-fn capture_backdrop(ui: &Ui) {
+/// Put the popup on the focused monitor and fit its content to that monitor.
+fn place_on_focused_monitor(ui: &Ui) {
     let t_mon = Instant::now();
     let Some(mon) = focused_monitor() else {
         eprintln!("omni: couldn't find the focused monitor");
@@ -4892,7 +4868,7 @@ fn capture_backdrop(ui: &Ui) {
             mon.name
         ),
     );
-    // Put the surface on that monitor so the card lands where we captured.
+    // Put the surface on the monitor that currently has keyboard focus.
     if let Some(display) = gdk::Display::default() {
         let monitors = display.monitors();
         for i in 0..monitors.n_items() {
@@ -4904,30 +4880,6 @@ fn capture_backdrop(ui: &Ui) {
     }
 
     fit_to_monitor(ui, mon.height);
-
-    let card_x = (mon.width - CARD_WIDTH) / 2;
-    // Area behind the card plus bleed, clamped to the monitor.
-    let x0 = (card_x - glass::BLEED).max(0);
-    let y0 = (CARD_TOP - glass::BLEED).max(0);
-    let x1 = (card_x + CARD_WIDTH + glass::BLEED).min(mon.width);
-    let y1 = (CARD_TOP + CARD_MAX_HEIGHT + glass::BLEED).min(mon.height);
-    let t_cap = Instant::now();
-    ui.card.capture(
-        mon.x + x0,
-        mon.y + y0,
-        x1 - x0,
-        y1 - y0,
-        ((x0 - card_x) as f32, (y0 - CARD_TOP) as f32),
-    );
-    open_log(
-        ui,
-        &format!(
-            "grim_capture+dim done ({:.1}ms) size={}x{}",
-            t_cap.elapsed().as_secs_f64() * 1000.0,
-            x1 - x0,
-            y1 - y0
-        ),
-    );
 }
 
 /// Cap the result list (and Claude's answer) so the card ends BOTTOM_GAP above the bottom
@@ -4945,7 +4897,7 @@ struct Monitor {
     name: String,
     x: i32,
     y: i32,
-    /// Logical size (physical / scale, rotated if needed).
+    /// Logical size (physical dimensions / scale, rotation-aware).
     width: i32,
     height: i32,
 }
@@ -4958,16 +4910,17 @@ fn focused_monitor() -> Option<Monitor> {
     let list: serde_json::Value = serde_json::from_slice(&out).ok()?;
     let m = list.as_array()?.iter().find(|m| m["focused"].as_bool() == Some(true))?;
     let scale = m["scale"].as_f64().unwrap_or(1.0);
-    let (mut w, mut h) = (m["width"].as_f64()? / scale, m["height"].as_f64()? / scale);
+    let (mut width, mut height) =
+        (m["width"].as_f64()? / scale, m["height"].as_f64()? / scale);
     if m["transform"].as_i64().unwrap_or(0) % 2 == 1 {
-        std::mem::swap(&mut w, &mut h);
+        std::mem::swap(&mut width, &mut height);
     }
     Some(Monitor {
         name: m["name"].as_str()?.to_string(),
         x: m["x"].as_i64()? as i32,
         y: m["y"].as_i64()? as i32,
-        width: w.round() as i32,
-        height: h.round() as i32,
+        width: width.round() as i32,
+        height: height.round() as i32,
     })
 }
 

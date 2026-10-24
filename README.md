@@ -136,10 +136,8 @@ steady pace slightly behind the stream so it never stalls or jumps.
 **Search bar rim.** A living cyan/black gradient that slowly morphs around the bar
 (`ring.rs`). omni's colours are its own cyan `#54dbed` on black `#07090b`.
 
-**The glass.** Hyprland's blur is global and far too strong for see-through glass, so
-omni captures the screen area behind the card (`grim`) just before it opens and blurs it
-itself (about 9 px), with a magnified rim for a refraction look. The backdrop is a still
-image while the popup is open.
+**The glass.** The card uses an opaque dark-metal surface. It does not capture the screen
+behind it, so opening the launcher never waits for the compositor's screenshot path.
 
 ## Layout
 
@@ -156,7 +154,7 @@ keybind helper doesn't load GTK, so pressing the key costs ~1 ms instead of ~60 
 
 ### Source files
 
-- `src/main.rs`: window, results list, keys, file right-click menu, socket, backdrop capture
+- `src/main.rs`: window, results list, keys, file right-click menu, socket, monitor placement
 - `src/calc.rs`: the calculator (strict parser: complete expressions only)
 - `src/apps.rs`: app list, matching, app actions (+ `TWEAKS`), launch counts and times (`~/.local/state/omni/usage.tsv`)
 - `src/recent.rs`: recent files/folders (GTK's shared recent list)
@@ -167,7 +165,7 @@ keybind helper doesn't load GTK, so pressing the key costs ~1 ms instead of ~60 
 - `src/agent_prompt.md`: your agent instructions, appended to Claude's system prompt
 - `src/services.rs`: systemd services (list, search, actions, status)
 - `src/ring.rs`: the search bar's animated rim
-- `src/glass.rs`: the glass card (captured, blurred backdrop)
+- `src/glass.rs`: the opaque glass-card shell
 - `src/util.rs`: running helper programs with a time limit
 - `src/style.css`: the look. Override anything in `~/.config/omni/style.css`.
   Colours are omni's own cyan/black (`@omni_cyan`, `@omni_black`).
@@ -182,7 +180,7 @@ keybind helper doesn't load GTK, so pressing the key costs ~1 ms instead of ~60 
 ```
 
 Builds a release (always into this folder's `target/`, even if `CARGO_TARGET_DIR` is set),
-replaces the installed files atomically, restarts `omni` and checks it answers. Needs `gtk4-devel`, `gtk4-layer-shell-devel`, `tinysparql-devel`, `grim`, Rust.
+replaces the installed files atomically, restarts `omni` and checks it answers. Needs `gtk4-devel`, `gtk4-layer-shell-devel`, `tinysparql-devel`, Rust.
 
 Optional, for the AgentMail badge (once, and again after changing the `scripts/` files; the stored key is kept):
 
@@ -197,9 +195,9 @@ sudo ~/Documents/github/omni/scripts/install-mailcount.sh
   (falls back to rofi if omni isn't installed). Super+Ctrl+Enter already runs this script.
 - `~/.config/hypr/conf/autostart.lua` runs `omni-start` at the top level, so it runs on
   login and on every `hyprctl reload`
-- `~/.config/hypr/custom.lua` loads the layer rule from `~/.local/share/omni/hypr/omni.lua`,
-  and permanently allows `grim` screen capture (`hl.permission`), which the glass backdrop
-  needs (also quickshell, alttabway, hyprlock and hyprpicker)
+- `~/.config/hypr/custom.lua` loads the layer rule from `~/.local/share/omni/hypr/omni.lua`.
+  Any existing `grim` screen-capture permission is no longer needed by omni (other tools
+  such as quickshell, alttabway, hyprlock or hyprpicker may still use it).
 
 `launcher.sh` and `autostart.lua` belong to the ML4W dotfiles; an ML4W update could
 overwrite them. If the old launcher comes back, re-add the `omni` branch / autostart line.
@@ -223,7 +221,7 @@ overwrite them. If the old launcher comes back, re-add the `omni` branch / autos
   trip, ~1.2 ms including starting `omni-toggle`). No reply within 1 s means omni is gone or
   stuck, and `omni-toggle` runs `omni-start`: ensure-running kills a hung instance, starts a
   fresh one, and the popup opens. A desktop notification appears if that fails.
-- `grim` and `hyprctl` calls are killed after 0.5 s, so a stuck helper can't freeze omni.
+- `hyprctl` calls are killed after 0.5 s, so a stuck helper can't freeze omni permanently.
 - The popup releases the keyboard and flushes that change before it hides or launches
   anything, so a slow app can't leave it holding the keyboard.
 - **Keyboard watchdog.** While open, the popup holds the keyboard exclusively, so a frozen

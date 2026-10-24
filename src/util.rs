@@ -1,4 +1,4 @@
-//! Running helper programs (grim, hyprctl) from the UI thread without risking a hang.
+//! Running helper programs (such as hyprctl) without risking a permanent hang.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 /// Run `cmd` and return its stdout if it succeeds within `timeout`. Otherwise kill it
 /// (and reap it) and return None. stdout is read on a thread so large output (a
-/// screenshot) can't fill the pipe and deadlock.
+/// large response) can't fill the pipe and deadlock.
 pub fn output_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<Vec<u8>> {
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
     let mut stdout = child.stdout.take()?;
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn large_output_does_not_deadlock() {
-        // Bigger than a pipe buffer, like a screenshot.
+        // Bigger than a pipe buffer.
         let out = output_with_timeout(Command::new("head").args(["-c", "3000000", "/dev/zero"]), Duration::from_secs(5));
         assert_eq!(out.map(|o| o.len()), Some(3_000_000));
     }
