@@ -1,6 +1,6 @@
 # ⌘ omni
 
-### One glass popup for your apps, files, folders, services, the web — and Claude.
+### One glass popup for your apps, files, folders, services, the web and Claude (OpenCode coming soon).
 
 **`Super`＋`Ctrl`＋`Enter`** → type → **`Enter`**
 
