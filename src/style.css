@@ -89,7 +89,7 @@ window.omni {
   height: 56px;
   border-spacing: 8px;
   margin: 0;
-  padding: 0 16px 0 18px;
+  padding: 0 40px 0 18px;
   border-bottom: 1px solid alpha(@omni_divider, 0.06);
 }
 
@@ -159,6 +159,69 @@ window.omni {
 .omni-toggle:checked:hover {
   color: @omni_accent;
   background-color: alpha(@omni_accent, 0.16);
+}
+
+/* ---------- settings navigation ---------- */
+
+.omni-settings-slip {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+.omni-settings-button {
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0;
+  margin: 4px 0 4px 4px;
+  color: alpha(white, 0.82);
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  transform: translate(16px, -14px);
+  transition: transform 280ms cubic-bezier(0.22, 1, 0.36, 1),
+              color 100ms ease;
+}
+
+.omni-settings-slip:hover .omni-settings-button,
+.omni-settings-button:focus-visible {
+  color: white;
+  background-color: transparent;
+  transform: translate(7px, -5px);
+}
+
+.omni-settings-button image {
+  -gtk-icon-size: 18px;
+}
+
+.omni-settings-plane {
+  min-height: 56px;
+}
+
+.omni-settings-back {
+  min-height: 36px;
+  min-width: 0;
+  margin: 4px;
+  padding: 0 12px 0 9px;
+  border-radius: 8px;
+  color: @omni_text_secondary;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}
+
+.omni-settings-back:hover,
+.omni-settings-back:focus-visible {
+  color: @omni_text;
+  background-color: alpha(@omni_hover, 0.04);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .omni-settings-button {
+    transition: none;
+  }
 }
 
 /* ---------- results ---------- */

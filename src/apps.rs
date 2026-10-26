@@ -57,6 +57,77 @@ const TWEAKS: &[Tweak] = &[Tweak {
     add: &[("New private window with Tor", &["--tor"], "onion incognito")],
 }];
 
+/// Per-app child environment, keyed by .desktop id like TWEAKS. Applied to the launch
+/// context only; omni's own environment is left alone.
+#[derive(Clone, Copy)]
+pub enum EnvOverride {
+    Unset(&'static str),
+    /// Kept for per-app overrides that need to set a value (covered by tests).
+    #[allow(dead_code)]
+    Set(&'static str, &'static str),
+}
+
+struct EnvOverrides {
+    desktop_ids: &'static [&'static str],
+    overrides: &'static [EnvOverride],
+}
+
+/// Zed needs NVIDIA (`ZED_DEVICE_ID`, already in the session) and must not inherit
+/// omni's Intel Vulkan ICD paths.
+const ENV_OVERRIDES: &[EnvOverrides] = &[EnvOverrides {
+    desktop_ids: &["dev.zed.Zed.desktop", "dev.zed.Delta.desktop"],
+    overrides: &[
+        EnvOverride::Unset("VK_DRIVER_FILES"),
+        EnvOverride::Unset("VK_ICD_FILENAMES"),
+    ],
+}];
+
+fn env_overrides_for(desktop_id: &str) -> &'static [EnvOverride] {
+    ENV_OVERRIDES
+        .iter()
+        .find(|e| e.desktop_ids.contains(&desktop_id))
+        .map(|e| e.overrides)
+        .unwrap_or(&[])
+}
+
+fn apply_env_override_list(overrides: &[EnvOverride], ctx: &gio::AppLaunchContext) {
+    for o in overrides {
+        match o {
+            EnvOverride::Unset(key) => ctx.unsetenv(*key),
+            EnvOverride::Set(key, value) => ctx.setenv(*key, *value),
+        }
+    }
+}
+
+/// Change the child's environment for this desktop id. No-op when `id` is missing or
+/// has no overrides.
+pub fn apply_env_overrides(id: Option<&str>, ctx: &gio::AppLaunchContext) {
+    let Some(id) = id else { return };
+    apply_env_override_list(env_overrides_for(id), ctx);
+}
+
+/// Apply the default handler's overrides for `uri`. `AppInfo::launch_default_for_uri`
+/// resolves the handler itself, so resolve the same app here before launching.
+pub fn apply_env_overrides_for_uri(uri: &str, ctx: &gio::AppLaunchContext) {
+    apply_env_overrides_for_uri_with(uri, ctx, |uri| {
+        gio::File::for_uri(uri)
+            .query_default_handler(gio::Cancellable::NONE)
+            .ok()
+    });
+}
+
+/// Resolver seam: production resolves with `File::query_default_handler`; tests can pass
+/// a temporary desktop entry instead of depending on the machine's MIME defaults.
+fn apply_env_overrides_for_uri_with(
+    uri: &str,
+    ctx: &gio::AppLaunchContext,
+    resolve: impl FnOnce(&str) -> Option<gio::AppInfo>,
+) {
+    if let Some(info) = resolve(uri) {
+        apply_env_overrides(info.id().as_deref(), ctx);
+    }
+}
+
 fn load_actions(info: &gio::AppInfo) -> Vec<AppAction> {
     let id = info.id().map(|i| i.to_string()).unwrap_or_default();
     let tweak = TWEAKS.iter().find(|t| t.desktop_ids.contains(&id.as_str()));
@@ -556,5 +627,165 @@ mod tests {
         assert_eq!(found("brave private")[0], "private");
         assert!(found("brave xyz").is_empty());
         assert!(found("tor xyz").is_empty());
+    }
+
+    fn env_map(ctx: &gio::AppLaunchContext) -> HashMap<String, String> {
+        ctx.environment()
+            .into_iter()
+            .filter_map(|entry| {
+                let s = entry.to_string_lossy();
+                let (k, v) = s.split_once('=')?;
+                Some((k.to_string(), v.to_string()))
+            })
+            .collect()
+    }
+
+    /// A real DesktopAppInfo with the requested id, so tests can simulate the app GIO
+    /// would resolve as the default handler without touching the user's MIME settings.
+    fn test_desktop_app(desktop_id: &str) -> gio::AppInfo {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "omni-env-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp desktop dir");
+        let path = dir.join(desktop_id);
+        std::fs::write(
+            &path,
+            "[Desktop Entry]\nType=Application\nName=Omni test\nExec=true\n",
+        )
+        .expect("write temp desktop file");
+        let info = gio_unix::DesktopAppInfo::from_filename(&path)
+            .expect("temporary desktop entry should load")
+            .upcast();
+        let _ = std::fs::remove_dir_all(&dir);
+        info
+    }
+
+    #[test]
+    fn default_uri_launch_uses_zed_overrides_when_zed_is_default() {
+        let zed = test_desktop_app("dev.zed.Zed.desktop");
+        assert_eq!(zed.id().as_deref(), Some("dev.zed.Zed.desktop"));
+
+        let ctx = gio::AppLaunchContext::new();
+        ctx.setenv("VK_DRIVER_FILES", "intel.icd");
+        ctx.setenv("VK_ICD_FILENAMES", "intel.icd");
+        ctx.setenv("ZED_DEVICE_ID", "0x28e0");
+        apply_env_overrides_for_uri_with("file:///tmp/omni-default-handler.txt", &ctx, |_| {
+            Some(zed)
+        });
+
+        let env = env_map(&ctx);
+        assert!(!env.contains_key("VK_DRIVER_FILES"));
+        assert!(!env.contains_key("VK_ICD_FILENAMES"));
+        assert_eq!(env.get("ZED_DEVICE_ID").map(String::as_str), Some("0x28e0"));
+    }
+
+    #[test]
+    fn default_uri_launch_keeps_other_apps_environment() {
+        let brave = test_desktop_app("brave-browser.desktop");
+        let ctx = gio::AppLaunchContext::new();
+        ctx.setenv("VK_DRIVER_FILES", "intel.icd");
+        ctx.setenv("VK_ICD_FILENAMES", "intel.icd");
+        apply_env_overrides_for_uri_with("file:///tmp/omni-default-handler.html", &ctx, |_| {
+            Some(brave)
+        });
+
+        let env = env_map(&ctx);
+        assert_eq!(
+            env.get("VK_DRIVER_FILES").map(String::as_str),
+            Some("intel.icd")
+        );
+        assert_eq!(
+            env.get("VK_ICD_FILENAMES").map(String::as_str),
+            Some("intel.icd")
+        );
+    }
+
+    /// Exercise the real `File::query_default_handler` path. On a machine where Zed is
+    /// the text handler this must unset the ICD vars; otherwise it must leave them alone.
+    #[test]
+    fn default_uri_launch_matches_gio_default_handler() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "omni-default-uri-{}-{}.txt",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, "test\n").expect("write temp text file");
+        let file = gio::File::for_path(&path);
+        let uri = file.uri();
+        let zed_default = file
+            .query_default_handler(gio::Cancellable::NONE)
+            .ok()
+            .and_then(|info| info.id())
+            .is_some_and(|id| {
+                matches!(id.as_str(), "dev.zed.Zed.desktop" | "dev.zed.Delta.desktop")
+            });
+
+        let ctx = gio::AppLaunchContext::new();
+        ctx.setenv("VK_DRIVER_FILES", "intel.icd");
+        ctx.setenv("VK_ICD_FILENAMES", "intel.icd");
+        apply_env_overrides_for_uri(&uri, &ctx);
+
+        let env = env_map(&ctx);
+        assert_eq!(env.contains_key("VK_DRIVER_FILES"), !zed_default);
+        assert_eq!(env.contains_key("VK_ICD_FILENAMES"), !zed_default);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Zed must not inherit omni's Intel Vulkan ICD; NVIDIA selection needs those unset.
+    #[test]
+    fn zed_launch_unsets_vulkan_icd_vars() {
+        let parent_files = std::env::var_os("VK_DRIVER_FILES");
+        let parent_icd = std::env::var_os("VK_ICD_FILENAMES");
+        let ctx = gio::AppLaunchContext::new();
+        ctx.setenv("VK_DRIVER_FILES", "intel.icd");
+        ctx.setenv("VK_ICD_FILENAMES", "intel.icd");
+        ctx.setenv("ZED_DEVICE_ID", "0x28e0");
+        apply_env_overrides(Some("dev.zed.Zed.desktop"), &ctx);
+        let env = env_map(&ctx);
+        assert!(!env.contains_key("VK_DRIVER_FILES"));
+        assert!(!env.contains_key("VK_ICD_FILENAMES"));
+        assert_eq!(env.get("ZED_DEVICE_ID").map(String::as_str), Some("0x28e0"));
+        assert_eq!(std::env::var_os("VK_DRIVER_FILES"), parent_files);
+        assert_eq!(std::env::var_os("VK_ICD_FILENAMES"), parent_icd);
+    }
+
+    #[test]
+    fn zed_delta_uses_the_same_gpu_overrides() {
+        let ctx = gio::AppLaunchContext::new();
+        ctx.setenv("VK_DRIVER_FILES", "intel.icd");
+        ctx.setenv("VK_ICD_FILENAMES", "intel.icd");
+        apply_env_overrides(Some("dev.zed.Delta.desktop"), &ctx);
+        let env = env_map(&ctx);
+        assert!(!env.contains_key("VK_DRIVER_FILES"));
+        assert!(!env.contains_key("VK_ICD_FILENAMES"));
+    }
+
+    #[test]
+    fn other_apps_keep_vulkan_icd_vars() {
+        let ctx = gio::AppLaunchContext::new();
+        ctx.setenv("VK_DRIVER_FILES", "intel.icd");
+        ctx.setenv("VK_ICD_FILENAMES", "intel.icd");
+        apply_env_overrides(Some("brave-browser.desktop"), &ctx);
+        apply_env_overrides(None, &ctx);
+        let env = env_map(&ctx);
+        assert_eq!(env.get("VK_DRIVER_FILES").map(String::as_str), Some("intel.icd"));
+        assert_eq!(env.get("VK_ICD_FILENAMES").map(String::as_str), Some("intel.icd"));
+    }
+
+    #[test]
+    fn launch_context_can_set_as_well_as_unset() {
+        let ctx = gio::AppLaunchContext::new();
+        ctx.setenv("FOO", "old");
+        ctx.setenv("BAR", "keep-me-not");
+        apply_env_override_list(&[EnvOverride::Set("FOO", "new"), EnvOverride::Unset("BAR")], &ctx);
+        let env = env_map(&ctx);
+        assert_eq!(env.get("FOO").map(String::as_str), Some("new"));
+        assert!(!env.contains_key("BAR"));
     }
 }

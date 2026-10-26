@@ -190,9 +190,46 @@ impl ContentCache {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum UiMode {
+    #[default]
+    Launcher,
+    Settings,
+}
+
+#[derive(Clone, Copy)]
+enum UiModeAction {
+    OpenSettings,
+    Back,
+    Close,
+}
+
+impl UiMode {
+    fn after(self, action: UiModeAction) -> Self {
+        match action {
+            UiModeAction::OpenSettings => Self::Settings,
+            UiModeAction::Back | UiModeAction::Close => Self::Launcher,
+        }
+    }
+
+    fn consumes_escape(self) -> bool {
+        self == Self::Settings
+    }
+
+    fn stack_name(self) -> &'static str {
+        match self {
+            Self::Launcher => "launcher",
+            Self::Settings => "settings",
+        }
+    }
+}
+
 struct Ui {
     window: gtk::ApplicationWindow,
     card: glass::GlassCard,
+    main_stack: gtk::Stack,
+    mode: Cell<UiMode>,
+    settings_back: gtk::Button,
     entry: gtk::SearchEntry,
     list: gtk::ListBox,
     list_scroll: gtk::ScrolledWindow,
@@ -770,9 +807,54 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .build();
     surface.append(&path_reveal);
 
+    let launcher_plane = gtk::Overlay::builder().child(&surface).build();
+    let settings_button = gtk::Button::builder()
+        .icon_name("preferences-system-symbolic")
+        .tooltip_text("Settings")
+        .css_classes(["flat", "omni-settings-button"])
+        .focus_on_click(false)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Center)
+        .build();
+    let settings_slip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    settings_slip.add_css_class("omni-settings-slip");
+    settings_slip.set_halign(gtk::Align::End);
+    settings_slip.set_valign(gtk::Align::Start);
+    settings_slip.set_size_request(44, 44);
+    settings_slip.set_margin_top(10);
+    settings_slip.set_overflow(gtk::Overflow::Hidden);
+    settings_slip.append(&settings_button);
+    launcher_plane.add_overlay(&settings_slip);
+
+    let back_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    back_content.append(&gtk::Image::from_icon_name("go-previous-symbolic"));
+    back_content.append(&gtk::Label::new(Some("Back")));
+    let settings_back = gtk::Button::builder()
+        .child(&back_content)
+        .css_classes(["flat", "omni-settings-back"])
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Start)
+        .focus_on_click(false)
+        .build();
+    let settings_plane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    settings_plane.add_css_class("omni-glass");
+    settings_plane.add_css_class("omni-settings-plane");
+    settings_plane.set_vexpand(true);
+    settings_plane.append(&settings_back);
+
+    let main_stack = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .transition_duration(160)
+        .hhomogeneous(true)
+        .vhomogeneous(true)
+        .build();
+    main_stack.add_named(&launcher_plane, Some(UiMode::Launcher.stack_name()));
+    main_stack.add_named(&settings_plane, Some(UiMode::Settings.stack_name()));
+    main_stack.set_visible_child_name(UiMode::Launcher.stack_name());
+
     let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
     frame.add_css_class("omni-frame");
-    frame.append(&surface);
+    frame.append(&main_stack);
 
     let card = glass::GlassCard::new();
     card.add_css_class("omni-card");
@@ -828,6 +910,9 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     let ui = Rc::new(Ui {
         window: window.clone(),
         card: card.clone(),
+        main_stack: main_stack.clone(),
+        mode: Cell::new(UiMode::default()),
+        settings_back: settings_back.clone(),
         entry: entry.clone(),
         list: list.clone(),
         list_scroll: list_scroll.clone(),
@@ -914,6 +999,11 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     confirm_always.connect_clicked(move |_| finish_confirm(&u, Answered::Always));
     let u = ui.clone();
     confirm_no.connect_clicked(move |_| close_confirm(&u));
+
+    let u = ui.clone();
+    settings_back.connect_clicked(move |_| show_launcher(&u));
+    let u = ui.clone();
+    settings_button.connect_clicked(move |_| show_settings(&u));
 
     // Claude Code asking permission (a command, an edit, a web page ...).
     let weak = Rc::downgrade(&ui);
@@ -1251,6 +1341,10 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
             }
             return glib::Propagation::Stop;
         }
+        if key == gdk::Key::Escape && u.mode.get().consumes_escape() {
+            show_launcher(&u);
+            return glib::Propagation::Stop;
+        }
         match key {
             // In a conversation, Esc goes back to searching; otherwise it closes.
             gdk::Key::Escape if u.chatting.get() => end_chat(&u),
@@ -1435,9 +1529,8 @@ fn refresh(ui: &Ui) {
     let keep_scroll = prev_key
         .as_ref()
         .is_some_and(|k| hits.iter().any(|h| &hit_key(h) == k));
-    // While typing the selected *slot* usually stays put (index 0). Same index ⇒ same
-    // chrome geometry — skip place entirely even if the hit id at that slot changed.
-    // (Re-applying transform / toggling transition CSS was a flicker source.)
+    // Preserve the visible position during the diff when the selected slot stays
+    // put. Its actual allocation is still reconciled after GTK lays out the rows.
     let same_selection = chrome_was_shown && next == prev_index;
 
     // Invalidate hover targets; do NOT hide chrome (that caused the typing blink).
@@ -1496,82 +1589,24 @@ fn refresh(ui: &Ui) {
     }
 }
 
-/// After a non-empty results update: keep chrome visible; skip place when selection id is unchanged.
+/// Keep existing chrome steady during a diff, then reconcile every slot after layout.
 fn finish_results_selection_visual(ui: &Ui, same_selection: bool, chrome_was_shown: bool) {
-    // Same id at same index: leave highlight alone (no transform/CSS/opacity touch).
-    if same_selection {
-        ui.sel_layout_pending.set(false);
-        ui.is_snapping.set(false);
-        if ui.selection_fill.opacity() < 1.0 {
+    ui.sel_layout_pending.set(true);
+    if !same_selection {
+        ui.is_snapping.set(true);
+        set_sel_transition_enabled(ui, false);
+        // A reused row can still report its previous allocation here. Use the fixed
+        // slot as a provisional position; the deferred snap measures the real bounds.
+        if let Some((y, h)) = estimate_sel_geom(ui) {
+            apply_sel_transform(ui, y, h);
+            show_selection_chrome(ui);
+        } else if chrome_was_shown {
             show_selection_chrome(ui);
         }
-        sel_log_verify(ui);
-        let op = ui.selection_fill.opacity();
-        let weak = ui.me.borrow().clone();
-        let update_gen = ui.sel_update_gen.get();
-        glib::timeout_add_local_once(Duration::from_millis(50), move || {
-            let Some(ui) = weak.upgrade() else { return };
-            if ui.sel_update_gen.get() != update_gen {
-                return;
-            }
-            sel_log(format!(
-                "UPDATE highlight=skipped same_slot opacity={op:.2} chrome_place=0 paints={}",
-                ui.sel_paint_frames.get()
-            ));
-        });
-        return;
     }
-
-    ui.is_snapping.set(true);
-    ui.sel_layout_pending.set(true);
-    set_sel_transition_enabled(ui, false);
-    // Keep an existing highlight visible for the whole update. First show stays
-    // hidden until place+show below (no opacity blink on an already-shown chrome).
-    if chrome_was_shown {
-        show_selection_chrome(ui);
-    }
-
-    cache_row_geometry(ui);
-    // Prefer live bounds; if GTK hasn't allocated yet after a diff, estimate from row height
-    // so we can snap in this same update without blinking.
-    let geom = cached_sel_geom(ui).or_else(|| estimate_sel_geom(ui));
-    if let Some((y, h)) = geom {
-        ui.sel_layout_pending.set(false);
-        apply_sel_transform(ui, y, h);
-        show_selection_chrome(ui);
-        sel_log(format!(
-            "UPDATE highlight=moved y={y:.1} h={h:.1} opacity={:.2} same_frame=1 chrome_place=1",
-            ui.selection_fill.opacity()
-        ));
-        sel_log_verify(ui);
-        let weak = ui.me.borrow().clone();
-        let update_gen = ui.sel_update_gen.get();
-        ui.list_overlay.add_tick_callback(move |_, _| {
-            if let Some(ui) = weak.upgrade() {
-                // Refine from real bounds once allocated (no opacity change).
-                cache_row_geometry(&ui);
-                if let Some((y2, h2)) = cached_sel_geom(&ui) {
-                    apply_sel_transform(&ui, y2, h2);
-                }
-                ui.is_snapping.set(false);
-                if motion_enabled() {
-                    set_sel_transition_enabled(&ui, true);
-                }
-                flush_sel_needs_replace(&ui);
-                sel_log(format!(
-                    "UPDATE done opacity={:.2} chrome_place=1 paints={}",
-                    ui.selection_fill.opacity(),
-                    ui.sel_paint_frames.get()
-                ));
-                let _ = update_gen;
-            }
-            glib::ControlFlow::Break
-        });
-    } else {
-        // Genuine no-geometry (no row widget): keep prior visible position; retry without hiding.
-        sel_log("UPDATE highlight=defer no_geom (keep prior visible)");
-        schedule_selection_snap(ui);
-    }
+    // Same index does not imply same allocation: a diff can replace/reorder rows
+    // without changing the selected index or the overlay's overall dimensions.
+    schedule_selection_snap(ui);
 }
 
 /// Count FrameClock paints for the current results update (OMNI_LOG_SEL).
@@ -1595,34 +1630,40 @@ fn arm_sel_paint_count(ui: &Ui) {
     });
 }
 
-/// After rows are laid out: place highlight from fresh geometry (no animation, no hide).
+/// Reconcile after at least one layout phase, ignoring superseded updates/sessions.
 fn schedule_selection_snap(ui: &Ui) {
     let weak = ui.me.borrow().clone();
-    glib::idle_add_local_once(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        let weak = ui.me.borrow().clone();
-        let frames = Cell::new(0u8);
-        ui.list_overlay.add_tick_callback(move |_overlay, _| {
-            let Some(ui) = weak.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            let n = frames.get() + 1;
-            frames.set(n);
-            cache_row_geometry(&ui);
-            let ready = cached_sel_geom(&ui).is_some() || ui.hits.borrow().is_empty();
-            if !ready && n < 5 {
-                sel_log(format!("schedule_selection_snap frame={n} waiting for row height"));
-                return glib::ControlFlow::Continue;
-            }
-            ui.sel_layout_pending.set(false);
-            sel_log(format!(
-                "schedule_selection_snap frame={n} ready={ready} → update_selection_visual"
-            ));
+    let update_gen = ui.sel_update_gen.get();
+    let place_gen = ui.sel_place_gen.get();
+    let frames = Cell::new(0u8);
+    ui.list_overlay.add_tick_callback(move |_, _| {
+        let Some(ui) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if ui.sel_update_gen.get() != update_gen || ui.sel_place_gen.get() != place_gen {
+            return glib::ControlFlow::Break;
+        }
+        let n = frames.get() + 1;
+        frames.set(n);
+        // GTK tick callbacks run BEFORE layout. The first tick may still see the
+        // previous allocation (including a nonzero one); only read on a later tick.
+        if n == 1 {
+            return glib::ControlFlow::Continue;
+        }
+        cache_row_geometry(&ui);
+        let ready = cached_sel_geom(&ui).is_some() || ui.hits.borrow().is_empty();
+        if !ready && n < 60 {
+            return glib::ControlFlow::Continue;
+        }
+        ui.sel_layout_pending.set(false);
+        if ready {
             update_selection_visual(&ui);
-            sel_log_state(&ui, "after_schedule_snap");
             verify_selection_geometry(&ui);
-            glib::ControlFlow::Break
-        });
+        } else {
+            ui.is_snapping.set(false);
+            sel_log("schedule_selection_snap: no allocated row after 60 frames");
+        }
+        glib::ControlFlow::Break
     });
 }
 
@@ -4183,37 +4224,50 @@ fn run(ui: &Ui, action: Action) {
     match action {
         Action::Web(query) => ui.web.borrow().search(&query),
         Action::WebIn(query, window) => ui.web.borrow().search_in(&query, window),
-        Action::App(info) => match info.launch(&[], Some(&ctx)) {
-            Ok(()) => ui.apps.borrow_mut().record_launch(&info),
-            Err(e) => {
-                let name = info.display_name();
-                eprintln!("omni: failed to launch {name}: {e}");
-                notify_user(&format!("Couldn't launch {name}"), &e.to_string());
+        Action::App(info) => {
+            apps::apply_env_overrides(info.id().as_deref(), ctx.upcast_ref());
+            match info.launch(&[], Some(&ctx)) {
+                Ok(()) => ui.apps.borrow_mut().record_launch(&info),
+                Err(e) => {
+                    let name = info.display_name();
+                    eprintln!("omni: failed to launch {name}: {e}");
+                    notify_user(&format!("Couldn't launch {name}"), &e.to_string());
+                }
             }
-        },
-        Action::AppAction(info, action) => match apps::launch_action(&info, &action, ctx.upcast_ref()) {
-            Ok(()) => ui.apps.borrow_mut().record_launch(&info),
-            Err(e) => {
-                let name = info.display_name();
-                eprintln!("omni: failed to launch {name} ({}): {e}", action.name);
-                notify_user(&format!("Couldn't launch {name}"), &e.to_string());
+        }
+        Action::AppAction(info, action) => {
+            apps::apply_env_overrides(info.id().as_deref(), ctx.upcast_ref());
+            match apps::launch_action(&info, &action, ctx.upcast_ref()) {
+                Ok(()) => ui.apps.borrow_mut().record_launch(&info),
+                Err(e) => {
+                    let name = info.display_name();
+                    eprintln!("omni: failed to launch {name} ({}): {e}", action.name);
+                    notify_user(&format!("Couldn't launch {name}"), &e.to_string());
+                }
             }
-        },
-        Action::Open(file) => match gio::AppInfo::launch_default_for_uri(&file.uri(), Some(&ctx)) {
-            Ok(()) => recent::record(&file),
-            Err(e) => {
-                eprintln!("omni: couldn't open {}: {e}", file.uri());
-                notify_user("Couldn't open", &e.to_string());
+        }
+        Action::Open(file) => {
+            let uri = file.uri();
+            apps::apply_env_overrides_for_uri(&uri, ctx.upcast_ref());
+            match gio::AppInfo::launch_default_for_uri(&uri, Some(&ctx)) {
+                Ok(()) => recent::record(&file),
+                Err(e) => {
+                    eprintln!("omni: couldn't open {uri}: {e}");
+                    notify_user("Couldn't open", &e.to_string());
+                }
             }
-        },
-        Action::OpenWith(info, file) => match info.launch(&[file.clone()], Some(&ctx)) {
-            Ok(()) => recent::record(&file),
-            Err(e) => {
-                let name = info.display_name();
-                eprintln!("omni: couldn't open {} with {name}: {e}", file.uri());
-                notify_user(&format!("Couldn't open with {name}"), &e.to_string());
+        }
+        Action::OpenWith(info, file) => {
+            apps::apply_env_overrides(info.id().as_deref(), ctx.upcast_ref());
+            match info.launch(&[file.clone()], Some(&ctx)) {
+                Ok(()) => recent::record(&file),
+                Err(e) => {
+                    let name = info.display_name();
+                    eprintln!("omni: couldn't open {} with {name}: {e}", file.uri());
+                    notify_user(&format!("Couldn't open with {name}"), &e.to_string());
+                }
             }
-        },
+        }
         Action::Copy(_) => {}
         Action::DockPin(id, pinned) => dock::set_pinned(&id, pinned),
         Action::Info => {}
@@ -4229,6 +4283,23 @@ fn notify_user(title: &str, body: &str) {
             .map(std::ffi::OsStr::new),
         gio::SubprocessFlags::NONE,
     );
+}
+
+fn set_ui_mode(ui: &Ui, mode: UiMode, animate: bool) {
+    ui.mode.set(mode);
+    ui.main_stack
+        .set_transition_duration(if animate && motion_enabled() { 160 } else { 0 });
+    ui.main_stack.set_visible_child_name(mode.stack_name());
+}
+
+fn show_settings(ui: &Ui) {
+    set_ui_mode(ui, ui.mode.get().after(UiModeAction::OpenSettings), true);
+    ui.settings_back.grab_focus();
+}
+
+fn show_launcher(ui: &Ui) {
+    set_ui_mode(ui, ui.mode.get().after(UiModeAction::Back), true);
+    ui.entry.grab_focus();
 }
 
 fn toggle(ui: &Rc<Ui>) {
@@ -4320,8 +4391,12 @@ fn toggle(ui: &Rc<Ui>) {
         open_log(ui, "search_entry_focused");
         // Next frame: confirm snap, re-enable transition, log assertions.
         let weak = Rc::downgrade(ui);
+        let place_gen = ui.sel_place_gen.get();
         ui.window.add_tick_callback(move |_, _| {
             if let Some(ui) = weak.upgrade() {
+                if ui.sel_place_gen.get() != place_gen {
+                    return glib::ControlFlow::Break;
+                }
                 open_log(&ui, "first_frame_rendered");
                 cache_row_geometry(&ui);
                 if let Some((y, h)) = cached_sel_geom(&ui).or_else(|| estimate_sel_geom(&ui)) {
@@ -4345,6 +4420,9 @@ fn toggle(ui: &Rc<Ui>) {
                 let weak = ui.me.borrow().clone();
                 ui.list_overlay.add_tick_callback(move |_, _| {
                     if let Some(ui) = weak.upgrade() {
+                        if ui.sel_place_gen.get() != place_gen {
+                            return glib::ControlFlow::Break;
+                        }
                         ui.is_snapping.set(false);
                         if motion_enabled() {
                             set_sel_transition_enabled(&ui, true);
@@ -4802,6 +4880,7 @@ fn hide(ui: &Ui) {
     ui.reveal.set_reveal_child(false);
     // Keep path strip height reserved when results exist next open; hide with the list.
     ui.path_reveal.set_reveal_child(false);
+    set_ui_mode(ui, ui.mode.get().after(UiModeAction::Close), false);
     ui.window.set_visible(false);
     ui.place_while_hidden.set(false);
     watchdog::set_open(false);
@@ -5068,6 +5147,44 @@ fn listen_for_toggle(ui: &Rc<Ui>) {
 #[cfg(test)]
 mod filter_tests {
     use super::*;
+
+    #[test]
+    fn settings_navigation_starts_on_launcher() {
+        assert_eq!(UiMode::default(), UiMode::Launcher);
+    }
+
+    #[test]
+    fn settings_navigation_gear_opens_and_back_returns() {
+        let settings = UiMode::Launcher.after(UiModeAction::OpenSettings);
+        assert_eq!(settings, UiMode::Settings);
+        assert_eq!(settings.after(UiModeAction::Back), UiMode::Launcher);
+    }
+
+    #[test]
+    fn settings_navigation_escape_is_consumed_only_in_settings() {
+        assert!(!UiMode::Launcher.consumes_escape());
+        assert!(UiMode::Settings.consumes_escape());
+        assert_eq!(UiMode::Settings.after(UiModeAction::Back), UiMode::Launcher);
+    }
+
+    #[test]
+    fn settings_navigation_close_resets_to_launcher() {
+        assert_eq!(UiMode::Settings.after(UiModeAction::Close), UiMode::Launcher);
+    }
+
+    #[test]
+    fn settings_gear_css_has_rest_hover_and_reduced_motion_states() {
+        assert!(DEFAULT_CSS.contains(".omni-settings-slip"));
+        assert!(DEFAULT_CSS.contains(".omni-settings-slip:hover .omni-settings-button"));
+        assert!(DEFAULT_CSS.contains("padding: 0 40px 0 18px;"));
+        assert!(DEFAULT_CSS.contains("transform: translate(16px, -14px);"));
+        assert!(DEFAULT_CSS.contains("transform: translate(7px, -5px);"));
+        assert!(DEFAULT_CSS.contains("transition: transform 280ms cubic-bezier(0.22, 1, 0.36, 1)"));
+        assert!(DEFAULT_CSS.contains("color: alpha(white, 0.82);"));
+        assert!(DEFAULT_CSS.contains("background-color: transparent;\n  background-image: none;\n  border: none;"));
+        assert!(DEFAULT_CSS.contains("prefers-reduced-motion: reduce"));
+        assert!(DEFAULT_CSS.contains(".omni-settings-button {\n    transition: none;"));
+    }
 
     #[test]
     fn folder_scope_syntax() {
