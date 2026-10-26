@@ -4,3 +4,4 @@ local*
 docs*
 .s*
 test*
+/isolated-mailcount/

@@ -717,38 +717,3 @@ list.omni-results > row.omni-calc.activatable:hover {
   border-radius: 0;
   background-color: alpha(white, 0.04);
 }
-
-.omni-mail {
-  min-width: 28px;
-  min-height: 28px;
-  padding: 0;
-  border-radius: 0;
-  background-color: #000000;
-  background-image: none;
-  border: none;
-  box-shadow: none;
-  margin: 4px 6px 0 0;
-}
-
-.omni-mail:hover {
-  background-color: #111111;
-}
-
-.omni-mail-badge {
-  min-width: 13px;
-  min-height: 13px;
-  padding: 0;
-  margin: -1px -2px 0 0;
-  border-radius: 999px;
-  background-color: #e5303f;
-  color: white;
-  font-size: 8px;
-  font-weight: 700;
-  letter-spacing: 0;
-  box-shadow: none;
-}
-
-.omni-mail-badge.omni-mail-warn {
-  background-color: #f2a33a;
-  color: black;
-}

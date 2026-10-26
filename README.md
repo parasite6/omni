@@ -127,8 +127,6 @@ temporary conversation in the popup:
   pauses while a permission prompt waits
 - **Continue in Claude** opens a chat in the Claude app with the question pre-filled
   (the app never auto-sends prompts that arrive by link, by design)
-- with the mail service installed, the header shows an AgentMail tile with an unread badge
-  (see the last status log entry)
 
 While Claude starts up a ball bounces around the answer panel; text is revealed at a
 steady pace slightly behind the stream so it never stalls or jumps.
@@ -161,7 +159,7 @@ keybind helper doesn't load GTK, so pressing the key costs ~1 ms instead of ~60 
 - `src/files.rs`: the file-name index (walk, search, ranking), contents search
 - `src/sparql.rs`: minimal bindings to LocalSearch's library (queries, change events)
 - `src/web.rs`: default browser and search engine detection
-- `src/answer.rs`: Ask Claude (conversation process, permission prompts, model chip, Markdown, bouncing ball, mail badge)
+- `src/answer.rs`: Ask Claude (conversation process, permission prompts, model chip, Markdown, bouncing ball)
 - `src/agent_prompt.md`: your agent instructions, appended to Claude's system prompt
 - `src/services.rs`: systemd services (list, search, actions, status)
 - `src/ring.rs`: the search bar's animated rim
@@ -171,7 +169,6 @@ keybind helper doesn't load GTK, so pressing the key costs ~1 ms instead of ~60 
   Colours are omni's own cyan/black (`@omni_cyan`, `@omni_black`).
 - `src/bin/omni-toggle.rs`: the keybind helper
 - `scripts/omni-start`: starts omni through `ensure-running`
-- `scripts/omni-mailcount`, `omni-mailcount.service`, `install-mailcount.sh`: the AgentMail unread-count service
 
 ## Install / update
 
@@ -181,12 +178,6 @@ keybind helper doesn't load GTK, so pressing the key costs ~1 ms instead of ~60 
 
 Builds a release (always into this folder's `target/`, even if `CARGO_TARGET_DIR` is set),
 replaces the installed files atomically, restarts `omni` and checks it answers. Needs `gtk4-devel`, `gtk4-layer-shell-devel`, `tinysparql-devel`, Rust.
-
-Optional, for the AgentMail badge (once, and again after changing the `scripts/` files; the stored key is kept):
-
-```bash
-sudo ~/Documents/github/omni/scripts/install-mailcount.sh
-```
 
 ## How it's hooked into Hyprland / ML4W
 
@@ -415,17 +406,6 @@ Each attack below was tested against Claude Code with omni's exact flags.
   - Answers arriving after a stop, cancel or retry are ignored.
   - Prompts queue and survive Esc, hide and crash paths.
 
-### 2026-10-11: AgentMail unread badge
-- **In omni:** Claude's header shows a black tile with the AgentMail logo and an Android-style red badge: unread **conversations** (threads) in `assistant@example.com`, "99+" past 99. **Every prompt to Claude asks the service for a fresh check** (socket `/run/omni-mail/trigger`: it only checks and answers with the count, with checks at least 3 s apart). omni also re-reads `/run/omni-mail/count` every 10 s while a conversation is open, and the service checks on its own every 45 s. Clicking it asks Claude to summarize the unread mail. A rejected (expired or revoked) key shows an amber "!". Without the service there's no tile.
-- **Where the key lives:** never in omni or your account. `scripts/omni-mailcount`, installed root-owned in `/usr/local/libexec`, runs as `omni-mailcount.service`:
-  - its own throwaway user (`DynamicUser`), so the key is unreadable to every regular account, including omni and Claude;
-  - the key is decrypted from `/etc/credstore.encrypted/omni-agentmail.cred` (`systemd-creds`, machine- and TPM-bound) into a private in-memory directory;
-  - no home folders, a read-only system, no privileges or devices, network only, and invisible in other users' process lists;
-  - the key is sent only in an HTTPS header (never on a command line). A redirect is an error, so the key is not sent to another host. An expired key is not rechecked from the trigger socket. Errors log only status codes;
-  - output is just `{"state","unread","more","checked"}`, with nothing from the messages kept.
-- **Install or update:** `sudo ./scripts/install-mailcount.sh`. It keeps the stored key; add `--new-key` to replace it. It asks for the key at a hidden prompt and encrypts it directly, so it never touches the chat, a file or shell history. The key expires after 90 days; then run the script again with the new one.
-- **Badge look:** a small, evenly round red dot (13 px, number centred) overlapping the tile's top-right corner; "99+" widens it slightly.
-
 ### 2026-10-11: audit follow-up (environment, protected files)
 - Another model's audit and patches are in `docs/audit-sanctuary.md`. They were reviewed: it builds, the tests pass, and the key fixes were re-tested against Claude Code.
 - **Fixed: inherited tokens.** omni passes its environment to Claude and to every app it opens. Restarted from a Claude Code session, it carried that session's `CLAUDE_CODE_*` tokens, and `printenv` runs without a prompt. omni now drops `CLAUDE_CODE_*`, `ANTHROPIC_*` and anything named like a token, secret, password or key at startup (`scrub_env` in `main.rs`; `SSH_AUTH_SOCK` stays). `install.sh` restarts omni through Hyprland (`hl.dsp.exec_cmd`), so it gets the desktop's environment.
@@ -434,7 +414,7 @@ Each attack below was tested against Claude Code with omni's exact flags.
   - Tested with the real list: an approved command can't append to, delete or create protected paths, rename their folder away, or add a symlink in `~/.config`. Other folders (`~/Documents`, `~/.cache`, …) stay writable. No placeholder files are left in your home.
   - Claude's Edit and Write tools can still change these files, always with a prompt. Commands that write to `~/.config` or a PATH folder (`cargo install`, a tool saving its settings) now fail inside omni; run them yourself.
   - **Known gap:** `~/.bashrc` is a symlink directly in home, and home itself can't be read-only without blocking every write. zsh is your login shell, so bash rarely reads it.
-- **Still open:** the mail installer runs user-owned files under `sudo` (install from a root-owned copy to close this), a second keypress during backdrop capture, `ensure-running` matching by process name, the D-Bus toggle, and case-variant paths.
+- **Still open:** a second keypress during backdrop capture, `ensure-running` matching by process name, the D-Bus toggle, and case-variant paths.
 
 ### 2026-10-11: readable over white apps
 - **Fixed:** over a white app, the lightly tinted glass stayed nearly white and white text was unreadable. omni now measures the captured backdrop's bright parts (85th percentile of brightness, so half a white window counts) and lays just enough black over it to keep text readable (`dim_for` in `glass.rs`). Dark wallpapers keep the clear glass, and a fully white app gets about 63% dimming (capped at 72%). Tune `MAX_LUMA` / `MAX_DIM` in `glass.rs`.

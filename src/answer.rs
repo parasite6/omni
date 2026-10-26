@@ -33,7 +33,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gtk::prelude::*;
-use gtk::{cairo, gdk, gio, glib};
+use gtk::{cairo, gio, glib};
 
 /// Models and effort levels offered in the answer header's dropdown: (CLI value, label).
 pub const MODELS: [(&str, &str); 4] = [
@@ -168,14 +168,6 @@ const MIN_CPS: f64 = 70.0;
 const CATCH_UP: f64 = 0.6;
 /// Give up (kill Claude, say so) after this long with no output mid-answer; more effort
 /// thinks longer between outputs, so it gets longer.
-/// Written by the omni-mailcount system service (scripts/omni-mailcount): the unread
-/// count only. The API key never comes near omni.
-const MAIL_COUNT: &str = "/run/omni-mail/count";
-/// Asking omni-mailcount for a fresh check (answers with the count; can do nothing else).
-const MAIL_TRIGGER: &str = "/run/omni-mail/trigger";
-/// What the mail tile asks, once the current turn can take another message.
-const MAIL_ASK: &str = "Check my unread AgentMail emails and summarize them briefly.";
-
 /// Longest a single answer may run, however busy, before it's stopped.
 const HARD_LIMIT: Duration = Duration::from_secs(20 * 60);
 
@@ -223,15 +215,6 @@ pub struct Answer {
     busy: Cell<bool>,
     /// Keep the newest text in view while it's typed out (off once the user scrolls up).
     follow: Rc<Cell<bool>>,
-    /// AgentMail unread badge: the tile (hidden without the service), its button, the
-    /// number, and the refresh timer that runs while a conversation is open.
-    mail: gtk::Overlay,
-    mail_button: gtk::Button,
-    mail_badge: gtk::Label,
-    mail_timer: RefCell<Option<glib::SourceId>>,
-    /// One mail-tile question waiting out a busy turn: (that turn, the question).
-    /// A second click replaces it; they don't pile up.
-    mail_followup: Cell<Option<(u64, &'static str)>>,
     /// Header chip showing the model and effort ("Haiku 5.5 · Medium ▾"); the popup opens
     /// the dropdown from it.
     pub chip: gtk::Button,
@@ -296,23 +279,9 @@ impl Answer {
             .css_classes(["omni-answer-button", "omni-model-chip"])
             .build();
 
-        // AgentMail: logo tile with an unread badge (see refresh_mail). Hidden unless the
-        // omni-mailcount service is installed.
-        let logo = gdk::Texture::from_bytes(&glib::Bytes::from_static(include_bytes!("../agentmaillogo.png"))).ok();
-        let mail_image = gtk::Image::builder().pixel_size(14).build();
-        if let Some(logo) = &logo {
-            mail_image.set_paintable(Some(logo));
-        }
-        let mail_button = gtk::Button::builder().child(&mail_image).css_classes(["omni-mail"]).valign(gtk::Align::Center).build();
-        let mail_badge = gtk::Label::builder().halign(gtk::Align::End).valign(gtk::Align::Start).xalign(0.5).justify(gtk::Justification::Center).can_target(false).visible(false).build();
-        mail_badge.add_css_class("omni-mail-badge");
-        let mail = gtk::Overlay::builder().child(&mail_button).visible(false).valign(gtk::Align::Center).build();
-        mail.add_overlay(&mail_badge);
-
         let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         header.append(&icon);
         header.append(&title);
-        header.append(&mail);
         header.append(&chip);
         header.append(&cont);
 
@@ -370,7 +339,7 @@ impl Answer {
             stack,
             ball,
             ball_state,
-            obstacles: vec![icon.clone().upcast(), title.clone().upcast(), mail.clone().upcast(), chip.clone().upcast(), cont.clone().upcast()],
+            obstacles: vec![icon.clone().upcast(), title.clone().upcast(), chip.clone().upcast(), cont.clone().upcast()],
             turns,
             body: RefCell::new(answer_label()),
             scroller,
@@ -394,11 +363,6 @@ impl Answer {
             on_permission_gone: RefCell::default(),
             turn_answer: RefCell::default(),
             chip: chip.clone(),
-            mail: mail.clone(),
-            mail_button: mail_button.clone(),
-            mail_badge,
-            mail_timer: RefCell::default(),
-            mail_followup: Cell::new(None),
             chip_label,
             model: Cell::new(model),
             effort: Cell::new(effort),
@@ -414,18 +378,6 @@ impl Answer {
             tick: RefCell::default(),
         });
 
-        // Clicking the mail tile asks Claude about the unread mail (as a follow-up).
-        // reply() drops the text while a turn is busy; the tile has nowhere else to keep
-        // it, so hold that one question until this turn's result.
-        let a = answer.clone();
-        mail_button.connect_clicked(move |_| {
-            if a.reply(MAIL_ASK) {
-                return;
-            }
-            if a.active.get() && a.busy.get() {
-                a.mail_followup.set(Some((a.turn.get(), MAIL_ASK)));
-            }
-        });
         let a = answer.clone();
         cont.connect_clicked(move |_| {
             let url = format!("claude://claude.ai/new?q={}", crate::web::percent_encode(&a.question.borrow()));
@@ -537,20 +489,6 @@ impl Answer {
         }
         self.cancel();
         self.active.set(true);
-        // The unread badge: now, then every 10 s while the conversation is open (it's a tiny
-        // file in /run; the service itself checks AgentMail every 45 s).
-        self.refresh_mail();
-        let weak = Rc::downgrade(self);
-        let timer = glib::timeout_add_local(Duration::from_secs(10), move || match weak.upgrade() {
-            Some(this) if this.active.get() => {
-                this.refresh_mail();
-                glib::ControlFlow::Continue
-            }
-            _ => glib::ControlFlow::Break,
-        });
-        if let Some(old) = self.mail_timer.replace(Some(timer)) {
-            old.remove();
-        }
         self.stack.set_visible_child_name("loading");
         self.start_turn(question);
     }
@@ -579,8 +517,6 @@ impl Answer {
         self.follow.set(true);
         self.connector_retries.set(0);
         self.title.set_text("Claude");
-        // Every prompt: a fresh unread count.
-        self.poke_mail();
         // Settings changed while the last answer was running: this turn gets them.
         if self.restart_pending.replace(false) {
             self.stop_process();
@@ -899,7 +835,6 @@ impl Answer {
                 self.finished.set(true); // the reveal loop finishes typing out what's buffered
                 self.history.borrow_mut().push((self.question.borrow().clone(), self.text.borrow().clone()));
                 self.turn_answer.borrow().replace(self.text.borrow().clone());
-                self.send_mail_followup();
             }
             _ => {}
         }
@@ -1070,27 +1005,10 @@ impl Answer {
         glib::idle_add_local_once(move || adj.set_value(adj.upper() - adj.page_size()));
     }
 
-    /// The mail tile's question, held while this turn was busy. Only the turn it was
-    /// clicked on, and only if that conversation is still the open one.
-    fn send_mail_followup(self: &Rc<Self>) {
-        let Some((turn, text)) = self.mail_followup.take() else { return };
-        if turn != self.turn.get() || !self.active.get() || self.failed.get() {
-            return;
-        }
-        // The result can land before the type-out finishes, and the next turn replaces
-        // the label. Leave the finished answer whole on the label that's staying.
-        let body = self.body.borrow();
-        body.set_size_request(-1, -1);
-        set_markup_safe(&body, &self.text.borrow(), false);
-        drop(body);
-        self.start_turn(text);
-    }
-
     /// This turn failed: say why in its answer slot. Earlier turns stay, and the user can
     /// reply again (a dead process is replaced, primed with the transcript).
     fn fail(&self, message: &str) {
         self.failed.set(true);
-        self.mail_followup.set(None);
         self.body.borrow().set_size_request(-1, -1);
         self.busy.set(false);
         self.ball.set_visible(false);
@@ -1108,64 +1026,9 @@ impl Answer {
         self.scroller.set_max_content_height(height.min(460));
     }
 
-    /// Update the AgentMail badge from omni-mailcount's file (a tiny file in /run, read in
-    /// microseconds). No file: the service isn't installed, so no tile at all.
-    fn refresh_mail(&self) {
-        let Ok(text) = std::fs::read_to_string(MAIL_COUNT) else {
-            self.mail.set_visible(false);
-            return;
-        };
-        let state: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
-        let unread = state["unread"].as_u64().unwrap_or(0);
-        let more = state["more"].as_bool().unwrap_or(false);
-        let (badge, tip, warn) = match state["state"].as_str() {
-            Some("ok") if unread == 0 => (None, "No unread email in assistant@example.com".to_string(), false),
-            Some("ok") => {
-                let n = if more || unread > 99 { "99+".to_string() } else { unread.to_string() };
-                let tip = format!("{n} unread conversation{} in assistant@example.com \u{b7} click to ask Claude", if unread == 1 && !more { "" } else { "s" });
-                (Some(n), tip, false)
-            }
-            Some("expired") => (Some("!".to_string()), "The AgentMail key was rejected (expired or revoked)".to_string(), true),
-            _ => (None, "Couldn't check AgentMail right now".to_string(), false),
-        };
-        self.mail.set_visible(true);
-        self.mail_button.set_tooltip_text(Some(&tip));
-        self.mail_badge.set_visible(badge.is_some());
-        self.mail_badge.set_label(badge.as_deref().unwrap_or(""));
-        if warn {
-            self.mail_badge.add_css_class("omni-mail-warn");
-        } else {
-            self.mail_badge.remove_css_class("omni-mail-warn");
-        }
-    }
-
-    /// Ask omni-mailcount to check AgentMail now, off the UI thread; the badge updates when
-    /// it answers (or stays as it was if the service is slow or missing).
-    fn poke_mail(self: &Rc<Self>) {
-        if !std::path::Path::new(MAIL_TRIGGER).exists() {
-            return;
-        }
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let client = gio::SocketClient::new();
-            client.set_timeout(25);
-            let address = gio::UnixSocketAddress::new(std::path::Path::new(MAIL_TRIGGER));
-            let Ok(conn) = client.connect_future(&address).await else { return };
-            // The service checks, writes its file, sends the same JSON and closes.
-            let _ = conn.input_stream().read_bytes_future(4096, glib::Priority::DEFAULT).await;
-            if let Some(this) = weak.upgrade() {
-                this.refresh_mail();
-            }
-        });
-    }
-
     /// End the conversation (Esc, new search, popup closed): stop Claude and forget it.
     pub fn cancel(&self) {
         self.active.set(false);
-        self.mail_followup.set(None);
-        if let Some(timer) = self.mail_timer.take() {
-            timer.remove();
-        }
         self.busy.set(false);
         self.stop_process();
         self.stop_ticking();
