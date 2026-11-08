@@ -1,0 +1,21 @@
+/* Ask Brave chrome, inspected on 2026-10-26. Keep answer/citation nodes intact. */
+.ask-left,
+.ask-center-header,
+.ask-mobile-topbar {
+  display: none !important;
+}
+
+/* Hide the tracks without changing scroll containers or overflow behavior. */
+* {
+  scrollbar-width: none !important;
+}
+*::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+/* Ask Brave overlays these DOM tracks on its native scroll containers. */
+.vscroll-track {
+  display: none !important;
+}

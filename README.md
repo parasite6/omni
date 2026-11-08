@@ -31,7 +31,7 @@
 
 ```bash
 # 1. build dependencies (Fedora)
-sudo dnf install gtk4-devel gtk4-layer-shell-devel tinysparql-devel   # + Rust
+sudo dnf install gtk4-devel gtk4-layer-shell-devel tinysparql-devel cef   # + Rust
 
 # 2. build, install and start it
 ~/Documents/github/omni/install.sh
@@ -43,7 +43,11 @@ That's it. The same command **updates** omni later.
 
 **What `install.sh` does:** builds a release (always into this folder's `target/`, even if `CARGO_TARGET_DIR` is set), replaces the installed files atomically, restarts `omni` and checks that it answers.
 
-**Needs:** `gtk4-devel`, `gtk4-layer-shell-devel`, `tinysparql-devel`, Rust.
+**Needs:** `gtk4-devel`, `gtk4-layer-shell-devel`, `tinysparql-devel`, `cef`, Rust.
+
+Built-in web search currently uses Brave Search in a GTK view backed by Chromium Embedded Framework (CEF). Select the engine in Settings, then use `Ctrl`＋`Enter` or the web result. Back / `Esc` returns to the launcher. Queries open Brave’s `/ask` AI view. An initial page filter hides the navigation header and history sidebar while retaining answers, sources, and the follow-up prompt. Each submitted search creates an isolated in-memory browser session. Every fresh session starts with usage metrics, anonymous local results, and SafeSearch off. Omni seeds Brave’s `safesearch=off` and `useLocation=0` cookies before navigation, and sets `app.usageMetricsOptOut=true` in Brave’s localStorage before its page scripts run. These preferences remain in memory with the session. Follow-ups share that session until Back, Escape, or popup close destroys it. Cookies, browser history, localStorage, IndexedDB, caches, and service workers are not reused for the next search. CEF installation metadata lives in a private temporary runtime directory that is removed on clean shutdown. This controls local storage; Brave’s own server-side retention is separate. The system CEF library must support API 14600; Fedora’s `cef` package is used by default. Set `OMNI_CEF_DIR` at build time for another CEF installation.
+
+The search header and launcher result use the bundled [official Brave favicon](https://cdn.search.brave.com/serp/v3/_app/immutable/assets/favicon.CVXAaejQ.svg). Page chrome and native and Brave-drawn scrollbar tracks are hidden at document creation; wheel and trackpad scrolling remain available. Searches show the query, a spinner, and pulsing placeholder lines immediately, then crossfade into the ready page; reduced-motion preferences are respected. Omni warms the Chromium engine shortly after startup without creating a page or search session. Its external message pump honors CEF scheduling requests with a 33 ms fallback. The embedded browser disables QUIC so Brave requests use HTTPS over HTTP/2 where available; conversation creation was intermittently rejected with HTTP 400 over HTTP/3 in controlled CEF and Brave tests. Set `OMNI_SEARCH_DIAGNOSTICS=1` for opt-in endpoint status and streaming metadata without query strings, request bodies, or answer text. Set `OMNI_SEARCH_TIMING=1` to log startup and document-load timings without logging queries; `cargo run --example chromium-load-timing -- --local` runs a local sequential-request benchmark, and `--prewarm` measures an already-initialized engine.
 
 > The keybind and autostart are wired up through Hyprland / ML4W: see [How it's hooked into Hyprland / ML4W](#how-its-hooked-into-hyprland--ml4w).
 
@@ -274,11 +278,9 @@ One- and two-letter queries match name starts only. Every shown path is checked,
 
 ## Web search
 
-Uses your **default browser's own default engine**.
+Use `Ctrl`＋`Enter` or activate the web result to open **Brave Search inside Omni**, using Chromium Embedded Framework (CEF). Settings → Search engine currently offers Brave; additional engines need their own AI overview filters. The initial page filter hides Brave’s navigation header and history sidebar while retaining answers, source controls, and the follow-up prompt. Back or `Esc` returns to the launcher.
 
-- **Chromium-family** browsers (Brave, Chrome, Chromium, Edge, Vivaldi): omni reads the engine from the browser profile.
-- **Firefox-family** browsers get `--search`.
-- Brave's `&t=brave` tag is dropped from DuckDuckGo URLs.
+Private-window actions below continue to use your external browser and its private search engine.
 
 ### Private searching
 

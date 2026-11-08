@@ -5,9 +5,13 @@ edition = "2024"
 
 [dependencies]
 gio-unix = "0.22.8"
+glib-unix = "0.22.8"
 gtk = { version = "0.11.5", package = "gtk4", features = ["v4_14"] }
 gtk4-layer-shell = "0.8.1"
 libc = "0.2.190"
 memchr = "2.8.3"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 serde_json = "1.0.152"
+# Use the system CEF library; dox suppresses the bindings' bundled CEF downloader.
+cef = { version = "=146.0.0", default-features = false, features = ["dox", "linux-x11"] }
+cef-dll-sys = { version = "=146.0.0", features = ["dox"] }

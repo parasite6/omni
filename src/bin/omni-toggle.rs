@@ -17,7 +17,29 @@ use std::time::Duration;
 
 const ROUND_TRIP: Duration = Duration::from_secs(1);
 
+/// `OMNI_TRIGGER_LOG=/path`: append wall-clock timings for the whole keybind path.
+fn tlog(stage: impl std::fmt::Display) {
+    use std::io::Write;
+    // An explicit path, or the runtime-directory marker that also turns on omni's
+    // own probe logging (see probe.rs).
+    let Some(path) = std::env::var_os("OMNI_TRIGGER_LOG").filter(|p| !p.is_empty()).or_else(|| {
+        let dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty())?;
+        let dir = PathBuf::from(dir);
+        dir.join("omni-debug").exists().then(|| dir.join("omni-trigger.log").into_os_string())
+    }) else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{now} trigger {stage}");
+    }
+}
+
 fn main() -> ExitCode {
+    tlog("omni-toggle start");
     // Same socket as omni. Unset or empty: stop. /tmp is shared, so it is not a fallback.
     let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) else {
         return ExitCode::FAILURE;
@@ -29,8 +51,10 @@ fn main() -> ExitCode {
     }
 
     if send_toggle(&socket) {
+        tlog("toggle acknowledged");
         return ExitCode::SUCCESS;
     }
+    tlog("toggle NOT acknowledged; recovering");
 
     // omni isn't answering: (re)start it, then toggle it open.
     let here = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf));
@@ -66,9 +90,12 @@ fn ping(socket: &Path) -> bool {
 }
 
 fn request(socket: &Path, msg: &[u8], expect: &[u8]) -> bool {
+    let t = std::time::Instant::now();
     let Ok(mut stream) = connect_timeout(socket, ROUND_TRIP) else {
+        tlog("connect failed");
         return false;
     };
+    tlog(format!("connected ({:.1}ms)", t.elapsed().as_secs_f64() * 1000.0));
     let timeout = Some(ROUND_TRIP);
     if stream.set_read_timeout(timeout).is_err() || stream.set_write_timeout(timeout).is_err() {
         return false;
@@ -77,7 +104,9 @@ fn request(socket: &Path, msg: &[u8], expect: &[u8]) -> bool {
         return false;
     }
     let mut reply = vec![0u8; expect.len()];
-    stream.read_exact(&mut reply).is_ok() && reply == expect
+    let ok = stream.read_exact(&mut reply).is_ok() && reply == expect;
+    tlog(format!("reply ok={ok} ({:.1}ms)", t.elapsed().as_secs_f64() * 1000.0));
+    ok
 }
 
 /// `UnixStream::connect` can block forever on a half-dead peer (zombie omni still

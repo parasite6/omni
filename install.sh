@@ -8,9 +8,13 @@ dest="$HOME/.local/share/omni"
 runtime="${XDG_RUNTIME_DIR:-}"
 
 # linuxbrew's pkg-config shadows Fedora's and can't see the system GTK .pc files.
-# --target-dir: a CARGO_TARGET_DIR from the environment would build elsewhere and leave
-# the binaries copied below stale.
-PKG_CONFIG=/usr/bin/pkg-config cargo build --release --manifest-path "$src/Cargo.toml" --target-dir "$src/target"
+# Build from the source root so both blaze and its cargo fallback use $src/target
+# (a CARGO_TARGET_DIR from the environment must not leave the copied binaries stale).
+if command -v blaze >/dev/null 2>&1; then
+    (cd "$src" && PKG_CONFIG=/usr/bin/pkg-config blaze build --release)
+else
+    PKG_CONFIG=/usr/bin/pkg-config cargo build --release --manifest-path "$src/Cargo.toml" --target-dir "$src/target"
+fi
 
 mkdir -p "$dest/bin" "$dest/hypr"
 
@@ -21,9 +25,16 @@ put() { # put SRC DEST MODE
     mv -f "$2.new" "$2"
 }
 put "$src/target/release/omni"        "$dest/bin/omni"        0555
+put "$src/target/release/omni-browser" "$dest/bin/omni-browser" 0555
 put "$src/target/release/omni-toggle" "$dest/bin/omni-toggle" 0555
 put "$src/scripts/omni-start"         "$dest/bin/omni-start"  0555
 put "$src/hypr/omni.lua"              "$dest/hypr/omni.lua"   0444
+
+# The identity-guarded installer manages shutdown/startup itself.
+if [ "${OMNI_INSTALL_NO_RESTART:-0}" = 1 ]; then
+    echo "omni installed to $dest (restart managed by caller)"
+    exit 0
+fi
 
 omni_state() { awk '{print $3}' "/proc/$1/stat" 2>/dev/null || true; }
 

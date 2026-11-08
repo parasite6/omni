@@ -1,12 +1,17 @@
 mod answer;
+mod browser_frame;
+mod chromium;
 mod apps;
 mod calc;
 mod dock;
 mod files;
 mod glass;
+mod probe;
 mod recent;
 mod ring;
 mod services;
+mod search_provider;
+mod search_view;
 mod sparql;
 mod util;
 mod web;
@@ -195,6 +200,7 @@ enum UiMode {
     #[default]
     Launcher,
     Settings,
+    WebSearch,
 }
 
 #[derive(Clone, Copy)]
@@ -213,13 +219,14 @@ impl UiMode {
     }
 
     fn consumes_escape(self) -> bool {
-        self == Self::Settings
+        self != Self::Launcher
     }
 
     fn stack_name(self) -> &'static str {
         match self {
             Self::Launcher => "launcher",
             Self::Settings => "settings",
+            Self::WebSearch => "web-search",
         }
     }
 }
@@ -230,6 +237,8 @@ struct Ui {
     main_stack: gtk::Stack,
     mode: Cell<UiMode>,
     settings_back: gtk::Button,
+    search_provider: Cell<search_provider::SearchProvider>,
+    search_view: search_view::SearchView,
     entry: gtk::SearchEntry,
     list: gtk::ListBox,
     list_scroll: gtk::ScrolledWindow,
@@ -343,6 +352,8 @@ struct Ui {
 }
 
 fn main() -> glib::ExitCode {
+    probe::init();
+    probe::log("process start");
     scrub_env();
     use_display_gpu_only();
 
@@ -444,25 +455,42 @@ fn main() -> glib::ExitCode {
 
     let ui: Rc<RefCell<Option<Rc<Ui>>>> = Rc::default();
 
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let app = app.downgrade();
+        glib_unix::unix_signal_add_local(signal, move || {
+            if let Some(app) = app.upgrade() { app.quit(); }
+            glib::ControlFlow::Break
+        });
+    }
+
     let slot = ui.clone();
     app.connect_startup(move |app| {
         let built = build_ui(app);
+        search_provider::start_icon_preload();
+        probe::start_loop_probe();
         listen_for_toggle(&built);
         *slot.borrow_mut() = Some(built);
         std::mem::forget(app.hold()); // keep running while hidden
     });
 
+    let command_ui = ui.clone();
     app.connect_command_line(move |_, cmd| {
         let daemon = cmd.arguments().iter().any(|a| a == "--daemon");
         if !daemon {
-            if let Some(ui) = ui.borrow().as_ref() {
+            if let Some(ui) = command_ui.borrow().as_ref() {
                 toggle(ui);
             }
         }
         0.into()
     });
 
-    app.run()
+    let result = app.run();
+    if let Some(ui) = ui.borrow().as_ref() { ui.search_view.close(); }
+    if let Err(error) = chromium::finish() {
+        eprintln!("omni: {error}");
+        return glib::ExitCode::FAILURE;
+    }
+    result
 }
 
 /// At early login Hyprland can start programs before WAYLAND_DISPLAY (or the instance
@@ -814,16 +842,23 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .css_classes(["flat", "omni-settings-button"])
         .focus_on_click(false)
         .halign(gtk::Align::End)
-        .valign(gtk::Align::Center)
+        .valign(gtk::Align::Start)
         .build();
-    let settings_slip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    let settings_slip = gtk::Overlay::new();
     settings_slip.add_css_class("omni-settings-slip");
     settings_slip.set_halign(gtk::Align::End);
     settings_slip.set_valign(gtk::Align::Start);
     settings_slip.set_size_request(44, 44);
-    settings_slip.set_margin_top(10);
+    settings_slip.set_margin_top(0);
     settings_slip.set_overflow(gtk::Overflow::Hidden);
-    settings_slip.append(&settings_button);
+    settings_slip.set_child(Some(&settings_button));
+    settings_button.set_can_target(false);
+    let corner_hover = gtk::EventControllerMotion::new();
+    let gear = settings_button.clone();
+    corner_hover.connect_enter(move |_, _, _| gear.set_can_target(true));
+    let gear = settings_button.clone();
+    corner_hover.connect_leave(move |_| gear.set_can_target(false));
+    settings_slip.add_controller(corner_hover);
     launcher_plane.add_overlay(&settings_slip);
 
     let back_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -841,15 +876,27 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     settings_plane.add_css_class("omni-settings-plane");
     settings_plane.set_vexpand(true);
     settings_plane.append(&settings_back);
+    let provider = load_search_provider();
+    let search_settings = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    search_settings.add_css_class("omni-search-settings");
+    let search_label = gtk::Label::builder().label("Search engine").xalign(0.0).hexpand(true).build();
+    let names: Vec<_> = search_provider::SearchProvider::ALL.iter().map(|p| p.name()).collect();
+    let engine_dropdown = gtk::DropDown::from_strings(&names);
+    engine_dropdown.set_selected(search_provider::SearchProvider::ALL.iter().position(|p| *p == provider).unwrap_or(0) as u32);
+    search_settings.append(&search_label);
+    search_settings.append(&engine_dropdown);
+    settings_plane.append(&search_settings);
+    let search_view = search_view::SearchView::new();
 
     let main_stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
         .transition_duration(160)
         .hhomogeneous(true)
-        .vhomogeneous(true)
+        .vhomogeneous(false)
         .build();
     main_stack.add_named(&launcher_plane, Some(UiMode::Launcher.stack_name()));
     main_stack.add_named(&settings_plane, Some(UiMode::Settings.stack_name()));
+    main_stack.add_named(&search_view.root, Some(UiMode::WebSearch.stack_name()));
     main_stack.set_visible_child_name(UiMode::Launcher.stack_name());
 
     let frame = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -913,6 +960,8 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         main_stack: main_stack.clone(),
         mode: Cell::new(UiMode::default()),
         settings_back: settings_back.clone(),
+        search_provider: Cell::new(provider),
+        search_view,
         entry: entry.clone(),
         list: list.clone(),
         list_scroll: list_scroll.clone(),
@@ -1003,6 +1052,17 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     let u = ui.clone();
     settings_back.connect_clicked(move |_| show_launcher(&u));
     let u = ui.clone();
+    ui.search_view.back.connect_clicked(move |_| show_launcher(&u));
+    let u = ui.clone();
+    engine_dropdown.connect_selected_notify(move |dropdown| {
+        if let Some(&provider) = search_provider::SearchProvider::ALL.get(dropdown.selected() as usize) {
+            u.search_provider.set(provider);
+            if let Err(error) = save_search_provider(provider) {
+                notify_user("Couldn’t save search engine", &error.to_string());
+            }
+        }
+    });
+    let u = ui.clone();
     settings_button.connect_clicked(move |_| show_settings(&u));
 
     // Claude Code asking permission (a command, an edit, a web page ...).
@@ -1088,8 +1148,11 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     let weak = Rc::downgrade(&ui);
     let app_monitor = gio::AppInfoMonitor::get();
     app_monitor.connect_changed(move |_| {
+        probe::log("apps-changed signal");
         if let Some(ui) = weak.upgrade() {
+            let t_reload = Instant::now();
             ui.apps.borrow_mut().reload();
+            probe::log(format!("apps reloaded ({:.1}ms)", t_reload.elapsed().as_secs_f64() * 1000.0));
             if ui.window.is_visible() && !ui.chatting.get() && !ui.entry.text().trim().is_empty() {
                 refresh(&ui);
             }
@@ -1099,6 +1162,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
 
     let u = ui.clone();
     entry.connect_search_changed(move |_| {
+        probe::log(format!("keystroke {:?}", u.entry.text().to_string()));
         sel_log(format!(
             "keystroke text={:?} selectedIndex={}",
             u.entry.text().to_string(),
@@ -1109,6 +1173,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
             dismiss_menu(&u);
         }
         refresh(&u);
+        probe::log("keystroke refresh done");
         sel_log_state(&u, "after_keystroke_refresh");
     });
 
@@ -1345,6 +1410,9 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
             show_launcher(&u);
             return glib::Propagation::Stop;
         }
+        if u.mode.get() != UiMode::Launcher {
+            return glib::Propagation::Proceed;
+        }
         match key {
             // In a conversation, Esc goes back to searching; otherwise it closes.
             gdk::Key::Escape if u.chatting.get() => end_chat(&u),
@@ -1383,25 +1451,36 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     });
     window.add_controller(keys);
 
-    // Scroll wheel / touchpad moves the selection like ↑/↓. Touchpad deltas are summed so a
-    // swipe moves one row per unit, not one per event. With a Claude answer showing, the
+    // Scroll wheel / touchpad moves the selection like ↑/↓. Convert surface pixels to
+    // row-sized steps; wheel units are already detents. With a Claude answer showing, the
     // scroll goes to the answer text instead.
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
     // Before the list's own scroller sees it: the wheel moves the selection, and the list
     // follows the selection.
     scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
     let u = ui.clone();
-    let pending = Cell::new(0.0f64);
-    scroll.connect_scroll(move |_, _, dy| {
-        if u.answer_reveal.reveals_child() || u.status_reveal.reveals_child() || u.menu.borrow().is_some() {
+    let pending = Rc::new(Cell::new(0.0f64));
+    for begin in [true, false] {
+        let pending = pending.clone();
+        if begin {
+            scroll.connect_scroll_begin(move |_| pending.set(0.0));
+        } else {
+            scroll.connect_scroll_end(move |_| pending.set(0.0));
+        }
+    }
+    let last_unit = Cell::new(gdk::ScrollUnit::Wheel);
+    scroll.connect_scroll(move |controller, _, dy| {
+        if u.mode.get() != UiMode::Launcher || u.answer_reveal.reveals_child() || u.status_reveal.reveals_child() || u.menu.borrow().is_some() {
             return glib::Propagation::Proceed;
         }
-        let total = pending.get() + dy;
-        let steps = total.trunc() as i32;
-        pending.set(total - steps as f64);
-        for _ in 0..steps.abs() {
-            move_selection(&u, steps.signum());
+        let unit = controller.unit();
+        if last_unit.replace(unit) != unit {
+            pending.set(0.0);
         }
+        let steps = selection_scroll_steps(&pending, dy, unit);
+        // Jump straight to the event's final row: no intermediate CSS/layout work
+        // or redundant idle callbacks, including when already at a list boundary.
+        move_selection(&u, steps);
         glib::Propagation::Stop
     });
     window.add_controller(scroll);
@@ -1515,9 +1594,14 @@ fn refresh(ui: &Ui) {
         hits.extend(claude_hit(ui, query));
     }
 
-    // Keep the same result if it still exists (by stable id); otherwise clamp to 0.
+    // Results filling in for the same query keep the same result (by stable id). A new
+    // query re-ranks everything, so the best match (row 0) is selected: following the old
+    // pick let a weaker match stay selected below better ones that just appeared.
     let prev_index = ui.selected_index.get();
-    let prev_key = ui.hits.borrow().get(prev_index).map(hit_key);
+    let same_query = *ui.shown_query.borrow() == query;
+    let prev_key = same_query
+        .then(|| ui.hits.borrow().get(prev_index).map(hit_key))
+        .flatten();
     let chrome_was_shown =
         ui.selection_fill.is_visible() && ui.selection_fill.opacity() >= 1.0 && !ui.hits.borrow().is_empty();
     *ui.shown_query.borrow_mut() = query.to_string();
@@ -3243,6 +3327,18 @@ fn save_contents_setting(on: bool) {
     let _ = std::fs::write(path, if on { "on\n" } else { "off\n" });
 }
 
+fn load_search_provider() -> search_provider::SearchProvider {
+    let path = glib::user_config_dir().join("omni/search-engine");
+    let id = std::fs::read_to_string(path).unwrap_or_default();
+    search_provider::SearchProvider::from_id(id.trim())
+}
+
+fn save_search_provider(provider: search_provider::SearchProvider) -> std::io::Result<()> {
+    let dir = glib::user_config_dir().join("omni");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("search-engine"), format!("{}\n", provider.id()))
+}
+
 fn filter_setting_path() -> PathBuf {
     contents_setting_path().with_file_name("filter")
 }
@@ -3564,16 +3660,11 @@ fn recent_hits(ui: &Ui) -> Vec<Hit> {
 }
 
 fn web_hit(ui: &Ui, query: &str) -> Hit {
-    let engine = ui.web.borrow();
-    let browser = engine.browser.as_ref().map(|b| b.display_name().to_string());
     Hit {
         title: format!("Search the web for \u{201c}{query}\u{201d}"),
-        subtitle: match browser {
-            Some(b) => format!("{} \u{b7} {b}", engine.name),
-            None => engine.name.clone(),
-        },
+        subtitle: format!("{} \u{b7} Built-in search", ui.search_provider.get().name()),
         subtitle_markup: false,
-        icon: engine.browser.as_ref().and_then(|b| b.icon()).or_else(|| Some(gio::ThemedIcon::new("web-browser").upcast())),
+        icon: Some(ui.search_provider.get().icon()),
         action: Action::Web(query.to_string()),
         file_menu: false,
         match_type: None,
@@ -3614,11 +3705,17 @@ fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
     if matches!(hit.action, Action::Copy(_)) {
         return calc_row(hit);
     }
-    let icon = match &hit.icon {
-        Some(i) => gtk::Image::from_gicon(i),
-        None => gtk::Image::from_icon_name("application-x-executable"),
+    let icon = match &hit.action {
+        Action::Web(_) | Action::WebIn(..) => search_provider::mark_image(28),
+        _ => {
+            let image = match &hit.icon {
+                Some(i) => gtk::Image::from_gicon(i),
+                None => gtk::Image::from_icon_name("application-x-executable"),
+            };
+            image.set_pixel_size(28);
+            image
+        }
     };
-    icon.set_pixel_size(28);
     icon.set_halign(gtk::Align::Center);
     icon.set_valign(gtk::Align::Center);
 
@@ -3731,16 +3828,23 @@ fn highlight_title(title: &str, query: &str) -> String {
     out
 }
 
-/// The calculator's result, shown as the answer: expression small on top, result large
-/// underneath (it can wrap, so long numbers are never cut off).
+/// The calculator's answer, laid out like every other row: icon, then the text
+/// column (expression small on top, result large underneath), with the shortcut
+/// hint on the right. The result can wrap, so long numbers are never cut off.
 fn calc_row(hit: &Hit) -> gtk::ListBoxRow {
-    let expression = gtk::Label::builder().label(&hit.subtitle).xalign(0.0).hexpand(true).build();
+    let icon = gtk::Image::from_icon_name("accessories-calculator-symbolic");
+    icon.set_pixel_size(28);
+    icon.set_halign(gtk::Align::Center);
+    icon.set_valign(gtk::Align::Center);
+
+    let expression = gtk::Label::builder()
+        .label(&hit.subtitle)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(1)
+        .hexpand(true)
+        .build();
     expression.add_css_class("omni-calc-expression");
-    let hint = gtk::Label::new(Some("Enter to copy"));
-    hint.add_css_class("omni-calc-hint");
-    let top = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    top.append(&expression);
-    top.append(&hint);
 
     let result = gtk::Label::builder()
         .label(&hit.title)
@@ -3752,9 +3856,21 @@ fn calc_row(hit: &Hit) -> gtk::ListBoxRow {
         .build();
     result.add_css_class("omni-calc-result");
 
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    content.append(&top);
-    content.append(&result);
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    text.set_valign(gtk::Align::Center);
+    text.set_hexpand(true);
+    text.append(&expression);
+    text.append(&result);
+
+    let hint = gtk::Label::new(Some("Enter to copy"));
+    hint.add_css_class("omni-calc-hint");
+    hint.set_valign(gtk::Align::Center);
+
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    content.set_valign(gtk::Align::Center);
+    content.append(&icon);
+    content.append(&text);
+    content.append(&hint);
     let row = gtk::ListBoxRow::builder().child(&content).build();
     row.add_css_class("omni-calc");
     row
@@ -4013,7 +4129,7 @@ fn web_menu_entries(ui: &Ui, query: &str) -> Vec<MenuEntry> {
     let engine = ui.web.borrow();
     let mut entries = vec![MenuEntry::Item {
         label: "Search".into(),
-        detail: Some(engine.name.clone()),
+        detail: Some(ui.search_provider.get().name().into()),
         icon: Some(gio::ThemedIcon::new("system-search-symbolic").upcast()),
         action: Action::Web(query.to_string()),
     }];
@@ -4128,13 +4244,18 @@ fn show_menu(ui: &Ui, entries: Vec<MenuEntry>, target: gdk::Rectangle) {
     menu.popup();
 }
 
+fn selection_scroll_steps(pending: &Cell<f64>, dy: f64, unit: gdk::ScrollUnit) -> i32 {
+    let dy = if unit == gdk::ScrollUnit::Surface { dy / ROW_HEIGHT as f64 } else { dy };
+    let total = pending.get() + dy;
+    let steps = total.trunc() as i32;
+    pending.set(total.fract());
+    steps
+}
+
 fn move_selection(ui: &Ui, delta: i32) {
-    let count = ui.hits.borrow().len() as i32;
-    if count == 0 {
+    let Some(next) = selection_target(ui.selected_index.get(), ui.hits.borrow().len(), delta) else {
         return;
-    }
-    let cur = ui.selected_index.get() as i32;
-    let next = (cur + delta).clamp(0, count - 1) as usize;
+    };
     // Animation first; scroll (layout) waits for the next idle.
     set_selected_index(ui, next, true);
     let weak = ui.me.borrow().clone();
@@ -4142,6 +4263,14 @@ fn move_selection(ui: &Ui, delta: i32) {
         let Some(ui) = weak.upgrade() else { return };
         scroll_to_cached(&ui, ui.selected_index.get());
     });
+}
+
+fn selection_target(current: usize, count: usize, delta: i32) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let next = current.saturating_add_signed(delta as isize).min(count - 1);
+    (next != current).then_some(next)
 }
 
 /// Scroll using cached row geometry — no layout reads on the selection hot path.
@@ -4159,6 +4288,7 @@ fn scroll_to_cached(ui: &Ui, index: usize) {
 }
 
 fn activate(ui: &Ui, index: usize) {
+    probe::log(format!("activate {index}"));
     let Some(action) = ui.hits.borrow().get(index).map(|h| h.action.clone()) else { return };
     if matches!(action, Action::Info) {
         return;
@@ -4168,6 +4298,12 @@ fn activate(ui: &Ui, index: usize) {
 
 fn run(ui: &Ui, action: Action) {
     if matches!(action, Action::Info) {
+        return;
+    }
+    if let Action::Web(query) = &action {
+        probe::log("web search: enter");
+        set_ui_mode(ui, UiMode::WebSearch, true);
+        ui.search_view.search(ui.search_provider.get(), query);
         return;
     }
     if let Action::Claude(query) = action {
@@ -4221,6 +4357,7 @@ fn run(ui: &Ui, action: Action) {
         ctx.setenv(key, value);
     }
     hide(ui);
+    probe::log("hide done, launching");
     match action {
         Action::Web(query) => ui.web.borrow().search(&query),
         Action::WebIn(query, window) => ui.web.borrow().search_in(&query, window),
@@ -4273,6 +4410,7 @@ fn run(ui: &Ui, action: Action) {
         Action::Info => {}
         Action::Claude(_) | Action::Service(_) | Action::ServiceVerb(..) | Action::ServiceStatus(_) => unreachable!(),
     }
+    probe::log("launch returned");
 }
 
 /// Desktop notification after the popup has closed (same pattern as services.rs).
@@ -4298,6 +4436,7 @@ fn show_settings(ui: &Ui) {
 }
 
 fn show_launcher(ui: &Ui) {
+    ui.search_view.stop();
     set_ui_mode(ui, ui.mode.get().after(UiModeAction::Back), true);
     ui.entry.grab_focus();
 }
@@ -4306,6 +4445,7 @@ fn toggle(ui: &Rc<Ui>) {
     if ui.window.is_visible() {
         hide(ui);
     } else {
+        probe::log("toggle enter");
         ui.open_t0.set(Some(Instant::now()));
         let apps_n = ui.apps.borrow().len();
         let sparql_ready = ui.sparql.borrow().is_some();
@@ -4552,14 +4692,15 @@ fn maybe_run_reopen_diag(ui: &Rc<Ui>) {
 }
 
 fn open_log(ui: &Ui, stage: &str) {
-    if std::env::var_os("OMNI_LOG_OPEN").is_none() {
-        return;
-    }
     let ms = ui
         .open_t0
         .get()
         .map(|t| t.elapsed().as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
+    probe::log(format!("open +{ms:.1}ms {stage}"));
+    if std::env::var_os("OMNI_LOG_OPEN").is_none() {
+        return;
+    }
     eprintln!("omni[open]: +{ms:7.1}ms {stage}");
 }
 
@@ -4848,6 +4989,8 @@ fn close_confirm(ui: &Ui) {
 }
 
 fn hide(ui: &Ui) {
+    probe::log("hide enter");
+    ui.search_view.stop();
     // Release the exclusive grab and flush it before unmapping. Launching blocks this
     // thread after hide() returns, and an unflushed unmap can leave the grab held
     // after the watchdog stands down.
@@ -4887,6 +5030,7 @@ fn hide(ui: &Ui) {
     if let Some(beat) = ui.heartbeat.take() {
         beat.remove();
     }
+    probe::log("hide done");
 }
 
 /// Keyboard safety net. While the popup is open it holds the keyboard exclusively, so a
@@ -4969,6 +5113,7 @@ fn fit_to_monitor(ui: &Ui, height: i32) {
     let list_cap = (MAX_VISIBLE_ROWS * ROW_HEIGHT).min(room);
     ui.list_scroll.set_max_content_height(list_cap);
     ui.answer.set_max_height(room);
+    ui.search_view.set_height(room.saturating_sub(60));
     ui.status_scroll.set_max_content_height(room);
 }
 
@@ -5018,6 +5163,8 @@ enum SocketRequest {
     Toggle,
     Ping,
     Search(String),
+    /// Debug: put text in the bar, as typing would.
+    Type(String),
     WatchdogTest,
     Ignore,
 }
@@ -5029,6 +5176,9 @@ fn socket_request(msg: &[u8], debug: bool) -> SocketRequest {
     if debug {
         if let Some(query) = msg.strip_prefix(b"search\t") {
             return SocketRequest::Search(String::from_utf8_lossy(query).trim().to_string());
+        }
+        if let Some(text) = msg.strip_prefix(b"type\t") {
+            return SocketRequest::Type(String::from_utf8_lossy(text).trim_end_matches('\n').to_string());
         }
         if msg.starts_with(b"watchdog-test") {
             return SocketRequest::WatchdogTest;
@@ -5088,6 +5238,7 @@ fn listen_for_toggle(ui: &Rc<Ui>) {
     }
     let ui = ui.clone();
     service.connect_incoming(move |_, conn, _| {
+        probe::log("socket accept");
         // Read the message without blocking the UI; a client that sends nothing just
         // gets end-of-stream when it closes.
         let (ui, conn) = (ui.clone(), conn.clone());
@@ -5098,6 +5249,9 @@ fn listen_for_toggle(ui: &Rc<Ui>) {
             }
             let msg = conn.input_stream().read_bytes_future(1024, glib::Priority::DEFAULT).await;
             let msg = msg.map(|b| b.to_vec()).unwrap_or_default();
+            // Kind only: a debug search request can carry the user's query.
+            let kind = msg.split(|b| *b == b'\t' || *b == b'\n').next().unwrap_or_default();
+            probe::log(format!("socket msg {:?}", String::from_utf8_lossy(kind)));
             let debug = std::env::var("OMNI_DEBUG").ok().as_deref() == Some("1");
             match socket_request(&msg, debug) {
                 SocketRequest::Search(query) => {
@@ -5125,6 +5279,10 @@ fn listen_for_toggle(ui: &Rc<Ui>) {
                     std::thread::sleep(Duration::from_secs(5));
                     watchdog::set_open(false);
                 }
+                SocketRequest::Type(text) => {
+                    // Debug: drive the first-keystroke path without an input device.
+                    ui.entry.set_text(&text);
+                }
                 SocketRequest::Ping => {
                     let _ = conn.output_stream().write_all_future(b"pong\n".to_vec(), glib::Priority::DEFAULT).await;
                 }
@@ -5147,6 +5305,36 @@ fn listen_for_toggle(ui: &Rc<Ui>) {
 #[cfg(test)]
 mod filter_tests {
     use super::*;
+
+    #[test]
+    fn selection_scroll_surface_pixels_are_converted_to_rows() {
+        let pending = Cell::new(0.0);
+        assert_eq!(selection_scroll_steps(&pending, 52.0, gdk::ScrollUnit::Surface), 1);
+        assert_eq!(selection_scroll_steps(&pending, -104.0, gdk::ScrollUnit::Surface), -2);
+    }
+
+    #[test]
+    fn selection_scroll_accumulates_fractional_motion_in_both_units() {
+        let pending = Cell::new(0.0);
+        assert_eq!(selection_scroll_steps(&pending, 0.5, gdk::ScrollUnit::Wheel), 0);
+        assert_eq!(selection_scroll_steps(&pending, 0.5, gdk::ScrollUnit::Wheel), 1);
+        assert_eq!(selection_scroll_steps(&pending, 26.0, gdk::ScrollUnit::Surface), 0);
+        assert_eq!(selection_scroll_steps(&pending, 26.0, gdk::ScrollUnit::Surface), 1);
+        assert_eq!(selection_scroll_steps(&pending, -26.0, gdk::ScrollUnit::Surface), 0);
+        assert_eq!(selection_scroll_steps(&pending, -26.0, gdk::ScrollUnit::Surface), -1);
+    }
+
+    #[test]
+    fn selection_target_clamps_large_deltas_and_skips_unchanged_rows() {
+        assert_eq!(selection_target(2, 8, i32::MAX), Some(7));
+        assert_eq!(selection_target(2, 8, i32::MIN), Some(0));
+        assert_eq!(selection_target(7, 8, 1000), None);
+        assert_eq!(selection_target(0, 8, -1000), None);
+        assert_eq!(selection_target(2, 8, 0), None);
+        assert_eq!(selection_target(0, 0, 1), None);
+        assert_eq!(selection_target(2, 8, 3), Some(5));
+        assert_eq!(selection_target(2, 8, -1), Some(1));
+    }
 
     #[test]
     fn settings_navigation_starts_on_launcher() {
@@ -5177,9 +5365,6 @@ mod filter_tests {
         assert!(DEFAULT_CSS.contains(".omni-settings-slip"));
         assert!(DEFAULT_CSS.contains(".omni-settings-slip:hover .omni-settings-button"));
         assert!(DEFAULT_CSS.contains("padding: 0 40px 0 18px;"));
-        assert!(DEFAULT_CSS.contains("transform: translate(16px, -14px);"));
-        assert!(DEFAULT_CSS.contains("transform: translate(7px, -5px);"));
-        assert!(DEFAULT_CSS.contains("transition: transform 280ms cubic-bezier(0.22, 1, 0.36, 1)"));
         assert!(DEFAULT_CSS.contains("color: alpha(white, 0.82);"));
         assert!(DEFAULT_CSS.contains("background-color: transparent;\n  background-image: none;\n  border: none;"));
         assert!(DEFAULT_CSS.contains("prefers-reduced-motion: reduce"));
@@ -5249,5 +5434,8 @@ mod filter_tests {
         assert_eq!(socket_request(b"search\tNF", false), SocketRequest::Ignore);
         assert_eq!(socket_request(b"watchdog-test", true), SocketRequest::WatchdogTest);
         assert_eq!(socket_request(b"search\tNF\n", true), SocketRequest::Search("NF".into()));
+        assert_eq!(socket_request(b"type\tNF", true), SocketRequest::Type("NF".into()));
+        assert_eq!(socket_request(b"type\tNF\n", true), SocketRequest::Type("NF".into()));
+        assert_eq!(socket_request(b"type\tNF", false), SocketRequest::Ignore);
     }
 }
