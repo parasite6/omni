@@ -719,8 +719,8 @@ list.omni-results > row.omni-calc.activatable:hover {
   background-color: alpha(white, 0.04);
 }
 
-/* Initial built-in search settings and browser surface. */
-.omni-search-settings {
+/* Settings rows (search engine, run programs) and browser surface. */
+.omni-settings-rows {
   margin: 12px 18px 24px;
 }
 .omni-web-plane {

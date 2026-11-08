@@ -35,6 +35,11 @@ const JUNK: u8 = 8;
 const XDG: u8 = 16;
 /// One of the home folders itself.
 const XDG_ROOT: u8 = 32;
+/// A file directly in a `$PATH` folder: a command (python, git, ...).
+const COMMAND: u8 = 64;
+/// Commands shown per query, in their own group so home files and commands can't crowd
+/// each other out.
+pub const MAX_COMMANDS: usize = 3;
 
 /// UI-thread filesystem calls give up after this. It sits under the 2s watchdog.
 const STAT_TIMEOUT: Duration = Duration::from_millis(200);
@@ -89,6 +94,8 @@ pub struct Index {
     flags: Vec<u8>,
     /// Root entries and their real (correctly capitalized) paths.
     roots: Vec<(u32, PathBuf)>,
+    /// `$PATH` folders in the index and their place in `$PATH` (0 = searched first).
+    command_dirs: HashMap<u32, u16>,
 }
 
 #[derive(Clone)]
@@ -97,6 +104,8 @@ pub struct FileHit {
     pub is_dir: bool,
     /// One of the home folders (~/Documents, ...): shown above the file results.
     pub home_folder: bool,
+    /// A command: an executable directly in a `$PATH` folder.
+    pub command: bool,
     score: i32,
 }
 
@@ -160,7 +169,29 @@ impl Index {
     /// Walk `roots` in parallel and build the index. Takes a few seconds for millions of
     /// files; call it off the UI thread.
     pub fn build(roots: &[PathBuf], ignored: &HashSet<String>) -> Self {
+        Self::build_with_path(roots, ignored, std::env::var_os("PATH").as_deref())
+    }
+
+    /// `build`, with commands taken from `path_var` (a `$PATH` value).
+    fn build_with_path(roots: &[PathBuf], ignored: &HashSet<String>, path_var: Option<&std::ffi::OsStr>) -> Self {
         let home = glib::home_dir();
+        // $PATH folders, each at its first place in $PATH: that's the one the shell searches.
+        // Keyed by the resolved path (/usr/sbin is a link to /usr/bin on Fedora) and by the
+        // path as written, since the walk uses the path as written (a symlinked ancestor of
+        // $HOME). Relative and empty entries are skipped: they'd resolve against omni's cwd.
+        let mut path_rank: HashMap<PathBuf, u16> = HashMap::new();
+        let mut rank_of: HashMap<PathBuf, u16> = HashMap::new();
+        for dir in path_var.map(std::env::split_paths).into_iter().flatten() {
+            if !dir.is_absolute() {
+                continue;
+            }
+            let Ok(resolved) = dir.canonicalize() else { continue };
+            let next = rank_of.len().min(u16::MAX as usize) as u16;
+            let rank = *rank_of.entry(resolved.clone()).or_insert(next);
+            path_rank.entry(resolved).or_insert(rank);
+            path_rank.entry(dir).or_insert(rank);
+        }
+        let mut command_dirs_old: HashMap<u32, u16> = HashMap::new();
 
         // Walk: entries in discovery order with an id per distinct lowercase name.
         let mut names: Vec<Box<str>> = Vec::new();
@@ -261,6 +292,10 @@ impl Index {
                 seen.insert(id);
             }
             let in_home_root = job.path == home;
+            let command_rank = path_rank.get(&job.path).copied();
+            if let Some(rank) = command_rank {
+                command_dirs_old.insert(job.idx, rank);
+            }
             for (name, is_dir, id) in children {
                 if is_dir && ignored.contains(&name) {
                     continue;
@@ -277,6 +312,8 @@ impl Index {
                     if JUNK_DIRS.contains(&name.as_str()) {
                         flags |= JUNK;
                     }
+                } else if command_rank.is_some() {
+                    flags |= COMMAND;
                 }
                 let idx = e_parent.len() as u32;
                 e_parent.push(job.idx);
@@ -330,8 +367,9 @@ impl Index {
             flags[n] = e_flags[old];
         }
         let roots = root_paths.into_iter().map(|(i, p)| (new_idx[i as usize], p)).collect();
+        let command_dirs = command_dirs_old.into_iter().map(|(i, rank)| (new_idx[i as usize], rank)).collect();
 
-        Index { arena, name_off, name_start, parent, flags, roots }
+        Index { arena, name_off, name_start, parent, flags, roots, command_dirs }
     }
 
     /// Distinct name containing arena byte `pos`.
@@ -425,6 +463,7 @@ impl Index {
 
     /// Best files and folders whose names contain every word of `query`.
     /// `scope`: only entries inside these folders (see `entries_at`), at any depth.
+    /// Commands (see `MAX_COMMANDS`) come first in the files list, flagged `command`.
     pub fn search(&self, query: &str, max_files: usize, max_dirs: usize, scope: Option<&[u32]>) -> (Vec<FileHit>, Vec<FileHit>) {
         if scope.is_some_and(|s| s.is_empty()) {
             return (Vec::new(), Vec::new()); // the folder isn't in the index
@@ -437,8 +476,8 @@ impl Index {
         }
         let whole = query.trim().to_ascii_lowercase().into_bytes();
         // Keep extra candidates (some may turn out deleted when checked), separately for
-        // files and folders so one can't crowd out the other.
-        let keeps = [max_files * 3, max_dirs * 3];
+        // files, folders and commands so one can't crowd out another.
+        let keeps = [max_files * 3, max_dirs * 3, MAX_COMMANDS * 3];
 
         // SIMD scan for the longest word over all distinct names, split across cores; the
         // other words are checked only on those hits. One or two letters match name starts
@@ -468,9 +507,9 @@ impl Index {
                         // This thread owns matches *starting* in [lo, hi).
                         let lo = (t * chunk).min(self.arena.len());
                         let hi = ((t + 1) * chunk).min(self.arena.len());
-                        // [files, folders]: candidates and the score to beat once full.
-                        let mut best: [Vec<(i32, u32)>; 2] = [Vec::new(), Vec::new()];
-                        let mut floor = [i32::MIN; 2];
+                        // [files, folders, commands]: candidates and the score to beat once full.
+                        let mut best: [Vec<(i32, u32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+                        let mut floor = [i32::MIN; 3];
                         let mut scored = HashSet::new();
                         for (pattern, at_nul) in patterns {
                             let end = (hi + pattern.len()).min(self.arena.len());
@@ -498,14 +537,26 @@ impl Index {
                                 if as_file.is_none() && as_dir.is_none() {
                                     continue;
                                 }
+                                // Typed exactly ("python"): the command the shell would run is the
+                                // one from the earliest $PATH folder holding that name.
+                                let shell_pick = (name == whole.as_slice())
+                                    .then(|| {
+                                        (self.name_start[u as usize]..self.name_start[u as usize + 1])
+                                            .filter(|&e| self.flags[e as usize] & COMMAND != 0)
+                                            .min_by_key(|&e| self.command_dirs.get(&self.parent[e as usize]).copied().unwrap_or(u16::MAX))
+                                    })
+                                    .flatten();
                                 for e in self.name_start[u as usize]..self.name_start[u as usize + 1] {
                                     if scope.is_some_and(|s| !self.inside(e, s)) {
                                         continue;
                                     }
                                     let flags = self.flags[e as usize];
                                     let Some(base) = (if flags & DIR != 0 { as_dir } else { as_file }) else { continue };
-                                    let score = base + adjust(flags, self.depth(e), name.len());
-                                    let k = (flags & DIR != 0) as usize;
+                                    let mut score = base + adjust(flags, self.depth(e), name.len());
+                                    if shell_pick == Some(e) {
+                                        score += COMMAND_BONUS;
+                                    }
+                                    let k = if flags & DIR != 0 { 1 } else if flags & COMMAND != 0 { 2 } else { 0 };
                                     if best[k].len() >= keeps[k] && score <= floor[k] {
                                         continue;
                                     }
@@ -518,21 +569,29 @@ impl Index {
                                 }
                             }
                         }
-                        let [f, d] = best;
-                        f.into_iter().chain(d).collect::<Vec<_>>()
+                        let [f, d, c] = best;
+                        f.into_iter().chain(d).chain(c).collect::<Vec<_>>()
                     })
                 })
                 .collect();
             handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
         });
-        candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        // Equal scores in a fixed order: commands first, newest version first among them
+        // (python3.15 before python3.9); everything else in natural order. This must stay a
+        // total order, or sort_unstable_by may panic.
+        candidates.sort_unstable_by(|a, b| {
+            let (na, nb) = (self.name(self.name_of_entry(a.1)), self.name(self.name_of_entry(b.1)));
+            let (ca, cb) = (self.flags[a.1 as usize] & COMMAND != 0, self.flags[b.1 as usize] & COMMAND != 0);
+            let by_name = if ca && cb { natural_cmp(nb, na) } else { natural_cmp(na, nb) };
+            b.0.cmp(&a.0).then(cb.cmp(&ca)).then(by_name).then(a.1.cmp(&b.1))
+        });
 
-        let planned: Vec<(i32, bool, bool, Vec<Step>)> = candidates
+        let planned: Vec<(i32, bool, bool, bool, Vec<Step>)> = candidates
             .into_iter()
             .filter_map(|(score, e)| {
                 let steps = self.chain(e)?;
                 let flags = self.flags[e as usize];
-                Some((score, flags & DIR != 0, flags & XDG_ROOT != 0, steps))
+                Some((score, flags & DIR != 0, flags & XDG_ROOT != 0, flags & COMMAND != 0, steps))
             })
             .collect();
         if planned.is_empty() {
@@ -544,16 +603,23 @@ impl Index {
             let mut cache: HashMap<u32, PathBuf> = HashMap::new();
             let mut files = 0usize;
             let mut dirs = 0usize;
+            let mut commands = 0usize;
             let mut seen_paths = HashSet::new();
-            for (score, is_dir, home_folder, steps) in planned {
+            for (score, is_dir, home_folder, mut command, steps) in planned {
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
-                if files >= max_files && dirs >= max_dirs {
+                if files >= max_files && dirs >= max_dirs && commands >= MAX_COMMANDS {
                     break;
                 }
                 if is_dir {
                     if dirs >= max_dirs {
+                        continue;
+                    }
+                } else if command {
+                    // A command that turns out not to run can still take a file slot, so
+                    // skip before the stat only when both groups are full.
+                    if commands >= MAX_COMMANDS && files >= max_files {
                         continue;
                     }
                 } else if files >= max_files {
@@ -570,18 +636,31 @@ impl Index {
                 if !seen_paths.insert(path.clone()) {
                     continue;
                 }
+                // Only what can actually run counts as a command (a README in a bin
+                // folder is a file); checked here, off the UI thread, for the few shown.
+                if command && !is_runnable(&path) {
+                    if files >= max_files {
+                        continue;
+                    }
+                    command = false;
+                } else if command && commands >= MAX_COMMANDS {
+                    continue;
+                }
                 if is_dir {
                     dirs += 1;
+                } else if command {
+                    commands += 1;
                 } else {
                     files += 1;
                 }
-                if tx.send(FileHit { path, is_dir, home_folder, score }).is_err() {
+                if tx.send(FileHit { path, is_dir, home_folder, command, score }).is_err() {
                     return;
                 }
             }
         }) else {
             return (Vec::new(), Vec::new());
         };
+        let mut commands = Vec::new();
         let mut files = Vec::new();
         let mut dirs = Vec::new();
         for hit in batch.items {
@@ -589,11 +668,16 @@ impl Index {
                 if dirs.len() < max_dirs {
                     dirs.push(hit);
                 }
+            } else if hit.command {
+                if commands.len() < MAX_COMMANDS {
+                    commands.push(hit);
+                }
             } else if files.len() < max_files {
                 files.push(hit);
             }
         }
-        (files, dirs)
+        commands.extend(files);
+        (commands, dirs)
     }
 }
 
@@ -674,6 +758,53 @@ fn bounded_query(query: &str) -> &str {
 /// mtime or ctime is at least `not_before` (unix seconds).
 fn fresh_enough(mtime: i64, ctime: i64, not_before: i64) -> bool {
     mtime.max(ctime) >= not_before
+}
+
+/// Added to the command the shell would run for an exact-name query (earliest $PATH folder).
+/// Above any home or ~/Documents bonus, so it leads its group.
+const COMMAND_BONUS: i32 = 1200;
+
+/// A regular file (links followed) the user may execute.
+fn is_runnable(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+    // SAFETY: a valid NUL-terminated path; access only reads it.
+    path.is_file() && unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0
+}
+
+/// Byte order, except that runs of digits compare as numbers ("3.9" < "3.15").
+fn natural_cmp(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            let (si, sj) = (i, j);
+            while i < a.len() && a[i].is_ascii_digit() {
+                i += 1;
+            }
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            // Without leading zeros, a longer run is the larger number.
+            let (x, y) = (trim_zeros(&a[si..i]), trim_zeros(&b[sj..j]));
+            let ord = x.len().cmp(&y.len()).then_with(|| x.cmp(y));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        } else {
+            if a[i] != b[j] {
+                return a[i].cmp(&b[j]);
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j))
+}
+
+fn trim_zeros(digits: &[u8]) -> &[u8] {
+    let start = digits.iter().position(|&d| d != b'0').unwrap_or(digits.len());
+    &digits[start..]
 }
 
 /// Score a lowercase name against the lowercase query words (name-only part), or None if
@@ -807,7 +938,7 @@ impl Extras {
                 let depth = path.components().count() as i32;
                 let score = score_name(name.as_bytes(), *is_dir, &words, &whole)? + adjust(flags, depth, name.len());
                 let home_folder = flags & XDG_ROOT != 0;
-                Some(FileHit { path: path.clone(), is_dir: *is_dir, home_folder, score })
+                Some(FileHit { path: path.clone(), is_dir: *is_dir, home_folder, command: false, score })
             })
             .collect()
     }
@@ -991,7 +1122,12 @@ pub fn search(shared: &Shared, query: &str, max_files: usize, max_dirs: usize, s
     });
     let extra = drop_missing(extra);
     let (ef, ed): (Vec<_>, Vec<_>) = extra.into_iter().partition(|h| !h.is_dir);
-    (merge(files, ef, max_files), merge(dirs, ed, max_dirs))
+    // Commands keep their own group; new files merge with the rest. A new file already
+    // listed as a command is dropped (merge only dedups against the file list).
+    let (mut commands, files): (Vec<_>, Vec<_>) = files.into_iter().partition(|h| h.command);
+    let ef: Vec<_> = ef.into_iter().filter(|h| !commands.iter().any(|c| c.path == h.path)).collect();
+    commands.extend(merge(files, ef, max_files));
+    (commands, merge(dirs, ed, max_dirs))
 }
 
 /// Start the background walker: builds the index now and again every `every`.
@@ -1755,6 +1891,72 @@ mod tests {
         named.items.push((hello, false));
         let q = "hello a a a a a a a missing";
         assert_eq!(named.search(q, None).len(), 1);
+    }
+
+    #[test]
+    fn files_commands_get_their_own_group() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("omni-files-{}-cmd", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        struct Rm(PathBuf);
+        impl Drop for Rm {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _rm = Rm(dir.clone());
+        let (bin, other_bin, docs) = (dir.join("bin"), dir.join("other/bin"), dir.join("docs"));
+        for d in [&bin, &other_bin, &docs] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let exe = |path: PathBuf| {
+            std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // Plenty of shallower same-named files that outrank the commands as files.
+        for name in ["tool.png", "tool.py", "tool.h", "tool.txt", "tool.md", "tool.rs"] {
+            std::fs::write(dir.join(name), b"a").unwrap();
+        }
+        std::fs::write(docs.join("tool"), b"a").unwrap();
+        for name in ["tool", "tool3.9", "tool3.10", "tool3.15"] {
+            exe(bin.join(name));
+        }
+        exe(other_bin.join("tool"));
+        std::fs::write(bin.join("tool-readme"), b"not runnable").unwrap();
+        std::os::unix::fs::symlink(&bin, dir.join("bin-link")).unwrap();
+
+        // other/bin comes first in $PATH, as the shell would search it; bin twice via a link.
+        let path_var = std::env::join_paths([&other_bin, &dir.join("bin-link"), &bin]).unwrap();
+        let index = Index::build_with_path(std::slice::from_ref(&dir), &HashSet::new(), Some(&path_var));
+        let (files, _) = index.search("tool", 5, 3, None);
+        let commands: Vec<_> = files.iter().filter(|h| h.command).map(|h| h.path.clone()).collect();
+        // The shell's own "tool" first, then the newest versions; capped at MAX_COMMANDS.
+        assert_eq!(commands, vec![other_bin.join("tool"), bin.join("tool"), bin.join("tool3.15")]);
+        // Commands come first and don't take the files' slots.
+        assert!(files[..3].iter().all(|h| h.command));
+        assert_eq!(files.iter().filter(|h| !h.command).count(), 5);
+        assert!(!files.iter().any(|h| h.path == bin.join("tool-readme") && h.command));
+        // Once the command group is full, a non-runnable file in a $PATH folder still takes
+        // a file slot instead of being dropped.
+        let (wide, _) = index.search("tool", 20, 3, None);
+        assert!(
+            wide.iter().any(|h| h.path == bin.join("tool-readme") && !h.command),
+            "tool-readme must be listed as a file"
+        );
+
+        // Without $PATH nothing is a command.
+        let plain = Index::build_with_path(std::slice::from_ref(&dir), &HashSet::new(), None);
+        assert!(plain.search("tool", 5, 3, None).0.iter().all(|h| !h.command));
+    }
+
+    #[test]
+    fn natural_order_compares_numbers_by_value() {
+        use std::cmp::Ordering::*;
+        assert_eq!(natural_cmp(b"python3.9", b"python3.15"), Less);
+        assert_eq!(natural_cmp(b"python3.10", b"python3.9"), Greater);
+        assert_eq!(natural_cmp(b"file007", b"file7"), Equal);
+        assert_eq!(natural_cmp(b"a", b"b"), Less);
+        assert_eq!(natural_cmp(b"python3", b"python3.15"), Less);
     }
 
     #[test]

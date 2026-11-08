@@ -238,6 +238,8 @@ struct Ui {
     mode: Cell<UiMode>,
     settings_back: gtk::Button,
     search_provider: Cell<search_provider::SearchProvider>,
+    /// Executable files run (after a confirmation) instead of opening in their default app.
+    run_programs: Cell<bool>,
     search_view: search_view::SearchView,
     entry: gtk::SearchEntry,
     list: gtk::ListBox,
@@ -377,6 +379,16 @@ fn main() -> glib::ExitCode {
             println!("{score:>6}  {}", app.name);
         }
         later.for_each(|l| println!("{}", &l[1..]));
+        // Then names from a fresh index of the same folders the daemon walks (a few s).
+        let (roots, ignored) = files::config();
+        let index = files::Index::build(&roots, &ignored);
+        let (found, dirs) = index.search(&query, MAX_FILES, MAX_DIRS, None);
+        // Same order as the popup and the socket reply: matching home folders, commands and
+        // files, other folders.
+        let (home_dirs, other_dirs): (Vec<_>, Vec<_>) = dirs.iter().partition(|h| h.home_folder);
+        for h in home_dirs.into_iter().chain(&found).chain(other_dirs) {
+            println!("{}  {}", if h.is_dir { "dir " } else if h.command { "cmd " } else { "file" }, h.path.display());
+        }
         return glib::ExitCode::SUCCESS;
     }
 
@@ -877,15 +889,40 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     settings_plane.set_vexpand(true);
     settings_plane.append(&settings_back);
     let provider = load_search_provider();
+    let settings_rows = gtk::Box::new(gtk::Orientation::Vertical, 16);
+    settings_rows.add_css_class("omni-settings-rows");
     let search_settings = gtk::Box::new(gtk::Orientation::Horizontal, 16);
-    search_settings.add_css_class("omni-search-settings");
     let search_label = gtk::Label::builder().label("Search engine").xalign(0.0).hexpand(true).build();
     let names: Vec<_> = search_provider::SearchProvider::ALL.iter().map(|p| p.name()).collect();
     let engine_dropdown = gtk::DropDown::from_strings(&names);
     engine_dropdown.set_selected(search_provider::SearchProvider::ALL.iter().position(|p| *p == provider).unwrap_or(0) as u32);
     search_settings.append(&search_label);
     search_settings.append(&engine_dropdown);
-    settings_plane.append(&search_settings);
+    settings_rows.append(&search_settings);
+    let run_programs = load_run_programs_setting();
+    let run_row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    let run_text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    run_text.set_hexpand(true);
+    let run_title = gtk::Label::builder().label("Run programs").xalign(0.0).build();
+    run_text.append(&run_title);
+    let run_hint = gtk::Label::builder()
+        .label("Executable files run after you confirm. Off: they open in their default app.")
+        .xalign(0.0)
+        .wrap(true)
+        .max_width_chars(1)
+        .build();
+    run_hint.add_css_class("omni-status-hint");
+    run_text.append(&run_hint);
+    let run_switch = gtk::Switch::builder().active(run_programs).valign(gtk::Align::Center).build();
+    // Screen readers announce the switch by its title, with the hint as its description.
+    run_switch.update_relation(&[
+        gtk::accessible::Relation::LabelledBy(&[run_title.upcast_ref()]),
+        gtk::accessible::Relation::DescribedBy(&[run_hint.upcast_ref()]),
+    ]);
+    run_row.append(&run_text);
+    run_row.append(&run_switch);
+    settings_rows.append(&run_row);
+    settings_plane.append(&settings_rows);
     let search_view = search_view::SearchView::new();
 
     let main_stack = gtk::Stack::builder()
@@ -961,6 +998,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         mode: Cell::new(UiMode::default()),
         settings_back: settings_back.clone(),
         search_provider: Cell::new(provider),
+        run_programs: Cell::new(run_programs),
         search_view,
         entry: entry.clone(),
         list: list.clone(),
@@ -1059,6 +1097,22 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
             u.search_provider.set(provider);
             if let Err(error) = save_search_provider(provider) {
                 notify_user("Couldn’t save search engine", &error.to_string());
+            }
+        }
+    });
+    let u = ui.clone();
+    run_switch.connect_active_notify(move |switch| {
+        let on = switch.is_active();
+        // Already in effect: the switch being put back after a failed save (below).
+        if on == u.run_programs.get() {
+            return;
+        }
+        match save_run_programs_setting(on) {
+            Ok(()) => u.run_programs.set(on),
+            Err(error) => {
+                // Keep the switch, this session and the saved file agreeing.
+                switch.set_active(!on);
+                notify_user("Couldn’t save setting", &error.to_string());
             }
         }
     });
@@ -1395,8 +1449,12 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
             match key {
                 gdk::Key::Escape => close_confirm(&u),
                 gdk::Key::Return | gdk::Key::KP_Enter => {
-                    // The focused button; with none, the safe answer (No / Deny).
-                    if let Some(focused) = gtk::prelude::GtkWindowExt::focus(&u.window).and_downcast::<gtk::Button>() {
+                    // The focused button inside the layer (Tab can reach buttons behind it,
+                    // which must not be pressed); with none, the safe answer (No / Deny).
+                    if let Some(focused) = gtk::prelude::GtkWindowExt::focus(&u.window)
+                        .and_downcast::<gtk::Button>()
+                        .filter(|b| gtk::prelude::WidgetExt::is_ancestor(b, &u.confirm))
+                    {
                         focused.emit_clicked();
                     } else {
                         close_confirm(&u);
@@ -1569,17 +1627,22 @@ fn refresh(ui: &Ui) {
         // File and folder names: instant (omni's own index, a few ms).
         let max_files = if show & SHOW_FILES == 0 { 0 } else if roomy { MAX_FILTERED } else { MAX_FILES };
         let max_dirs = if show & SHOW_FOLDERS == 0 { 0 } else if roomy { MAX_FILTERED } else { MAX_DIRS };
-        let (mut file_hits, mut dir_hits) = if max_files + max_dirs == 0 {
+        let (file_hits, mut dir_hits) = if max_files + max_dirs == 0 {
             (Vec::new(), Vec::new()) // Apps only: skip the file scan entirely
         } else {
             files::search(&ui.files, query, max_files.max(1), max_dirs.max(1), None)
         };
+        // Commands (python, git, ...) have their own slots above the files.
+        let (mut commands, mut file_hits): (Vec<_>, Vec<_>) = file_hits.into_iter().partition(|h| h.command);
+        if max_files == 0 {
+            commands.clear();
+        }
         file_hits.truncate(max_files);
         dir_hits.truncate(max_dirs);
         // A matching home folder (~/Documents, ...) goes above the files; other folders
         // keep their place after them.
         let (home_dirs, other_dirs): (Vec<_>, Vec<_>) = dir_hits.into_iter().partition(|h| h.home_folder);
-        for h in home_dirs.into_iter().chain(file_hits).chain(other_dirs) {
+        for h in home_dirs.into_iter().chain(commands).chain(file_hits).chain(other_dirs) {
             hits.push(file_hit(&h.path, h.is_dir, MatchType::Name, None, query));
         }
         // File contents (LocalSearch FTS + ripgrep for git trees): merge with name hits.
@@ -2196,11 +2259,16 @@ fn scoped_hits(ui: &Ui, dir: &std::path::Path, inner: &str) -> Vec<Hit> {
     let show = ui.filter.get();
     let max_files = if show & SHOW_FILES == 0 { 0 } else { MAX_FILTERED };
     let max_dirs = if show & SHOW_FOLDERS == 0 { 0 } else { MAX_DIRS * 2 };
-    let (mut files, mut dirs) = files::search(&ui.files, inner, max_files.max(1), max_dirs.max(1), Some(dir));
+    let (files, mut dirs) = files::search(&ui.files, inner, max_files.max(1), max_dirs.max(1), Some(dir));
+    let (mut commands, mut files): (Vec<_>, Vec<_>) = files.into_iter().partition(|h| h.command);
+    if max_files == 0 {
+        commands.clear();
+    }
     files.truncate(max_files);
     dirs.truncate(max_dirs);
-    files
+    commands
         .into_iter()
+        .chain(files)
         .chain(dirs)
         .map(|h| file_hit(&h.path, h.is_dir, MatchType::Name, None, inner))
         .collect()
@@ -3339,6 +3407,18 @@ fn save_search_provider(provider: search_provider::SearchProvider) -> std::io::R
     std::fs::write(dir.join("search-engine"), format!("{}\n", provider.id()))
 }
 
+/// Running programs is on unless the user turned it off in settings.
+fn load_run_programs_setting() -> bool {
+    let path = glib::user_config_dir().join("omni/run-programs");
+    std::fs::read_to_string(path).map_or(true, |s| s.trim() != "off")
+}
+
+fn save_run_programs_setting(on: bool) -> std::io::Result<()> {
+    let dir = glib::user_config_dir().join("omni");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("run-programs"), if on { "on\n" } else { "off\n" })
+}
+
 fn filter_setting_path() -> PathBuf {
     contents_setting_path().with_file_name("filter")
 }
@@ -4346,6 +4426,12 @@ fn run(ui: &Ui, action: Action) {
         }
         return;
     }
+    if let Action::Open(file) = &action {
+        if let Some(path) = file.path().filter(|path| ui.run_programs.get() && is_program(path)) {
+            confirm_run(ui, path);
+            return;
+        }
+    }
     // Close first: launching can block (D-Bus activated apps wait up to 25 s), and the
     // popup holds the keyboard exclusively while it's up.
     let display = gtk::prelude::WidgetExt::display(&ui.window);
@@ -4966,6 +5052,71 @@ fn confirm_link(ui: &Ui, uri: &str) {
     ui.window.set_focus_visible(false);
 }
 
+/// A file omni would run rather than open: a regular file the user may execute that is a
+/// binary (ELF, AppImages included) or a script with a `#!` line. The exec bit alone isn't
+/// enough: on NTFS / exFAT drives every file has it.
+fn is_program(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
+    // SAFETY: a valid NUL-terminated path; access only reads it.
+    if unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } != 0 {
+        return false;
+    }
+    let mut magic = [0u8; 4];
+    let Ok(n) = std::fs::File::open(path).and_then(|mut f| f.read(&mut magic)) else { return false };
+    magic[..n].starts_with(b"\x7fELF") || magic[..n].starts_with(b"#!")
+}
+
+/// Running a program found by a search is easy to do by accident (a stray Enter on the
+/// wrong row), so ask first. Cancel has the focus, so Enter alone never runs anything.
+fn confirm_run(ui: &Ui, path: PathBuf) {
+    // No line breaks: a file name with one could fake a second line of the question.
+    let name = visible(&path.file_name().unwrap_or_default().to_string_lossy()).replace(['\n', '\t'], " ");
+    show_confirm(
+        ui,
+        &format!("Run {name}?\nIt's a program: it runs with your permissions."),
+        &visible(&path.to_string_lossy()),
+        true,
+    );
+    ui.confirm_yes.set_label("Run");
+    ui.confirm_no.set_label("Cancel");
+    ui.confirm_always.set_visible(false);
+    ui.confirm_action.replace(Some(Box::new(move |ui: &Ui| {
+        hide(ui);
+        run_program(&path);
+    })));
+    ui.confirm_no_action.take();
+    ui.confirm_always_action.take();
+    ui.confirm_no.grab_focus();
+    ui.window.set_focus_visible(false);
+}
+
+/// Start `path` from its own folder (programs often look for files beside themselves).
+/// GIO reaps it when it exits; omni doesn't wait for it.
+fn run_program(path: &std::path::Path) {
+    let launcher = gio::SubprocessLauncher::new(gio::SubprocessFlags::STDIN_INHERIT);
+    if let Some(dir) = path.parent() {
+        launcher.set_cwd(dir);
+    }
+    for (key, value) in util::missing_x11_env() {
+        launcher.setenv(key, value, true);
+    }
+    match launcher.spawn(&[path.as_os_str()]) {
+        Ok(child) => {
+            child.wait_async(gio::Cancellable::NONE, |_| {});
+            recent::record(&gio::File::for_path(path));
+        }
+        Err(e) => {
+            eprintln!("omni: couldn't run {}: {e}", path.display());
+            notify_user("Couldn't run program", &e.to_string());
+        }
+    }
+}
+
 /// Take the layer away without running any answer (its question no longer applies).
 fn dismiss_confirm(ui: &Ui) {
     ui.confirm_action.take();
@@ -5264,7 +5415,7 @@ fn listen_for_toggle(ui: &Rc<Ui>) {
                     // Same order as the popup: matching home folders, files, other folders.
                     let home_dirs = d.iter().filter(|h| h.home_folder);
                     for h in home_dirs.chain(&f).chain(d.iter().filter(|h| !h.home_folder)) {
-                        reply.push_str(&format!("{} {}\n", if h.is_dir { "dir " } else { "file" }, h.path.display()));
+                        reply.push_str(&format!("{} {}\n", if h.is_dir { "dir " } else if h.command { "cmd " } else { "file" }, h.path.display()));
                     }
                     let indexed = ui.files.lock().unwrap().0.as_ref().map_or(0, |i| i.len());
                     let (ev, added) = (LIVE_EVENTS.load(std::sync::atomic::Ordering::Relaxed), LIVE_ADDED.load(std::sync::atomic::Ordering::Relaxed));
@@ -5305,6 +5456,29 @@ fn listen_for_toggle(ui: &Rc<Ui>) {
 #[cfg(test)]
 mod filter_tests {
     use super::*;
+
+    #[test]
+    fn only_executable_binaries_and_scripts_count_as_programs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("omni-program-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, body: &[u8], mode: u32| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        assert!(is_program(&file("binary", b"\x7fELF\x02\x01", 0o755)));
+        assert!(is_program(&file("script.sh", b"#!/bin/sh\necho hi\n", 0o700)));
+        // The exec bit alone (every file on NTFS / exFAT) is not a program.
+        assert!(!is_program(&file("notes.txt", b"just text", 0o755)));
+        assert!(!is_program(&file("report.docx", b"PK\x03\x04", 0o777)));
+        // A program the user may not execute is opened, not run.
+        assert!(!is_program(&file("plain.sh", b"#!/bin/sh\n", 0o644)));
+        assert!(!is_program(&file("empty", b"", 0o755)));
+        assert!(!is_program(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn selection_scroll_surface_pixels_are_converted_to_rows() {
