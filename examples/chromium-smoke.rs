@@ -1,8 +1,13 @@
 //! Structural renderer check; does not open Omni or simulate user input.
 #[path = "../src/browser_frame.rs"]
 mod browser_frame;
-#[path = "../src/chromium.rs"]
+#[path = "../src/probe.rs"]
+#[allow(dead_code)]
+mod probe;
+#[path = "../src/web_client.rs"]
 mod chromium;
+#[path = "../src/web_protocol.rs"]
+mod web_protocol;
 use gtk::{gdk, glib, prelude::*};
 use std::{cell::Cell, rc::Rc, time::Duration};
 

@@ -1,8 +1,13 @@
 //! Loading timings without opening Omni or simulating user input.
 #[path = "../src/browser_frame.rs"]
 mod browser_frame;
-#[path = "../src/chromium.rs"]
+#[path = "../src/probe.rs"]
+#[allow(dead_code)]
+mod probe;
+#[path = "../src/web_client.rs"]
 mod chromium;
+#[path = "../src/web_protocol.rs"]
+mod web_protocol;
 use gtk::glib;
 use std::{
     io::{Read, Write},
@@ -102,6 +107,14 @@ fn main() {
         eprintln!("Final status: {}", status.text());
         surface.stop();
         drop(surface);
+    }
+    // --linger=N keeps the launcher side alive with no page open, to watch the
+    // Chromium host exit on its idle timer.
+    if let Some(seconds) = args.iter().find_map(|arg| arg.strip_prefix("--linger=")) {
+        let main_loop = glib::MainLoop::new(None, false);
+        let done = main_loop.clone();
+        glib::timeout_add_local_once(Duration::from_secs(seconds.parse().unwrap()), move || done.quit());
+        main_loop.run();
     }
     chromium::finish().unwrap();
 }

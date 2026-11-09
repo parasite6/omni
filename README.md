@@ -19,6 +19,7 @@
 | 🧮 **do quick maths** | [Calculator](#calculator) |
 | 🚪 **launch app actions (private windows, Tor…)** | [App actions](#app-actions) |
 | 📁 **find files and folders** | [Files & folders](#files--folders) |
+| ▶️ **run a program or command** | [Programs & commands](#programs--commands) |
 | 🌐 **search the web (even privately)** | [Web search](#web-search) |
 | 🤖 **ask Claude without leaving the popup** | [Ask Claude](#ask-claude) |
 | 🎨 **change how it looks or behaves** | [Customize](#customize) |
@@ -45,9 +46,9 @@ That's it. The same command **updates** omni later.
 
 **Needs:** `gtk4-devel`, `gtk4-layer-shell-devel`, `tinysparql-devel`, `cef`, Rust.
 
-Built-in web search currently uses Brave Search in a GTK view backed by Chromium Embedded Framework (CEF). Select the engine in Settings, then use `Ctrl`＋`Enter` or the web result. Back / `Esc` returns to the launcher. Queries open Brave’s `/ask` AI view. An initial page filter hides the navigation header and history sidebar while retaining answers, sources, and the follow-up prompt. Each submitted search creates an isolated in-memory browser session. Every fresh session starts with usage metrics, anonymous local results, and SafeSearch off. Omni seeds Brave’s `safesearch=off` and `useLocation=0` cookies before navigation, and sets `app.usageMetricsOptOut=true` in Brave’s localStorage before its page scripts run. These preferences remain in memory with the session. Follow-ups share that session until Back, Escape, or popup close destroys it. Cookies, browser history, localStorage, IndexedDB, caches, and service workers are not reused for the next search. CEF installation metadata lives in a private temporary runtime directory that is removed on clean shutdown. This controls local storage; Brave’s own server-side retention is separate. The system CEF library must support API 14600; Fedora’s `cef` package is used by default. Set `OMNI_CEF_DIR` at build time for another CEF installation.
+Built-in web search currently uses Brave Search in a GTK view backed by Chromium Embedded Framework (CEF). Select the engine in Settings, then use `Ctrl`＋`Enter` or the web result. Back / `Esc` returns to the launcher. Queries open Brave’s `/ask` AI view. An initial page filter hides the navigation header and history sidebar while retaining answers, sources, and the follow-up prompt. Each submitted search creates an isolated in-memory browser session. Every fresh session starts with usage metrics, anonymous local results, and SafeSearch off. Omni seeds Brave’s `safesearch=off` and `useLocation=0` cookies before navigation, and sets `app.usageMetricsOptOut=true` in Brave’s localStorage before its page scripts run. These preferences remain in memory with the session. Follow-ups share that session until Back, Escape, or popup close destroys it. Cookies, browser history, localStorage, IndexedDB, caches, and service workers are not reused for the next search. Chromium runs in its own process (`omni-browser --omni-host`), not inside `omni`. It starts on the first search and exits **10 s after the last Brave page closes**, so it takes no memory while you're not searching. The next search starts it again (about 1.2 s from `Enter` to the page). CEF installation metadata lives in a private temporary runtime directory, removed when that process exits. Directories left behind by a killed process are removed the next time it starts. This controls local storage; Brave’s own server-side retention is separate. The system CEF library must support API 14600; Fedora’s `cef` package is used by default. Set `OMNI_CEF_DIR` at build time for another CEF installation.
 
-The search header and launcher result use the bundled [official Brave favicon](https://cdn.search.brave.com/serp/v3/_app/immutable/assets/favicon.CVXAaejQ.svg). Page chrome and native and Brave-drawn scrollbar tracks are hidden at document creation; wheel and trackpad scrolling remain available. Searches show the query, a spinner, and pulsing placeholder lines immediately, then crossfade into the ready page; reduced-motion preferences are respected. Omni warms the Chromium engine shortly after startup without creating a page or search session. Its external message pump honors CEF scheduling requests with a 33 ms fallback. The embedded browser disables QUIC so Brave requests use HTTPS over HTTP/2 where available; conversation creation was intermittently rejected with HTTP 400 over HTTP/3 in controlled CEF and Brave tests. Set `OMNI_SEARCH_DIAGNOSTICS=1` for opt-in endpoint status and streaming metadata without query strings, request bodies, or answer text. Set `OMNI_SEARCH_TIMING=1` to log startup and document-load timings without logging queries; `cargo run --example chromium-load-timing -- --local` runs a local sequential-request benchmark, and `--prewarm` measures an already-initialized engine.
+The search header and launcher result use the bundled [official Brave favicon](https://cdn.search.brave.com/serp/v3/_app/immutable/assets/favicon.CVXAaejQ.svg). Page chrome and native and Brave-drawn scrollbar tracks are hidden at document creation; wheel and trackpad scrolling remain available. Searches show a spinner on a blank pane in the page's colour, then crossfade into Brave's page on its first frame, so the only loading animation is Brave's own; reduced-motion preferences are respected. Pages reach omni as frames over a socket and input goes back the same way. The embedded browser disables QUIC so Brave requests use HTTPS over HTTP/2 where available; conversation creation was intermittently rejected with HTTP 400 over HTTP/3 in controlled CEF and Brave tests. Set `OMNI_SEARCH_DIAGNOSTICS=1` for opt-in endpoint status and streaming metadata without query strings, request bodies, or answer text. Set `OMNI_SEARCH_TIMING=1` to log startup and document-load timings without logging queries; `cargo run --example chromium-load-timing -- --local` runs a local sequential-request benchmark, and `--prewarm` starts the Chromium process before the first search.
 
 > The keybind and autostart are wired up through Hyprland / ML4W: see [How it's hooked into Hyprland / ML4W](#how-its-hooked-into-hyprland--ml4w).
 
@@ -121,6 +122,7 @@ Everything shares **one list**, so you never pick a mode first.
 | 🧩 **Apps** | an app name — word starts first, then substrings, then loose "did you mean" matching |
 | 🚪 **App actions** | an app plus an action: `brave tor`, `brave n`, `incognito` |
 | ⚙️ **Services** | a service name, 3+ letters: `bluetooth` |
+| ▶️ **Commands** | a program in your `$PATH`: `python`, `git`, `node` |
 | 📄 **Files** | part of a file name |
 | 📁 **Folders** | part of a folder name |
 | 📝 **File contents** | words inside files (turn on with `Ctrl`＋`T`) |
@@ -147,15 +149,18 @@ The **5 most recent** apps, files and folders, newest first.
 | 1 | App actions | 3 |
 | 2 | Apps | 6 |
 | 3 | Services | 3 |
-| 4 | Files | 5 |
-| 5 | Folders | 3 |
-| 6 | File contents | 4 |
-| 7 | "Search the web for …" | 1 |
-| 8 | "Ask Claude …" | 1 |
+| 4 | Commands (programs in `$PATH`) | 3 |
+| 5 | Files | 5 |
+| 6 | Folders | 3 |
+| 7 | File contents | 4 |
+| 8 | "Search the web for …" | 1 |
+| 9 | "Ask Claude …" | 1 |
 
 - A **narrowed filter** allows up to **8 per kind**.
 - The web row is first only when nothing above it matches.
 - Apps you launch often rank higher among apps.
+- A matching home folder (`~/Documents`, …) is listed above the commands and files.
+- Commands count as **Files** for the filter.
 
 ### The filter (`Ctrl`＋`F`)
 
@@ -251,7 +256,7 @@ The actions an app's `.desktop` file declares (New window, New private window, �
 
 ### What's searched
 
-- **File and folder names** are indexed *everywhere*.
+- **File and folder names** are indexed everywhere, except *inside* folders that tools manage: package stores (`node_modules`, `.npm`, `.yarn`, …), editor state (`.vscode`, `.cursor`, `.idea`), version control (`.git`, …), toolchains (`.rustup`, `.cargo`, `.gradle`, `.m2`), tool caches, Trash, `flatpak` and `containers`. The folders themselves are still listed. Your dotfiles (`~/.config`, `~/.local`) and project environments (`.venv`) are indexed. The list is `SKIP_INSIDE` in `files.rs`.
 - **Contents** only in your home folder and drives.
 
 ### Contents search (`Ctrl`＋`T`)
@@ -268,11 +273,31 @@ Toggle next to the search bar. **Off by default**, remembered in `~/.local/state
 2. Your home folders (`~/Documents`, `~/Downloads`, … from XDG user-dirs) first (a matching one is listed above the file results).
 3. Then things inside them, then the rest of home, shallow paths first.
 4. Extension matches ("pdf") favour that file type.
-5. Hidden and dependency/build folders (`node_modules`, `site-packages`, `target`, `Build`, `vcpkg`, `flatpak`, `Trash`, …) pushed down.
+5. Hidden and dependency/build folders (`site-packages`, `target`, `Build`, `vcpkg`, `.venv`, …) and what's in them pushed down. (`node_modules`, `.git`, `Trash` and the other `SKIP_INSIDE` folders are listed themselves, but their contents aren't indexed.)
 
 One- and two-letter queries match name starts only. Every shown path is checked, so deleted files never appear. New files are added from LocalSearch's change events as they arrive.
 
 *(How the index is built and why: see [The file-name index](#the-file-name-index).)*
+
+---
+
+## Programs & commands
+
+**Opening an executable file runs it, after you confirm.** That covers a result row, `Enter` or a right-click **Open**.
+
+- **What counts as a program:** a regular file you're allowed to execute that is either a compiled binary (ELF, AppImages included) or a script starting with `#!`. The exec bit alone isn't enough, so a text file marked executable still opens in its app.
+- **The confirmation:** a dimmed prompt asks "Run *name*? It's a program: it runs with your permissions." and shows the full path. **Cancel** is focused, so a stray `Enter` doesn't run anything. **Run** does nothing for the first half second after the prompt appears, so a click or key that was already on its way can't approve it. `Esc` cancels.
+- **How it runs:** from its own folder (programs often look for files beside themselves), without a terminal, as you. It's added to the recent list. If it can't start, a notification says why.
+- **Turning it off:** Settings → **Run programs**. Off: executables open in their default app like any other file. Remembered in `~/.config/omni/run-programs` (on by default).
+
+### Commands
+
+Programs directly inside a `$PATH` folder get their own group: up to **3**, above the files.
+
+- The one your shell would run for that exact name comes first (`python` → `/usr/bin/python`), then other matches. Version numbers compare as numbers, highest first: `python3.15`, `python3.14`, `python3.13`.
+- `$PATH` folders inside skipped folders (`~/.cargo/bin`) are still indexed.
+- Relative `$PATH` entries are ignored.
+- A program installed after the last index walk shows as a plain file until the next walk (every 30 minutes).
 
 ---
 
@@ -356,6 +381,9 @@ The full permission, sandbox and connector story is in the [status log](#status-
 | Glass dimming over white apps | `MAX_LUMA` / `MAX_DIM` in `glass.rs` |
 | Launcher fix-ups (e.g. Brave actions) | `TWEAKS` in `apps.rs` |
 | Folders walked for file names | `name_roots` in `files.rs` |
+| Folders whose contents aren't indexed | `SKIP_INSIDE` in `files.rs` |
+| How long Chromium stays after the last search | `IDLE_EXIT` in `web_client.rs` (10 s) |
+| Running programs on open | Settings → **Run programs** |
 | Claude's agent instructions | `src/agent_prompt.md`, then run `./install.sh` |
 
 ### Things omni remembers
@@ -366,6 +394,8 @@ The full permission, sandbox and connector story is in the [status log](#status-
 | `~/.local/state/omni/filter` | the result **filter** |
 | `~/.local/state/omni/claude` | Claude **model and effort** |
 | `~/.local/state/omni/usage.tsv` | app launch counts and times |
+| `~/.config/omni/run-programs` | **Run programs** on/off |
+| `~/.config/omni/search-engine` | the built-in web search engine |
 
 ### Switch back to rofi
 
@@ -392,6 +422,7 @@ Everything below is for the curious, or for when something breaks.
 |---|---|
 | `~/Documents/github/omni/` | source (this folder) |
 | `~/.local/share/omni/bin/omni` | the background program (GTK window, search, Claude) |
+| `~/.local/share/omni/bin/omni-browser` | Chromium, started for web searches and stopped when idle; also Chromium's own helper processes |
 | `~/.local/share/omni/bin/omni-toggle` | what the keybind runs: tiny, no GTK, opens/closes the popup in ~1 ms |
 | `~/.local/share/omni/bin/omni-start` | starts `omni` through `ensure-running` |
 | `~/.local/share/omni/hypr/omni.lua` | Hyprland layer rule for the popup (no Hyprland blur, fade in/out) |
@@ -416,7 +447,17 @@ Installed files are read-only. **Two programs instead of one on purpose** (speed
 | `src/glass.rs` | the opaque glass-card shell |
 | `src/util.rs` | running helper programs with a time limit |
 | `src/style.css` | the look. Override anything in `~/.config/omni/style.css`. Colours are omni's own cyan/black (`@omni_cyan`, `@omni_black`) |
+| `src/search_view.rs` | the web search panel |
+| `src/search_provider.rs` | built-in search engines (Brave) |
+| `src/search_filters/` | Brave's page style and preference script |
+| `src/web_client.rs` | omni's side of the browser: starts and stops the Chromium process, shows its frames, sends input |
+| `src/web_protocol.rs` | the messages between omni and the Chromium process |
+| `src/chromium.rs` | the Chromium process itself (CEF, private sessions, Brave preferences) |
+| `src/browser_frame.rs` | frame size checks |
+| `src/dock.rs` | pin or unpin apps on the quickshell dock |
+| `src/probe.rs` | opt-in responsiveness diagnostics |
 | `src/bin/omni-toggle.rs` | the keybind helper |
+| `src/bin/omni-browser.rs` | the Chromium process and its helpers |
 | `scripts/omni-start` | starts omni through `ensure-running` |
 
 ### How it's hooked into Hyprland / ML4W
@@ -470,17 +511,17 @@ omni renders on the GPU that drives your screens and loads only its driver.
 
 Names come from omni's **own in-memory index** (like Everything/FSearch), not LocalSearch: LocalSearch returns unranked results in index order at this size, and ranked queries take seconds.
 
-**What it walks:** home, `/usr`, `/etc`, `/opt`, `/var`, `/srv`, `/mnt`, `/run/media/$USER`, plus anything LocalSearch covers (`name_roots` in `files.rs`; cache folders skipped, hidden files included but ranked low).
+**What it walks:** home, `/usr`, `/etc`, `/opt`, `/var`, `/srv`, `/mnt`, `/run/media/$USER`, plus anything LocalSearch covers (`name_roots` in `files.rs`). Cache folders are skipped, and so is everything inside the `SKIP_INSIDE` folders (see [What's searched](#whats-searched)). Hidden files are included but ranked low.
 
 **How fast:**
 
 | | |
 |---|---|
-| Walk | in parallel at `nice 10`: about **4M entries in ~2.5 s** |
+| Walk | in parallel at `nice 10`: about **2.9M entries in ~2.7 s** |
 | Refresh | re-walked every **30 minutes** |
 | Search | a SIMD substring scan over all distinct names, split across cores: **~1.5–4 ms**, on every keystroke |
 
-**Memory:** the index holds ~71 MB for ~4M entries (daemon ~166 MB total).
+**Memory:** the index holds ~42 MB for ~2.9M entries (it was ~70 MB for 4.5M before tool-managed folders were left out).
 
 - Each distinct name is stored once, lowercase only (only 29% of names are distinct).
 - The real capitalization of the few results shown is read back from disk, which doubles as the "still exists" check.
@@ -523,8 +564,9 @@ Every entry from the original README is kept in full.
 
 ### Current state
 
-- The audit fixes are in this tree and covered by `cargo test --release` (41 passed). They are not installed yet: `./install.sh` is what replaces the running launcher.
-- Before these fixes the installed build was healthy, at about 160–260 MB RSS, and memory stayed flat during the LocalSearch flood.
+- `cargo test --release` passes (69 tests, plus 3 in `omni-browser`). `./install.sh` is what replaces the running launcher.
+- Chromium runs in `omni-browser` and exits 10 s after the last web search, so it takes no memory while idle. `omni` itself no longer loads CEF.
+- `examples/chromium-session-check.rs` drove CEF inside its own process; it's behind the `session-check-unported` feature until it's ported.
 
 ### 2026-10-11: keyboard-lock incident (fixed)
 

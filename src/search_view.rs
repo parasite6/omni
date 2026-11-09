@@ -8,7 +8,7 @@ pub struct SearchView {
     status: gtk::Label,
     host: gtk::Stack,
     loading_spinner: gtk::Spinner,
-    view: RefCell<Option<crate::chromium::Surface>>,
+    view: RefCell<Option<crate::web_client::Surface>>,
 }
 
 impl SearchView {
@@ -71,7 +71,7 @@ impl SearchView {
         self.loading_spinner.start();
         self.status.set_text("Loading Brave Search…");
         if self.view.borrow().is_none() {
-            match crate::chromium::Surface::new(provider.style_sheet(), &self.status) {
+            match crate::web_client::Surface::new(provider.style_sheet(), &self.status) {
                 Ok(view) => {
                     self.host.add_named(&view.picture, Some("browser"));
                     let host = self.host.downgrade();

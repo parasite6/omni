@@ -1,24 +1,36 @@
-//! Chromium Embedded Framework rendered directly into a GTK texture.
-//! CEF owns HTML, layout, streaming, and input. GTK owns only the containing panel.
+//! The Chromium host: `omni-browser --omni-host`, a short-lived process that owns the CEF
+//! engine and renders Brave Search off screen for the launcher.
+//!
+//! CEF can only be initialized once per process, so an engine inside the resident launcher
+//! could never give its memory back: the GPU process, network service, zygotes and
+//! renderers stayed for the daemon's lifetime. Here the launcher starts this process on
+//! the first search and closes its socket 10 s after the last page closes; the host then
+//! shuts CEF down and exits, and every Chromium process goes with it.
+//!
+//! The launcher's socket is fd 3. Commands are read on a thread and run on CEF's UI thread
+//! as tasks; frames and page events are written back by a writer thread that only ever
+//! keeps the newest frame, so a busy launcher costs dropped frames, never a backlog.
+use crate::web_protocol as proto;
 use cef::*;
-use gtk::{gdk, glib, prelude::*};
 use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    io::{Read, Write},
+    os::unix::net::UnixStream,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 thread_local! {
-    static ACTIVE: Cell<bool> = const { Cell::new(false) };
-    static PUMP: RefCell<Option<Arc<MessagePump>>> = const { RefCell::new(None) };
+    static PAGES: RefCell<HashMap<u32, Page>> = RefCell::new(HashMap::new());
     static CLOSING: RefCell<Vec<Arc<AtomicBool>>> = const { RefCell::new(Vec::new()) };
-    static SCRATCH: RefCell<Option<std::path::PathBuf>> = const { RefCell::new(None) };
-    static SCANNED_UP_TO: Cell<u32> = const { Cell::new(0) };
 }
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+static OUTBOX: OnceLock<Outbox> = OnceLock::new();
+static INBOX: Mutex<VecDeque<Command>> = Mutex::new(VecDeque::new());
 
 fn trace_timing(event: &str, since: std::time::Instant) {
     let line = format!(
@@ -34,7 +46,6 @@ fn trace_timing(event: &str, since: std::time::Instant) {
 /// The installed build's opt-in log: the same `omni-debug` marker and file as the
 /// launcher's probe, so timings survive `install.sh` restarting the daemon.
 fn debug_log(line: &str) {
-    use std::io::Write;
     let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) else {
         return;
     };
@@ -55,346 +66,250 @@ fn debug_log(line: &str) {
     }
 }
 
-fn pump_work() {
-    let started=std::time::Instant::now();
-    do_message_loop_work();
-    let elapsed=started.elapsed();
-    if elapsed>=Duration::from_millis(50) {
-        let line=format!("omni[open]: CEF main-thread work blocked for {:.1}ms",elapsed.as_secs_f64()*1000.0);
-        if std::env::var_os("OMNI_LOG_OPEN").is_some() {eprintln!("{line}");}
-        debug_log(&line);
+// ---------------------------------------------------------------------------------------
+// Outgoing messages
+
+#[derive(Default)]
+struct OutState {
+    messages: VecDeque<Vec<u8>>,
+    /// Only the newest frame is worth sending; an older unsent one is replaced.
+    frame: Option<Vec<u8>>,
+    closed: bool,
+}
+#[derive(Default)]
+struct Outbox {
+    state: Mutex<OutState>,
+    ready: Condvar,
+}
+
+fn send(message: Vec<u8>) {
+    if let Some(out) = OUTBOX.get() {
+        out.state.lock().unwrap().messages.push_back(message);
+        out.ready.notify_one();
+    }
+}
+fn send_frame(message: Vec<u8>) {
+    if let Some(out) = OUTBOX.get() {
+        out.state.lock().unwrap().frame = Some(message);
+        out.ready.notify_one();
     }
 }
 
-/// CEF asks for immediate work very often, including while nothing is loading. Running
-/// `DoMessageLoopWork` on a 0 ms timer then saturates the GTK thread for as long as the
-/// process lives. Coalesce requests to the page's 60 fps frame interval, bounded by
-/// CEF's 33 ms fallback ceiling: Brave's own streaming animation plays at full frame
-/// rate, and the pump only runs while a page exists, never while the launcher is idle.
-const MIN_PUMP_MS: i64 = 16;
-/// Pages or their close callbacks exist. With none, the pump is paused entirely: an idle
-/// engine must not keep the GTK thread busy.
-static SURFACES: AtomicUsize = AtomicUsize::new(0);
-
-#[derive(Default)]
-struct PumpState {
-    pending: Option<glib::Source>,
-    generation: u64,
-    stopped: bool,
-}
-#[derive(Default)]
-struct MessagePump {
-    state: Mutex<PumpState>,
-    enabled: AtomicBool,
-}
-
-impl MessagePump {
-    // CEF may schedule from any thread. GLib dispatches the source on GTK's
-    // main context, never inline or recursively inside DoMessageLoopWork.
-    fn schedule(self: &Arc<Self>, delay_ms: i64) {
-        self.schedule_inner(delay_ms, true);
-    }
-    fn schedule_inner(self: &Arc<Self>, delay_ms: i64, replace: bool) {
-        if !self.enabled.load(Ordering::Acquire) {
-            return;
-        }
-        let mut state = self.state.lock().unwrap();
-        if state.stopped {
-            return;
-        }
-        if !replace && state.pending.is_some() {
-            return;
-        }
-        if let Some(old) = state.pending.take() {
-            old.destroy();
-        }
-        state.generation = state.generation.wrapping_add(1);
-        let generation = state.generation;
-        let pump = self.clone();
-        let source = glib::timeout_source_new(
-            Duration::from_millis(delay_ms.clamp(MIN_PUMP_MS, 33) as u64),
-            Some("omni-cef-work"),
-            glib::Priority::DEFAULT,
-            move || {
-                let run = {
-                    let mut state = pump.state.lock().unwrap();
-                    if state.stopped || state.generation != generation {
-                        false
-                    } else {
-                        state.pending.take();
-                        true
-                    }
-                };
-                if run {
-                    pump_work();
-                    // CEF's callbacks request earlier work; they don't cover all
-                    // tasks. Keep its documented maximum 33 ms fallback interval.
-                    pump.schedule_inner(33, false);
+fn writer(mut stream: UnixStream) {
+    let out = OUTBOX.get().unwrap();
+    loop {
+        let next = {
+            let mut s = out.state.lock().unwrap();
+            loop {
+                if let Some(m) = s.messages.pop_front() {
+                    break Some(m);
                 }
-                glib::ControlFlow::Break
-            },
-        );
-        source.attach(Some(&glib::MainContext::default()));
-        state.pending = Some(source);
-    }
-    fn resume(self: &Arc<Self>) {
-        self.enabled.store(true, Ordering::Release);
-        self.schedule(0);
-    }
-    fn pause(&self) {
-        self.enabled.store(false, Ordering::Release);
-        let mut state = self.state.lock().unwrap();
-        state.generation = state.generation.wrapping_add(1);
-        if let Some(source) = state.pending.take() {
-            source.destroy();
-        }
-    }
-    fn stop(&self) {
-        let mut state = self.state.lock().unwrap();
-        state.stopped = true;
-        if let Some(source) = state.pending.take() {
-            source.destroy();
-        }
-    }
-}
-
-wrap_browser_process_handler! {
-    struct BrowserWork { pump:Arc<MessagePump> }
-    impl BrowserProcessHandler {
-        fn on_schedule_message_pump_work(&self, delay_ms:i64) {self.pump.schedule(delay_ms);}
-    }
-}
-wrap_app! {
-    struct BrowserApp { pump:Arc<MessagePump> }
-    impl App {
-        fn on_before_command_line_processing(&self, _process_type:Option<&CefString>, command_line:Option<&mut CommandLine>) {
-            // Brave's conversation endpoint returned 400 over HTTP/3 in both
-            // CEF and Brave controls, while the same requests succeeded over h2.
-            // Limit the workaround to Omni's embedded browser network stack.
-            if let Some(command_line)=command_line {
-                command_line.append_switch(Some(&CefString::from("disable-quic")));
+                if let Some(f) = s.frame.take() {
+                    break Some(f);
+                }
+                if s.closed {
+                    break None;
+                }
+                s = out.ready.wait(s).unwrap();
             }
+        };
+        let Some(message) = next else { return };
+        if stream.write_all(&message).is_err() {
+            // The launcher is gone; the reader sees the same and shuts down.
+            return;
         }
-        fn browser_process_handler(&self)->Option<BrowserProcessHandler> {Some(BrowserWork::new(self.pump.clone()))}
     }
 }
 
-/// Attach and detach an idle source to bracket an interval on the main context.
-/// Source ids increase monotonically, so ids between two brackets belong to work done
-/// inside the interval.
-fn context_bracket() -> u32 {
-    // SAFETY: GLib owns both references; destroy detaches and unref releases ours.
-    unsafe {
-        let source = glib::ffi::g_idle_source_new();
-        let id = glib::ffi::g_source_attach(source, glib::MainContext::default().as_ptr());
-        glib::ffi::g_source_destroy(source);
-        glib::ffi::g_source_unref(source);
-        id
-    }
+// ---------------------------------------------------------------------------------------
+// Incoming commands, run on CEF's UI thread
+
+enum Command {
+    Open { id: u32, css: String },
+    Close(u32),
+    Load { id: u32, url: String },
+    Stop(u32),
+    Resize { id: u32, w: i32, h: i32 },
+    Visible { id: u32, shown: bool },
+    Focus { id: u32, focused: bool },
+    MouseMove { id: u32, event: MouseEvent, leave: bool },
+    MouseClick { id: u32, event: MouseEvent, button: i32, up: bool, count: i32 },
+    Wheel { id: u32, event: MouseEvent, dx: i32, dy: i32 },
+    Key { id: u32, event: KeyEvent },
+    TryNavigate(u32),
+    PreferencesTimeout(u32),
+    Shutdown,
 }
 
-fn libcef_mappings() -> Vec<(usize, usize)> {
-    let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
-        return Vec::new();
-    };
-    let mut ranges = Vec::new();
-    for line in maps.lines() {
-        let mut fields = line.split_whitespace();
-        let Some(range) = fields.next() else {
-            continue;
-        };
-        // Match on the path, which may have a " (deleted)" suffix after an upgrade.
-        let Some(path) = fields.last() else {
-            continue;
-        };
-        if !path.contains("libcef.so") {
-            continue;
-        }
-        let Some((start, end)) = range.split_once('-') else {
-            continue;
-        };
-        if let (Ok(start), Ok(end)) = (
-            usize::from_str_radix(start, 16),
-            usize::from_str_radix(end, 16),
-        ) {
-            ranges.push((start, end));
-        }
-    }
-    ranges
-}
-
-/// libcef attaches two GLib sources to the process-wide main context. One of them asks
-/// the loop for immediate work even when Chromium has none, which keeps GTK's thread in
-/// a zero-timeout iteration (a full core) for as long as the process lives. Omni drives
-/// Chromium itself with `DoMessageLoopWork`, so those sources are redundant: detach the
-/// ones libcef created.
-fn detach_cef_glib_sources() {
-    let mappings = libcef_mappings();
-    if mappings.is_empty() {
-        return;
-    }
-    let max_id = context_bracket();
-    let first_id = SCANNED_UP_TO.get();
-    SCANNED_UP_TO.set(max_id);
-    if max_id <= first_id {
-        return;
-    }
-    let context = glib::MainContext::default();
-    for id in first_id.saturating_add(1)..=max_id {
-        // SAFETY: the returned source is borrowed from the context; destroying it only
-        // detaches it and leaves libcef's own reference untouched.
-        unsafe {
-            let source = glib::ffi::g_main_context_find_source_by_id(context.as_ptr(), id);
-            if source.is_null() {
-                continue;
-            }
-            let funcs = (*source).source_funcs as usize;
-            if mappings.iter().any(|&(start, end)| funcs >= start && funcs < end) {
-                glib::ffi::g_source_destroy(source);
+wrap_task! {
+    struct Drain;
+    impl Task {
+        fn execute(&self) {
+            loop {
+                let Some(command) = INBOX.lock().unwrap().pop_front() else { break };
+                handle(command);
             }
         }
     }
 }
 
-fn start() -> Result<(), String> {
-    if ACTIVE.get() {
-        return Ok(());
-    }
-    if api_hash(14600, 0).is_null() {
-        return Err("Installed CEF does not support API 14600".into());
-    }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let helper = std::env::var_os("OMNI_BROWSER_SUBPROCESS")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| exe.with_file_name("omni-browser"))
-        .canonicalize()
-        .map_err(|e| format!("Chromium helper is missing: {e}"))?;
-    let dir = env!("OMNI_CEF_DIR");
-    // CEF needs a root for installation metadata even with off-the-record contexts.
-    // Keep it private and temporary; no search profile is created beneath it.
-    let root = glib::mkdtemp_full(glib::user_runtime_dir().join("omni-chromium-XXXXXX"), 0o700)
-        .ok_or("Couldn’t create temporary Chromium runtime directory")?;
-    let settings = Settings {
-        windowless_rendering_enabled: 1,
-        external_message_pump: 1,
-        resources_dir_path: CefString::from(dir),
-        locales_dir_path: CefString::from(format!("{dir}/locales").as_str()),
-        root_cache_path: CefString::from(root.to_string_lossy().as_ref()),
-        // An empty cache_path selects CEF's in-memory/incognito storage mode.
-        cache_path: CefString::default(),
-        browser_subprocess_path: CefString::from(helper.to_string_lossy().as_ref()),
-        accept_language_list: CefString::from("en-US,en"),
-        background_color: 0xff1b1b1f,
-        // GLib handles daemon termination so browsers close before process exit.
-        disable_signal_handlers: 1,
-        ..Default::default()
-    };
-    let args = cef::args::Args::new();
-    let pump = Arc::new(MessagePump::default());
-    let mut app = BrowserApp::new(pump.clone());
-    let initialized = initialize(
-        Some(args.as_main_args()),
-        Some(&settings),
-        Some(&mut app),
-        std::ptr::null_mut(),
-    ) == 1;
-    if !initialized {
-        pump.stop();
-        let _ = std::fs::remove_dir_all(&root);
-        return Err("Chromium initialization failed".into());
-    }
-    detach_cef_glib_sources();
-    SCRATCH.set(Some(root));
-    ACTIVE.set(true);
-    PUMP.set(Some(pump));
-    Ok(())
+fn post(command: Command) {
+    INBOX.lock().unwrap().push_back(command);
+    post_task(ThreadId::UI, Some(&mut Drain::new()));
 }
 
-/// Start servicing CEF while at least one page exists.
-fn resume_pump() {
-    PUMP.with_borrow(|pump| {
-        if let Some(pump) = pump {
-            pump.resume();
+fn post_delayed(command: Command, delay: Duration) {
+    // Runs after the delay; the queue may hold earlier commands by then, which is fine:
+    // they are all due.
+    wrap_task! {
+        struct Delayed { command: Arc<Mutex<Option<Command>>> }
+        impl Task {
+            fn execute(&self) {
+                if let Some(command) = self.command.lock().unwrap().take() {
+                    post(command);
+                }
+            }
         }
-    });
+    }
+    let mut task = Delayed::new(Arc::new(Mutex::new(Some(command))));
+    post_delayed_task(ThreadId::UI, Some(&mut task), delay.as_millis() as i64);
 }
 
-/// The last page is closing. Keep servicing CEF briefly so `on_before_close` runs, then
-/// stop touching the GTK thread until the next search opens a page.
-fn pause_after_close() {
-    if SURFACES.load(Ordering::Acquire) != 0 {
-        return;
-    }
-    let pump = PUMP.with_borrow(|pump| pump.clone());
-    let Some(pump) = pump else { return };
-    glib::timeout_add_local_once(Duration::from_secs(1), move || {
-        if SURFACES.load(Ordering::Acquire) == 0 {
-            pump.pause();
+fn mouse(m: &mut proto::Message) -> Option<MouseEvent> {
+    Some(MouseEvent {
+        x: m.int()?,
+        y: m.int()?,
+        modifiers: m.int()? as u32,
+    })
+}
+
+fn decode(mut m: proto::Message) -> Option<Command> {
+    let id = m.id;
+    Some(match m.tag {
+        proto::OPEN => Command::Open { id, css: m.str()? },
+        proto::CLOSE => Command::Close(id),
+        proto::LOAD => Command::Load { id, url: m.str()? },
+        proto::STOP => Command::Stop(id),
+        proto::RESIZE => Command::Resize { id, w: m.int()?, h: m.int()? },
+        proto::VISIBLE => Command::Visible { id, shown: m.flag()? },
+        proto::FOCUS => Command::Focus { id, focused: m.flag()? },
+        proto::MOUSE_MOVE => Command::MouseMove { id, event: mouse(&mut m)?, leave: m.flag()? },
+        proto::MOUSE_CLICK => Command::MouseClick {
+            id,
+            event: mouse(&mut m)?,
+            button: m.int()?,
+            up: m.flag()?,
+            count: m.int()?,
+        },
+        proto::WHEEL => Command::Wheel { id, event: mouse(&mut m)?, dx: m.int()?, dy: m.int()? },
+        proto::KEY => {
+            let kind = match m.int()? {
+                proto::KEY_RAWDOWN => KeyEventType::RAWKEYDOWN,
+                proto::KEY_UP => KeyEventType::KEYUP,
+                proto::KEY_CHAR => KeyEventType::CHAR,
+                _ => return None,
+            };
+            let windows_key_code = m.int()?;
+            let native_key_code = m.int()?;
+            let modifiers = m.int()? as u32;
+            let character = m.int()? as u16;
+            Command::Key {
+                id,
+                event: KeyEvent {
+                    type_: kind,
+                    windows_key_code,
+                    native_key_code,
+                    modifiers,
+                    character,
+                    unmodified_character: character,
+                    ..Default::default()
+                },
+            }
         }
-    });
+        _ => return None,
+    })
 }
 
-/// Initialize the engine without creating a page, profile, or search session.
-/// Kept for the loading-time diagnostic; the application starts it on first search.
-#[allow(dead_code)]
-pub fn warm_up() -> Result<(), String> {
-    start()
-}
-
-pub fn finish() -> Result<(), String> {
-    if !ACTIVE.replace(false) {
-        return Ok(());
-    }
-    if let Some(pump) = PUMP.take() {
-        pump.stop();
-    }
-    // CloseBrowser is asynchronous. CEF must outlive every OnBeforeClose callback.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !CLOSING.with_borrow(|browsers| browsers.iter().all(|b| b.load(Ordering::Acquire))) {
-        if std::time::Instant::now() >= deadline {
-            // Calling CefShutdown with a live browser can crash. On this failure path,
-            // leave teardown to process exit and report it instead of claiming success.
-            return Err("Chromium did not finish closing; CefShutdown skipped".into());
+fn reader(mut stream: UnixStream) {
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let n = match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        let mut messages = Vec::new();
+        let Ok(used) = proto::parse(&buf, &mut messages) else { break };
+        let commands: Vec<Command> = messages.into_iter().filter_map(decode).collect();
+        buf.drain(..used);
+        if !commands.is_empty() {
+            INBOX.lock().unwrap().extend(commands);
+            post_task(ThreadId::UI, Some(&mut Drain::new()));
         }
-        pump_work();
-        std::thread::sleep(Duration::from_millis(10));
     }
-    CLOSING.with_borrow_mut(Vec::clear);
-    shutdown();
-    if let Some(root) = SCRATCH.take() {
-        std::fs::remove_dir_all(root)
-            .map_err(|e| format!("Temporary Chromium metadata cleanup failed: {e}"))?;
-    }
-    Ok(())
+    // The launcher closed the socket (idle, or it exited): close every page, shut CEF
+    // down and exit. If a page never finishes closing, don't linger as an orphan.
+    post(Command::Shutdown);
+    std::thread::sleep(Duration::from_secs(10));
+    debug_log("omni-browser: CEF did not shut down in time; exiting");
+    // SAFETY: plain process exit without running CEF's (unfinished) teardown.
+    unsafe { libc::_exit(0) };
 }
+
+// ---------------------------------------------------------------------------------------
+// Pages
 
 #[derive(Default)]
 struct State {
+    id: u32,
     size: (i32, i32),
-    frame: Option<(i32, i32, Vec<u8>)>,
-    loading: bool,
-    error: Option<String>,
     preferences_pending: usize,
     preferences_error: Option<String>,
     queued_url: Option<String>,
     navigation_started: Option<std::time::Instant>,
+    created: Option<std::time::Instant>,
     /// The search page itself has started loading; its frames are no longer about:blank.
     committed: bool,
     document_ready: bool,
-    /// Text the page copied, for the GTK clipboard (Chromium's own never reaches it).
-    copied: Option<String>,
     /// Last click or key the user sent the page. Copies count only right after one.
     last_input: Option<std::time::Instant>,
 }
 type Shared = Arc<Mutex<State>>;
 
+struct Page {
+    browser: Browser,
+    state: Shared,
+}
+
+fn mark_ready(state: &mut State) {
+    if !state.document_ready {
+        state.document_ready = true;
+        if let Some(t) = state.created {
+            trace_timing("page ready", t);
+        }
+        send(proto::Writer::new(proto::READY, state.id).finish());
+    }
+}
+
+fn send_error(id: u32, error: Option<&str>) {
+    send(proto::Writer::new(proto::ERROR, id).str(error.unwrap_or("")).finish());
+}
+
 wrap_set_cookie_callback! {
     struct PreferenceCookie { state: Shared }
     impl SetCookieCallback {
         fn on_complete(&self, success:i32) {
-            let mut state=self.state.lock().unwrap();
-            state.preferences_pending=state.preferences_pending.saturating_sub(1);
-            if success==0 {state.preferences_error=Some("Couldn’t set Brave Search preferences".into());}
+            let id={
+                let mut state=self.state.lock().unwrap();
+                state.preferences_pending=state.preferences_pending.saturating_sub(1);
+                if success==0 && state.preferences_error.is_none() {
+                    state.preferences_error=Some("Couldn’t set Brave Search preferences".into());
+                    send_error(state.id,state.preferences_error.as_deref());
+                }
+                state.id
+            };
+            post(Command::TryNavigate(id));
         }
     }
 }
@@ -402,17 +317,24 @@ wrap_completion_callback! {
     struct PreferenceStorage { context:RequestContext, state:Shared }
     impl CompletionCallback {
         fn on_complete(&self) {
+            let fail=|message:&str|{
+                let mut state=self.state.lock().unwrap();
+                if state.preferences_error.is_none() {
+                    state.preferences_error=Some(message.into());
+                    send_error(state.id,Some(message));
+                }
+            };
             let Some(manager)=self.context.cookie_manager(None) else {
-                self.state.lock().unwrap().preferences_error=Some("Couldn’t initialize Brave Search preferences".into());
+                fail("Couldn’t initialize Brave Search preferences");
                 return;
             };
             for (name,value) in [("safesearch","off"),("useLocation","0")] {
-                // Host-only, session-only cookies in this Surface's private context.
+                // Host-only, session-only cookies in this page's private context.
                 let cookie=Cookie {name:CefString::from(name),value:CefString::from(value),
                     path:CefString::from("/"),secure:1,..Default::default()};
                 let mut callback=PreferenceCookie::new(self.state.clone());
                 if manager.set_cookie(Some(&CefString::from("https://search.brave.com/")),Some(&cookie),Some(&mut callback))==0 {
-                    self.state.lock().unwrap().preferences_error=Some("Couldn’t set Brave Search preferences".into());
+                    fail("Couldn’t set Brave Search preferences");
                 }
             }
         }
@@ -429,12 +351,12 @@ wrap_render_handler! {
             if kind!=PaintElementType::VIEW || buffer.is_null() { return; }
             let Some(len)=crate::browser_frame::byte_len(width,height) else { return; };
             // SAFETY: CEF guarantees width*height BGRA pixels valid for this callback.
-            let pixels=unsafe { std::slice::from_raw_parts(buffer,len) }.to_vec();
+            let pixels=unsafe { std::slice::from_raw_parts(buffer,len) };
             let mut s=self.state.lock().unwrap();
-            s.frame=Some((width,height,pixels));
+            send_frame(proto::Writer::with_capacity(proto::FRAME,s.id,len+8).int(width).int(height).bytes(pixels).finish());
             // Hand over on the page's first frame so Brave's own loading animation is
             // what the user sees, whole, instead of a stand-in until the DOM is parsed.
-            if s.committed {s.document_ready=true;}
+            if s.committed {mark_ready(&mut s);}
         }
     }
 }
@@ -443,16 +365,22 @@ wrap_load_handler! {
     impl LoadHandler {
         fn on_load_start(&self, _browser:Option<&mut Browser>, frame:Option<&mut Frame>, _transition:TransitionType) {
             let Some(frame)=frame.filter(|f|f.is_main()!=0) else {return;};
-            let mut s=self.state.lock().unwrap();s.loading=true;s.error=None;
+            let s=&mut *self.state.lock().unwrap();
+            send(proto::Writer::new(proto::LOADING,s.id).flag(true).finish());
+            if s.preferences_error.is_none() {send_error(s.id,None);}
             if CefString::from(&frame.url()).to_string()!="about:blank" {s.committed=true;}
             if let Some(t)=s.navigation_started {trace_timing("navigation committed",t);}
         }
         fn on_load_end(&self, _browser:Option<&mut Browser>, frame:Option<&mut Frame>, _status:i32) {
             let Some(frame)=frame.filter(|f|f.is_main()!=0) else {return;};
-            if CefString::from(&frame.url()).to_string()=="about:blank" {return;}
-            {let mut state=self.state.lock().unwrap();state.loading=false;
-                if !CefString::from(&frame.url()).to_string().starts_with("https://search.brave.com/ask") {state.document_ready=true;}}
-            if let Some(t)=self.state.lock().unwrap().navigation_started {trace_timing("document loaded",t);}
+            let url=CefString::from(&frame.url()).to_string();
+            if url=="about:blank" {return;}
+            {
+                let s=&mut *self.state.lock().unwrap();
+                send(proto::Writer::new(proto::LOADING,s.id).flag(false).finish());
+                if !url.starts_with("https://search.brave.com/ask") {mark_ready(s);}
+                if let Some(t)=s.navigation_started {trace_timing("document loaded",t);}
+            }
             let css=serde_json::to_string(&self.css).unwrap();
             // Normally already installed at document start; rewriting identical text would
             // restyle the whole page once more (a visible flicker of the prompt box).
@@ -461,7 +389,10 @@ wrap_load_handler! {
         }
         fn on_load_error(&self, _browser:Option<&mut Browser>, frame:Option<&mut Frame>, code:Errorcode, text:Option<&CefString>, _url:Option<&CefString>) {
             if code==Errorcode::ABORTED || !frame.is_some_and(|f|f.is_main()!=0) {return;}
-            let mut s=self.state.lock().unwrap();s.loading=false;s.error=Some(text.map(ToString::to_string).unwrap_or_else(||"Page load failed".into()));
+            let id=self.state.lock().unwrap().id;
+            send(proto::Writer::new(proto::LOADING,id).flag(false).finish());
+            let text=text.map(ToString::to_string).unwrap_or_else(||"Page load failed".into());
+            send_error(id,Some(&text));
         }
     }
 }
@@ -471,7 +402,7 @@ wrap_display_handler! {
         fn on_console_message(&self, _browser:Option<&mut Browser>, _level:LogSeverity, message:Option<&CefString>, source:Option<&CefString>, _line:i32)->i32 {
             let Some(message)=message.map(ToString::to_string) else {return 0;};
             if message=="omni-search-page-ready" {
-                self.state.lock().unwrap().document_ready=true;
+                mark_ready(&mut self.state.lock().unwrap());
                 return 1;
             }
             if let Some(json)=message.strip_prefix("omni-copy:") {
@@ -480,9 +411,11 @@ wrap_display_handler! {
                 // key, so nothing on the page can fill the clipboard by itself.
                 let source=source.map(ToString::to_string).unwrap_or_default();
                 let trusted=source.is_empty() || source.starts_with("https://search.brave.com/");
-                let mut s=self.state.lock().unwrap();
+                let s=self.state.lock().unwrap();
                 let recent=s.last_input.is_some_and(|t|t.elapsed()<Duration::from_millis(1500));
-                if let (true,true,Ok(text))=(trusted,recent,serde_json::from_str::<String>(json)) {s.copied=Some(text);}
+                if let (true,true,Ok(text))=(trusted,recent,serde_json::from_str::<String>(json)) {
+                    send(proto::Writer::new(proto::COPIED,s.id).str(&text).finish());
+                }
                 return 1;
             }
             if std::env::var_os("OMNI_SEARCH_DIAGNOSTICS").is_some() {
@@ -502,16 +435,23 @@ wrap_client! {
     }
 }
 
+fn all_closed() -> bool {
+    CLOSING.with_borrow(|browsers| browsers.iter().all(|b| b.load(Ordering::Acquire)))
+}
+
 wrap_life_span_handler! {
     struct Life { closed:Arc<AtomicBool> }
     impl LifeSpanHandler {
-        fn on_before_close(&self, _browser:Option<&mut Browser>){self.closed.store(true,Ordering::Release);}
+        fn on_before_close(&self, _browser:Option<&mut Browser>){
+            self.closed.store(true,Ordering::Release);
+            if SHUTTING_DOWN.load(Ordering::Acquire) && all_closed() {quit_message_loop();}
+        }
         fn on_before_popup(&self, browser:Option<&mut Browser>, _frame:Option<&mut Frame>, _popup_id:i32,
             url:Option<&CefString>, _name:Option<&CefString>, _disposition:WindowOpenDisposition,
             _gesture:i32, _features:Option<&PopupFeatures>, _window:Option<&mut WindowInfo>,
             _client:Option<&mut Option<Client>>, _settings:Option<&mut BrowserSettings>,
             _extra:Option<&mut Option<DictionaryValue>>, _no_js:Option<&mut i32>)->i32 {
-            // Keep source links in this surface instead of creating unmanaged CEF windows.
+            // Keep source links in this page instead of creating unmanaged CEF windows.
             if let (Some(browser),Some(url))=(browser,url) {
                 let text=url.to_string();
                 if text.starts_with("https://") || text.starts_with("http://") {
@@ -523,396 +463,376 @@ wrap_life_span_handler! {
     }
 }
 
-pub struct Surface {
-    pub picture: gtk::Picture,
-    browser: Browser,
-    tick: Option<glib::SourceId>,
-    state: Shared,
-    ready_callback: ReadyCallback,
-}
-type ReadyCallback = Rc<RefCell<Option<Box<dyn FnOnce()>>>>;
-
-impl Surface {
-    pub fn new(css: &str, status: &gtk::Label) -> Result<Self, String> {
-        let creation_started = std::time::Instant::now();
-        start()?;
-        trace_timing("CEF initialized", creation_started);
-        let picture = gtk::Picture::builder()
-            .hexpand(true)
-            .vexpand(true)
-            .can_shrink(true)
-            .focusable(true)
-            .build();
-        picture.set_content_fit(gtk::ContentFit::Fill);
-        let state = Arc::new(Mutex::new(State {
-            size: (704, 400),
-            preferences_pending: 2,
+fn open(id: u32, css: String) -> Result<(), String> {
+    let created = std::time::Instant::now();
+    let state = Arc::new(Mutex::new(State {
+        id,
+        size: (704, 400),
+        preferences_pending: 2,
+        created: Some(created),
+        ..Default::default()
+    }));
+    let closed = Arc::new(AtomicBool::new(false));
+    let mut client = ClientImpl::new(
+        Render::new(state.clone()),
+        Load::new(state.clone(), css),
+        Life::new(closed.clone()),
+        PageDisplay::new(state.clone()),
+    );
+    let info = WindowInfo::default().set_as_windowless(0);
+    // Each page gets a distinct off-the-record context. Cookies, localStorage,
+    // IndexedDB, service workers and history cannot carry into the next search.
+    let mut context =
+        request_context_create_context(Some(&RequestContextSettings::default()), None)
+            .ok_or("Couldn’t create temporary Chromium session")?;
+    let browser = browser_host_create_browser_sync(
+        Some(&info),
+        Some(&mut client),
+        Some(&CefString::from("about:blank")),
+        Some(&BrowserSettings {
+            windowless_frame_rate: 60,
+            background_color: 0xff1b1b1f,
             ..Default::default()
-        }));
-        let closed = Arc::new(AtomicBool::new(false));
-        let mut client = ClientImpl::new(
-            Render::new(state.clone()),
-            Load::new(state.clone(), css.into()),
-            Life::new(closed.clone()),
-            PageDisplay::new(state.clone()),
-        );
-        let info = WindowInfo::default().set_as_windowless(0);
-        // Each Surface gets a distinct off-the-record context. Cookies, localStorage,
-        // IndexedDB, service workers and history cannot carry into the next search.
-        let mut context =
-            request_context_create_context(Some(&RequestContextSettings::default()), None)
-                .ok_or("Couldn’t create temporary Chromium session")?;
-        let browser = browser_host_create_browser_sync(
-            Some(&info),
-            Some(&mut client),
-            Some(&CefString::from("about:blank")),
-            Some(&BrowserSettings {
-                windowless_frame_rate: 60,
-                background_color: 0xff1b1b1f,
-                ..Default::default()
-            }),
-            None,
-            Some(&mut context),
-        )
-        .ok_or("Couldn’t create Chromium view")?;
-        trace_timing("private browser created", creation_started);
-        CLOSING.with_borrow_mut(|browsers| {
-            browsers.retain(|b| !b.load(Ordering::Acquire));
-            browsers.push(closed);
-        });
-        SURFACES.fetch_add(1, Ordering::AcqRel);
-        detach_cef_glib_sources();
-        resume_pump();
-        let mut ready = PreferenceStorage::new(context.clone(), state.clone());
-        if context.cookie_manager(Some(&mut ready)).is_none() {
-            if let Some(host) = browser.host() {
-                host.close_browser(1);
-            }
-            if SURFACES.fetch_sub(1, Ordering::AcqRel) == 1 {
-                pause_after_close();
-            }
-            return Err("Couldn’t initialize Brave Search preferences".into());
+        }),
+        None,
+        Some(&mut context),
+    )
+    .ok_or("Couldn’t create Chromium view")?;
+    trace_timing("private browser created", created);
+    CLOSING.with_borrow_mut(|browsers| {
+        browsers.retain(|b| !b.load(Ordering::Acquire));
+        browsers.push(closed);
+    });
+    let mut ready = PreferenceStorage::new(context.clone(), state.clone());
+    if context.cookie_manager(Some(&mut ready)).is_none() {
+        if let Some(host) = browser.host() {
+            host.close_browser(1);
         }
-        let weak = picture.downgrade();
-        let ready_callback: ReadyCallback = Rc::new(RefCell::new(None));
-        let ready = ready_callback.clone();
-        let b = browser.clone();
-        let label = status.clone();
-        let shared = state.clone();
-        let preference_deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let tick = glib::timeout_add_local(Duration::from_millis(16), move || {
-            let Some(p) = weak.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            let (frame, resize, loading, error, navigate, document_ready) = {
-                let mut s = shared.lock().unwrap();
-                // Lay the page out at its final size while it is still hidden behind
-                // the loading pane. The parent stack is allocated even when this child
-                // isn't, so the page doesn't re-flow (and jump) the moment it is shown.
-                let size = if p.is_mapped() {
-                    (p.width(), p.height())
-                } else {
-                    p.parent().map_or((0, 0), |parent| (parent.width(), parent.height()))
-                };
-                let resize = size.0 > 0 && size.1 > 0 && size != s.size;
-                if resize {
-                    s.size = size;
+        return Err("Couldn’t initialize Brave Search preferences".into());
+    }
+    PAGES.with_borrow_mut(|pages| pages.insert(id, Page { browser, state }));
+    // SetCookie is asynchronous: never send the first request before both completion
+    // callbacks succeed. Fail visibly instead of using defaults.
+    post_delayed(Command::PreferencesTimeout(id), Duration::from_secs(5));
+    Ok(())
+}
+
+fn with_page(id: u32, f: impl FnOnce(&Page)) {
+    let page = PAGES.with_borrow(|pages| pages.get(&id).map(|p| (p.browser.clone(), p.state.clone())));
+    if let Some((browser, state)) = page {
+        f(&Page { browser, state });
+    }
+}
+
+fn handle(command: Command) {
+    match command {
+        Command::Open { id, css } => {
+            if SHUTTING_DOWN.load(Ordering::Acquire) {
+                return;
+            }
+            if let Err(error) = open(id, css) {
+                send_error(id, Some(&error));
+            }
+        }
+        Command::Close(id) => {
+            if let Some(page) = PAGES.with_borrow_mut(|pages| pages.remove(&id)) {
+                if let Some(h) = page.browser.host() {
+                    h.close_browser(1);
                 }
-                if s.preferences_pending > 0 && std::time::Instant::now() >= preference_deadline {
-                    s.preferences_error
-                        .get_or_insert_with(|| "Brave Search preferences timed out".into());
+            }
+        }
+        Command::Load { id, url } => with_page(id, |page| {
+            if let Some(host) = page.browser.host() {
+                host.was_hidden(0);
+                host.set_focus(1);
+            }
+            let mut state = page.state.lock().unwrap();
+            state.queued_url = Some(url);
+            state.committed = false;
+            state.document_ready = false;
+            drop(state);
+            send(proto::Writer::new(proto::LOADING, id).flag(true).finish());
+            post(Command::TryNavigate(id));
+        }),
+        Command::TryNavigate(id) => with_page(id, |page| {
+            let url = {
+                let mut s = page.state.lock().unwrap();
+                if s.preferences_error.is_some() || s.preferences_pending > 0 {
+                    return;
                 }
-                let navigate = if s.preferences_error.is_none() && s.preferences_pending == 0 {
-                    let url = s.queued_url.take();
-                    if url.is_some() {
-                        s.navigation_started = Some(std::time::Instant::now());
-                        trace_timing("navigation ready", creation_started);
+                let url = s.queued_url.take();
+                if url.is_some() {
+                    s.navigation_started = Some(std::time::Instant::now());
+                    if let Some(t) = s.created {
+                        trace_timing("navigation ready", t);
                     }
-                    url
-                } else {
-                    None
-                };
-                (
-                    s.frame.take(),
-                    resize,
-                    s.loading,
-                    s.preferences_error.clone().or_else(|| s.error.clone()),
-                    navigate,
-                    s.document_ready,
-                )
+                }
+                url
             };
-            // SetCookie is asynchronous: never send the first request before both
-            // completion callbacks succeed. Fail visibly instead of using defaults.
-            if let Some(url) = navigate {
-                if let Some(frame) = b.main_frame() {
-                    frame.load_url(Some(&CefString::from(url.as_str())));
-                }
+            if let (Some(url), Some(frame)) = (url, page.browser.main_frame()) {
+                frame.load_url(Some(&CefString::from(url.as_str())));
             }
-            if resize {
-                if let Some(h) = b.host() {
-                    h.was_resized();
-                }
+        }),
+        Command::PreferencesTimeout(id) => with_page(id, |page| {
+            let mut s = page.state.lock().unwrap();
+            if s.preferences_pending > 0 && s.preferences_error.is_none() {
+                s.preferences_error = Some("Brave Search preferences timed out".into());
+                send_error(id, s.preferences_error.as_deref());
             }
-            if let Some(text) = shared.lock().unwrap().copied.take() {
-                p.clipboard().set_text(&text);
-            }
-            if let Some((w, h, data)) = frame {
-                let bytes = glib::Bytes::from_owned(data);
-                let texture = gdk::MemoryTexture::new(
-                    w,
-                    h,
-                    gdk::MemoryFormat::B8g8r8a8Premultiplied,
-                    &bytes,
-                    w as usize * 4,
-                );
-                p.set_paintable(Some(&texture));
-            }
-            if error.is_some() || (document_ready && p.paintable().is_some()) {
-                if let Some(callback) = ready.borrow_mut().take() {
-                    trace_timing("page shown", creation_started);
-                    callback();
-                    p.grab_focus();
-                }
-            }
-            label.set_text(error.as_deref().unwrap_or(if loading {
-                "Loading Brave Search…"
-            } else {
-                "Brave Search"
-            }));
-            glib::ControlFlow::Continue
-        });
-        let b = browser.clone();
-        picture.connect_map(move |_| {
-            if let Some(h) = b.host() {
-                h.was_hidden(0);
-                h.was_resized();
-            }
-        });
-        let b = browser.clone();
-        picture.connect_unmap(move |_| {
-            if let Some(h) = b.host() {
+        }),
+        Command::Stop(id) => with_page(id, |page| {
+            page.state.lock().unwrap().queued_url = None;
+            page.browser.stop_load();
+            if let Some(h) = page.browser.host() {
                 h.set_focus(0);
                 h.was_hidden(1);
             }
-        });
-        connect_input(&picture, &browser, &state);
-        Ok(Self {
-            picture,
-            browser,
-            tick: Some(tick),
-            state,
-            ready_callback,
-        })
-    }
-
-    pub fn load(&self, url: &str) {
-        if let Some(host) = self.browser.host() {
-            host.was_hidden(0);
-            host.set_focus(1);
-        }
-        let mut state = self.state.lock().unwrap();
-        state.queued_url = Some(url.into());
-        state.loading = true;
-        state.committed = false;
-        state.document_ready = false;
-        drop(state);
-        self.picture.grab_focus();
-    }
-    pub fn on_ready(&self, callback: impl FnOnce() + 'static) {
-        *self.ready_callback.borrow_mut() = Some(Box::new(callback));
-    }
-    pub fn stop(&self) {
-        self.state.lock().unwrap().queued_url = None;
-        self.browser.stop_load();
-        if let Some(h) = self.browser.host() {
-            h.set_focus(0);
-            h.was_hidden(1);
+        }),
+        Command::Resize { id, w, h } => with_page(id, |page| {
+            if w <= 0 || h <= 0 {
+                return;
+            }
+            page.state.lock().unwrap().size = (w, h);
+            if let Some(host) = page.browser.host() {
+                host.was_resized();
+            }
+        }),
+        Command::Visible { id, shown } => with_page(id, |page| {
+            if let Some(h) = page.browser.host() {
+                h.was_hidden(!shown as i32);
+                if shown {
+                    h.was_resized();
+                } else {
+                    h.set_focus(0);
+                }
+            }
+        }),
+        Command::Focus { id, focused } => with_page(id, |page| {
+            if let Some(h) = page.browser.host() {
+                h.set_focus(focused as i32);
+            }
+        }),
+        Command::MouseMove { id, event, leave } => with_page(id, |page| {
+            if let Some(h) = page.browser.host() {
+                h.send_mouse_move_event(Some(&event), leave as i32);
+            }
+        }),
+        Command::MouseClick { id, event, button, up, count } => with_page(id, |page| {
+            if !up {
+                page.state.lock().unwrap().last_input = Some(std::time::Instant::now());
+            }
+            let button = match button {
+                proto::BUTTON_MIDDLE => MouseButtonType::MIDDLE,
+                proto::BUTTON_RIGHT => MouseButtonType::RIGHT,
+                _ => MouseButtonType::LEFT,
+            };
+            if let Some(h) = page.browser.host() {
+                if !up {
+                    h.set_focus(1);
+                }
+                h.send_mouse_click_event(Some(&event), button, up as i32, count);
+            }
+        }),
+        Command::Wheel { id, event, dx, dy } => with_page(id, |page| {
+            if let Some(h) = page.browser.host() {
+                h.send_mouse_wheel_event(Some(&event), dx, dy);
+            }
+        }),
+        Command::Key { id, event } => with_page(id, |page| {
+            if event.type_ == KeyEventType::RAWKEYDOWN {
+                page.state.lock().unwrap().last_input = Some(std::time::Instant::now());
+            }
+            if let Some(h) = page.browser.host() {
+                h.send_key_event(Some(&event));
+            }
+        }),
+        Command::Shutdown => {
+            SHUTTING_DOWN.store(true, Ordering::Release);
+            let pages: Vec<Page> = PAGES.with_borrow_mut(|pages| pages.drain().map(|(_, p)| p).collect());
+            for page in pages {
+                if let Some(h) = page.browser.host() {
+                    h.close_browser(1);
+                }
+            }
+            if all_closed() {
+                quit_message_loop();
+            }
         }
     }
 }
-impl Drop for Surface {
-    fn drop(&mut self) {
-        if let Some(tick) = self.tick.take() {
-            tick.remove();
-        }
-        if let Some(h) = self.browser.host() {
-            h.close_browser(1);
-        }
-        if SURFACES.fetch_sub(1, Ordering::AcqRel) == 1 {
-            pause_after_close();
+
+// ---------------------------------------------------------------------------------------
+// Engine
+
+wrap_render_process_handler! {
+    struct Preferences;
+    impl RenderProcessHandler {
+        fn on_context_created(&self, _browser:Option<&mut Browser>, frame:Option<&mut Frame>, context:Option<&mut V8Context>) {
+            let (Some(frame),Some(context))=(frame,context) else {return;};
+            let url=CefString::from(&frame.url()).to_string();
+            if frame.is_main()!=0 && url.starts_with("https://search.brave.com/") {
+                // Context creation runs before the document's scripts, so metrics
+                // are opted out before Brave initializes its telemetry code.
+                // Leave an in-session settings change alone until the next search.
+                let css=serde_json::to_string(include_str!("search_filters/brave.css")).unwrap();
+                let mut script=include_str!("search_filters/brave.js").replace("__OMNI_BRAVE_CSS__",&css);
+                if std::env::var_os("OMNI_SEARCH_DIAGNOSTICS").is_some() {
+                    script.push_str(include_str!("search_filters/brave-diagnostics.js"));
+                }
+                let mut result=None;
+                let mut exception=None;
+                if context.eval(Some(&CefString::from(script.as_str())),None,0,Some(&mut result),Some(&mut exception))==0 {
+                    let message=exception.map(|error|CefString::from(&error.message()).to_string()).unwrap_or_default();
+                    eprintln!("Couldn’t initialize Brave Search preferences and style: {message}");
+                }
+            }
         }
     }
 }
-
-fn modifiers(m: gdk::ModifierType) -> u32 {
-    let mut flags = 0;
-    for (mask, bit) in [
-        (gdk::ModifierType::SHIFT_MASK, 2),
-        (gdk::ModifierType::CONTROL_MASK, 4),
-        (gdk::ModifierType::ALT_MASK, 8),
-        (gdk::ModifierType::BUTTON1_MASK, 16),
-        (gdk::ModifierType::BUTTON2_MASK, 32),
-        (gdk::ModifierType::BUTTON3_MASK, 64),
-        (gdk::ModifierType::SUPER_MASK, 128),
-    ] {
-        if m.contains(mask) {
-            flags |= bit;
+wrap_app! {
+    pub struct BrowserApp;
+    impl App {
+        fn on_before_command_line_processing(&self, process_type:Option<&CefString>, command_line:Option<&mut CommandLine>) {
+            // Brave's conversation endpoint returned 400 over HTTP/3 in both
+            // CEF and Brave controls, while the same requests succeeded over h2.
+            // Limit the workaround to Omni's embedded browser network stack.
+            let browser_process=process_type.is_none_or(|t|t.to_string().is_empty());
+            if let (true,Some(command_line))=(browser_process,command_line) {
+                command_line.append_switch(Some(&CefString::from("disable-quic")));
+            }
         }
+        fn render_process_handler(&self)->Option<RenderProcessHandler> {Some(Preferences::new())}
     }
-    flags
 }
 
-fn connect_input(picture: &gtk::Picture, browser: &Browser, state: &Shared) {
-    let pointer = Rc::new(Cell::new((0.0, 0.0)));
-    let position = pointer.clone();
-    let motion = gtk::EventControllerMotion::new();
-    let b = browser.clone();
-    motion.connect_motion(move |controller, x, y| {
-        position.set((x, y));
-        if let Some(h) = b.host() {
-            h.send_mouse_move_event(
-                Some(&MouseEvent {
-                    x: x as i32,
-                    y: y as i32,
-                    modifiers: modifiers(controller.current_event_state()),
-                }),
-                0,
-            );
-        }
-    });
-    let b = browser.clone();
-    motion.connect_leave(move |_| {
-        if let Some(h) = b.host() {
-            h.send_mouse_move_event(Some(&MouseEvent::default()), 1);
-        }
-    });
-    picture.add_controller(motion);
-    let click = gtk::GestureClick::new();
-    click.set_button(0);
-    let b = browser.clone();
-    let weak = picture.downgrade();
-    let input = state.clone();
-    click.connect_pressed(move |g, n, x, y| {
-        input.lock().unwrap().last_input = Some(std::time::Instant::now());
-        if let Some(p) = weak.upgrade() {
-            p.grab_focus();
-        }
-        if let Some(h) = b.host() {
-            h.set_focus(1);
-            h.send_mouse_click_event(
-                Some(&MouseEvent {
-                    x: x as i32,
-                    y: y as i32,
-                    modifiers: modifiers(g.current_event_state()),
-                }),
-                mouse_button(g.current_button()),
-                0,
-                n,
-            );
-        }
-    });
-    let b = browser.clone();
-    click.connect_released(move |g, n, x, y| {
-        if let Some(h) = b.host() {
-            h.send_mouse_click_event(
-                Some(&MouseEvent {
-                    x: x as i32,
-                    y: y as i32,
-                    modifiers: modifiers(g.current_event_state()),
-                }),
-                mouse_button(g.current_button()),
-                1,
-                n,
-            );
-        }
-    });
-    picture.add_controller(click);
-    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
-    let b = browser.clone();
-    scroll.connect_scroll(move |c, dx, dy| {
-        if let Some(h) = b.host() {
-            let (x, y) = pointer.get();
-            h.send_mouse_wheel_event(
-                Some(&MouseEvent {
-                    x: x as i32,
-                    y: y as i32,
-                    modifiers: modifiers(c.current_event_state()),
-                }),
-                (-dx * 48.) as i32,
-                (-dy * 48.) as i32,
-            );
-        }
-        glib::Propagation::Stop
-    });
-    picture.add_controller(scroll);
-    let keys = gtk::EventControllerKey::new();
-    let b = browser.clone();
-    let input = state.clone();
-    keys.connect_key_pressed(move |_, key, code, mods| {
-        input.lock().unwrap().last_input = Some(std::time::Instant::now());
-        if key == gdk::Key::Escape {
-            return glib::Propagation::Proceed;
-        }
-        if let Some(h) = b.host() {
-            let mut event = key_event(key, code, mods, KeyEventType::RAWKEYDOWN);
-            h.send_key_event(Some(&event));
-            if !mods.intersects(
-                gdk::ModifierType::CONTROL_MASK
-                    | gdk::ModifierType::ALT_MASK
-                    | gdk::ModifierType::SUPER_MASK,
-            ) {
-                if let Some(ch) = key.to_unicode() {
-                    for unit in ch.encode_utf16(&mut [0; 2]) {
-                        event.type_ = KeyEventType::CHAR;
-                        event.character = *unit;
-                        event.unmodified_character = *unit;
-                        h.send_key_event(Some(&event));
+const SCRATCH_PREFIX: &str = "omni-chromium-";
+
+/// Remove scratch directories left by hosts that were killed before cleaning up. They
+/// live on tmpfs, so each one is RAM. A directory is in use while some process (one of
+/// its Chromium helpers) names it in `--user-data-dir`.
+fn remove_stale_scratch(runtime: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(runtime) else { return };
+    let candidates: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(SCRATCH_PREFIX))
+        .map(|e| e.path())
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let mut in_use = Vec::new();
+    if let Ok(procs) = std::fs::read_dir("/proc") {
+        for p in procs.flatten() {
+            if let Ok(cmdline) = std::fs::read(p.path().join("cmdline")) {
+                for arg in cmdline.split(|&b| b == 0) {
+                    if let Some(dir) = arg.strip_prefix(b"--user-data-dir=") {
+                        in_use.push(String::from_utf8_lossy(dir).into_owned());
                     }
                 }
             }
         }
-        glib::Propagation::Stop
-    });
-    let b = browser.clone();
-    keys.connect_key_released(move |_, key, code, mods| {
-        if let Some(h) = b.host() {
-            h.send_key_event(Some(&key_event(key, code, mods, KeyEventType::KEYUP)));
+    }
+    for dir in candidates {
+        if !in_use.iter().any(|u| std::path::Path::new(u) == dir) {
+            let _ = std::fs::remove_dir_all(&dir);
         }
-    });
-    picture.add_controller(keys);
-}
-fn mouse_button(button: u32) -> MouseButtonType {
-    match button {
-        2 => MouseButtonType::MIDDLE,
-        3 => MouseButtonType::RIGHT,
-        _ => MouseButtonType::LEFT,
     }
 }
-fn key_event(key: gdk::Key, code: u32, mods: gdk::ModifierType, kind: KeyEventType) -> KeyEvent {
-    let virtual_key = match key {
-        gdk::Key::BackSpace => 8,
-        gdk::Key::Tab => 9,
-        gdk::Key::Return | gdk::Key::KP_Enter => 13,
-        gdk::Key::Escape => 27,
-        gdk::Key::Left => 37,
-        gdk::Key::Up => 38,
-        gdk::Key::Right => 39,
-        gdk::Key::Down => 40,
-        gdk::Key::Delete => 46,
-        gdk::Key::Home => 36,
-        gdk::Key::End => 35,
-        gdk::Key::Page_Up => 33,
-        gdk::Key::Page_Down => 34,
-        _ => key
-            .to_unicode()
-            .map(|c| c.to_ascii_uppercase() as i32)
-            .unwrap_or(0),
+
+/// `omni-browser --omni-host`: serve the launcher on fd 3 until it closes the socket.
+pub fn host_main() -> i32 {
+    // If the launcher dies without closing the socket cleanly, don't outlive it.
+    // SAFETY: plain prctl with constant arguments.
+    unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+    // SAFETY: fd 3 is the socket the launcher passed; nothing else in this process owns it.
+    // Move it off 3 (Chromium's own IPC slot in its children) and mark it close-on-exec so
+    // no Chromium helper inherits the launcher's socket.
+    let stream = unsafe {
+        use std::os::fd::FromRawFd;
+        let fd = libc::fcntl(3, libc::F_DUPFD_CLOEXEC, 10);
+        if fd < 0 {
+            eprintln!("omni-browser: no launcher socket on fd 3");
+            return 64;
+        }
+        libc::close(3);
+        UnixStream::from_raw_fd(fd)
     };
-    KeyEvent {
-        type_: kind,
-        windows_key_code: virtual_key,
-        native_key_code: code as i32,
-        modifiers: modifiers(mods),
-        ..Default::default()
+    let fatal = |message: &str| {
+        eprintln!("omni-browser: {message}");
+        let mut s = &stream;
+        let _ = s.write_all(&proto::Writer::new(proto::FATAL, 0).str(message).finish());
+        1
+    };
+    if api_hash(14600, 0).is_null() {
+        return fatal("Installed CEF does not support API 14600");
     }
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) else {
+        return fatal("XDG_RUNTIME_DIR is not set");
+    };
+    let runtime = std::path::PathBuf::from(runtime);
+    remove_stale_scratch(&runtime);
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return fatal(&e.to_string()),
+    };
+    let dir = env!("OMNI_CEF_DIR");
+    // CEF needs a root for installation metadata even with off-the-record contexts.
+    // Keep it private and temporary; no search profile is created beneath it.
+    let root = match tempdir(&runtime) {
+        Ok(root) => root,
+        Err(e) => return fatal(&format!("Couldn’t create temporary Chromium runtime directory: {e}")),
+    };
+    let started = std::time::Instant::now();
+    let settings = Settings {
+        windowless_rendering_enabled: 1,
+        resources_dir_path: CefString::from(dir),
+        locales_dir_path: CefString::from(format!("{dir}/locales").as_str()),
+        root_cache_path: CefString::from(root.to_string_lossy().as_ref()),
+        // An empty cache_path selects CEF's in-memory/incognito storage mode.
+        cache_path: CefString::default(),
+        browser_subprocess_path: CefString::from(exe.to_string_lossy().as_ref()),
+        accept_language_list: CefString::from("en-US,en"),
+        background_color: 0xff1b1b1f,
+        ..Default::default()
+    };
+    let args = cef::args::Args::new();
+    let mut app = BrowserApp::new();
+    if initialize(Some(args.as_main_args()), Some(&settings), Some(&mut app), std::ptr::null_mut()) != 1 {
+        let _ = std::fs::remove_dir_all(&root);
+        return fatal("Chromium initialization failed");
+    }
+    trace_timing("CEF initialized", started);
+    let _ = OUTBOX.set(Outbox::default());
+    let (read_half, write_half) = match stream.try_clone() {
+        Ok(w) => (stream, w),
+        Err(e) => return fatal(&e.to_string()),
+    };
+    let writer_thread = std::thread::spawn(move || writer(write_half));
+    std::thread::spawn(move || reader(read_half));
+    run_message_loop();
+    shutdown();
+    let _ = std::fs::remove_dir_all(&root);
+    if let Some(out) = OUTBOX.get() {
+        out.state.lock().unwrap().closed = true;
+        out.ready.notify_one();
+    }
+    let _ = writer_thread.join();
+    0
+}
+
+fn tempdir(runtime: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let seed = std::process::id() as u64 ^ std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    for n in 0..100u64 {
+        let path = runtime.join(format!("{SCRATCH_PREFIX}{:x}", seed.wrapping_add(n)));
+        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::ErrorKind::AlreadyExists.into())
 }

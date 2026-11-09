@@ -1,6 +1,6 @@
 mod answer;
 mod browser_frame;
-mod chromium;
+mod web_client;
 mod apps;
 mod calc;
 mod dock;
@@ -15,6 +15,7 @@ mod search_view;
 mod sparql;
 mod util;
 mod web;
+mod web_protocol;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -498,7 +499,7 @@ fn main() -> glib::ExitCode {
 
     let result = app.run();
     if let Some(ui) = ui.borrow().as_ref() { ui.search_view.close(); }
-    if let Err(error) = chromium::finish() {
+    if let Err(error) = web_client::finish() {
         eprintln!("omni: {error}");
         return glib::ExitCode::FAILURE;
     }

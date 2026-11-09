@@ -76,7 +76,8 @@ const JUNK_DIRS: &[&str] = &[
     "steamapps", "__MACOSX",
 ];
 
-/// The index. Memory is the point of this layout (~4M entries in ~70 MB):
+/// The index. Memory is the point of this layout (~4M entries in ~70 MB, less with the
+/// contents of `SKIP_INSIDE` folders left out):
 /// - each distinct name is stored once, ASCII-lowercased (only 29% of names are distinct:
 ///   index.js, README.md, __init__.py ...); the real capitalization of the few results
 ///   shown is read back from disk;
@@ -192,6 +193,10 @@ impl Index {
             path_rank.entry(dir).or_insert(rank);
         }
         let mut command_dirs_old: HashMap<u32, u16> = HashMap::new();
+        // `SKIP_INSIDE` folders aren't walked, except on the way down to a $PATH folder
+        // (~/.cargo/bin): those and their ancestors are walked as usual.
+        let path_chain: HashSet<PathBuf> =
+            path_rank.keys().flat_map(|dir| dir.ancestors().map(PathBuf::from)).collect();
 
         // Walk: entries in discovery order with an id per distinct lowercase name.
         let mut names: Vec<Box<str>> = Vec::new();
@@ -319,10 +324,14 @@ impl Index {
                 e_parent.push(job.idx);
                 e_name.push(intern(&name));
                 e_flags.push(flags);
+                let child = job.path.join(&name);
+                if is_dir && skip_inside(&name) && !path_chain.contains(&child) {
+                    continue;
+                }
                 if is_dir && claim_dir(&mut seen, id) {
                     pending += 1;
                     // Children inherit "inside a home folder", not "is the home folder".
-                    let _ = job_tx.send(Job { idx, path: job.path.join(&name), flags: flags & !XDG_ROOT });
+                    let _ = job_tx.send(Job { idx, path: child, flags: flags & !XDG_ROOT });
                 }
             }
         }
@@ -834,6 +843,31 @@ fn score_name(name: &[u8], is_dir: bool, words: &[Vec<u8>], whole: &[u8]) -> Opt
     Some(s)
 }
 
+/// Folders managed by a tool rather than by you: package stores, editor state, VCS
+/// internals, toolchains, Trash. The folder itself is indexed; what's inside isn't walked:
+/// it's a large share of a disk's names (every name is RAM) and never the file you're after.
+/// Your own dotfiles (~/.config, ~/.local) and project environments (.venv) are walked.
+const SKIP_INSIDE: &[&str] = &[
+    "node_modules", "bower_components", ".npm", ".yarn", ".pnpm-store", ".nvm",
+    ".vscode", ".vscode-server", ".vscode-oss", ".cursor", ".idea",
+    ".git", ".hg", ".svn",
+    ".rustup", ".cargo", ".gradle", ".m2",
+    ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".next", ".nuxt", ".turbo", ".parcel-cache",
+    "Trash", ".Trash", "flatpak", "containers",
+];
+
+fn skip_inside(name: &str) -> bool {
+    SKIP_INSIDE.contains(&name) || name.starts_with(".Trash-")
+}
+
+/// `dir` is, or is inside, a folder the walk doesn't enter.
+fn inside_skipped(dir: &std::path::Path) -> bool {
+    if std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d == dir)) {
+        return false;
+    }
+    dir.components().any(|c| skip_inside(&c.as_os_str().to_string_lossy()))
+}
+
 /// Where the entry lives: home first, hidden and dependency/build folders down, shallow
 /// paths and shorter names up.
 fn adjust(flags: u8, depth: i32, name_len: usize) -> i32 {
@@ -919,6 +953,10 @@ impl Extras {
                     if !path.to_string_lossy().to_ascii_lowercase().starts_with(scope.as_str()) {
                         return None;
                     }
+                }
+                // Same rule as the walk: nothing from inside a SKIP_INSIDE folder.
+                if path.parent().is_some_and(inside_skipped) {
+                    return None;
                 }
                 let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
                 let mut flags = if *is_dir { DIR } else { 0 };
