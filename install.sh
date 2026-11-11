@@ -29,6 +29,28 @@ put "$src/target/release/omni-browser" "$dest/bin/omni-browser" 0555
 put "$src/target/release/omni-toggle" "$dest/bin/omni-toggle" 0555
 put "$src/scripts/omni-start"         "$dest/bin/omni-start"  0555
 put "$src/hypr/omni.lua"              "$dest/hypr/omni.lua"   0444
+put "$src/scripts/omni-embed.py"      "$dest/bin/omni-embed.py" 0444
+
+# Image search's Python venv (onnxruntime-gpu + its CUDA/cuDNN wheels, ~2.6 GB). Rebuilt only
+# when the pinned requirements change; the model itself downloads on the first crawl.
+venv="$dest/embed-venv"
+reqs="$src/scripts/omni-embed.requirements.txt"
+if ! cmp -s "$reqs" "$venv/omni-requirements.txt" 2>/dev/null; then
+    if command -v uv >/dev/null 2>&1; then
+        echo "install: setting up image search venv (one time, a few minutes)"
+        rm -rf "$venv.new"
+        if uv venv -q --python 3.12 "$venv.new" && VIRTUAL_ENV="$venv.new" uv pip install -q -r "$reqs"; then
+            cp "$reqs" "$venv.new/omni-requirements.txt"
+            rm -rf "$venv"
+            mv "$venv.new" "$venv"
+        else
+            echo "install: image search venv failed; img search stays off until the next install" >&2
+            rm -rf "$venv.new"
+        fi
+    else
+        echo "install: uv not found, skipping image search (needs uv: https://docs.astral.sh/uv/)" >&2
+    fi
+fi
 
 # The identity-guarded installer manages shutdown/startup itself.
 if [ "${OMNI_INSTALL_NO_RESTART:-0}" = 1 ]; then

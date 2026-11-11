@@ -93,6 +93,7 @@ Right-click the row, **or** press `Menu` / `Shift`＋`F10` on the selected one.
 | `~/Music:` | the folder itself, to open |
 | `bluetooth` (3+ letters) | matching systemd **services**, with state |
 | `6x5` · `2^10` · `200*15%` | the **calculator** card (`Enter` copies the result) |
+| `img red terminal` | [**image search**](#image-search): pictures ranked by what's in them |
 | anything, then `Ctrl`＋`Enter` | web search |
 | anything, then `Shift`＋`Enter` | ask Claude |
 
@@ -322,6 +323,19 @@ Right-click the web row (or `Menu` / `Shift`＋`F10`) to search in a:
 
 ---
 
+## Image search
+
+Type `img`, a space, and a description (`img red terminal`, `img cat on a couch`). Results are your pictures ranked by what's *in* them, with thumbnails; `Enter` and right-click work like any file.
+
+- **Model:** [embeddinggemma-2](https://huggingface.co/google/embeddinggemma-2) (ONNX fp16, about 900 MB, downloaded on the first crawl to `~/.local/share/omni/models`). It runs in `omni-embed.py` on the GPU, from its own venv (`~/.local/share/omni/embed-venv`, made by `install.sh` with `uv`; onnxruntime-gpu brings its own CUDA and cuDNN).
+- **Querying loads only the text side** (~540 MB). Typing `img` starts it (about 2 s), each query then takes a few ms, and it exits **10 s after the last query**.
+- **Indexing** loads the vision encoder too, embeds only new or changed images, then exits. A crawl with nothing new never loads the model. About 0.2 s per image: a couple hundred take ~30 s.
+- **When:** quietly 10 s after omni starts, then hourly. Settings → **Image search** turns that off; **Index now** runs it; **Add folder…** adds a folder and indexes it right away.
+- **Folders:** `~/Pictures` by default; the list is `~/.config/omni/image-folders` (one per line). Hidden folders are skipped. PNG, JPEG, WebP, GIF (first frame), BMP.
+- **Index:** `~/.local/share/omni/images/index.npz` (paths and vectors); thumbnails in `~/.cache/omni/thumbs`.
+
+---
+
 ## Ask Claude
 
 Press `Shift`＋`Enter` on anything you typed. omni runs the **Claude Code CLI** (your normal Claude Code login and usage) as a **temporary conversation** in the popup.
@@ -384,6 +398,7 @@ The full permission, sandbox and connector story is in the [status log](#status-
 | Folders whose contents aren't indexed | `SKIP_INSIDE` in `files.rs` |
 | How long Chromium stays after the last search | `IDLE_EXIT` in `web_client.rs` (10 s) |
 | Running programs on open | Settings → **Run programs** |
+| Image search folders | `~/.config/omni/image-folders` or Settings → **Add folder…** |
 | Claude's agent instructions | `src/agent_prompt.md`, then run `./install.sh` |
 
 ### Things omni remembers
@@ -396,6 +411,7 @@ The full permission, sandbox and connector story is in the [status log](#status-
 | `~/.local/state/omni/usage.tsv` | app launch counts and times |
 | `~/.config/omni/run-programs` | **Run programs** on/off |
 | `~/.config/omni/search-engine` | the built-in web search engine |
+| `~/.config/omni/image-crawl` | Image search's hourly indexing on/off |
 
 ### Switch back to rofi
 
@@ -441,6 +457,7 @@ Installed files are read-only. **Two programs instead of one on purpose** (speed
 | `src/sparql.rs` | minimal bindings to LocalSearch's library (queries, change events) |
 | `src/web.rs` | default browser and search engine detection |
 | `src/answer.rs` | Ask Claude (conversation process, permission prompts, model chip, Markdown, bouncing ball) |
+| `src/images.rs` · `scripts/omni-embed.py` | Image search (`img …`): the helper process, its crawl, and the index |
 | `src/agent_prompt.md` | your agent instructions, appended to Claude's system prompt |
 | `src/services.rs` | systemd services (list, search, actions, status) |
 | `src/ring.rs` | the search bar's animated rim |

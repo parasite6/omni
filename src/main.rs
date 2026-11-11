@@ -6,6 +6,7 @@ mod calc;
 mod dock;
 mod files;
 mod glass;
+mod images;
 mod probe;
 mod recent;
 mod ring;
@@ -45,6 +46,9 @@ const SEARCH_PLACEHOLDER: &str = "Search apps, files and the web";
 const REPLY_PLACEHOLDER: &str = "Reply to Claude \u{b7} Esc to go back to search";
 /// Per-kind limit when the filter narrows results to some kinds (more room for each).
 const MAX_FILTERED: usize = 8;
+/// Image search (`img red terminal`): rows shown and their thumbnail size.
+const MAX_IMAGES: usize = 8;
+const IMAGE_THUMB_PX: i32 = 48;
 
 /// Result kinds the filter can show (bits). All bits set = no filter.
 const SHOW_APPS: u8 = 1;
@@ -139,6 +143,8 @@ struct Hit {
     file_menu: bool,
     /// Set for file/folder rows when Contents can classify the match.
     match_type: Option<MatchType>,
+    /// Image search rows (`img …`): the cached thumbnail shown large in place of the icon.
+    thumb: Option<PathBuf>,
 }
 
 /// Cache identity: search text + optional directory scope (Contents on).
@@ -352,6 +358,8 @@ struct Ui {
     services_loading: Cell<bool>,
     /// The open right-click menu. Its keys, clicks and scrolls are its own while it's up.
     menu: RefCell<Option<gtk::Popover>>,
+    /// Image search (`img …`) and its background crawl.
+    images: Rc<images::Images>,
 }
 
 fn main() -> glib::ExitCode {
@@ -923,6 +931,39 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     run_row.append(&run_text);
     run_row.append(&run_switch);
     settings_rows.append(&run_row);
+    let images = images::Images::new();
+    let img_row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    let img_text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    img_text.set_hexpand(true);
+    let img_title = gtk::Label::builder().label("Image search").xalign(0.0).build();
+    img_text.append(&img_title);
+    let img_hint = gtk::Label::builder()
+        .label("Type img and a description. New pictures are indexed quietly every hour on the GPU.")
+        .xalign(0.0)
+        .wrap(true)
+        .max_width_chars(1)
+        .build();
+    img_hint.add_css_class("omni-status-hint");
+    img_text.append(&img_hint);
+    let img_status = gtk::Label::builder().label(images.crawl_status()).xalign(0.0).wrap(true).max_width_chars(1).build();
+    img_status.add_css_class("omni-status-hint");
+    img_text.append(&img_status);
+    let img_switch = gtk::Switch::builder().active(images::auto_crawl()).valign(gtk::Align::Center).build();
+    img_switch.update_relation(&[
+        gtk::accessible::Relation::LabelledBy(&[img_title.upcast_ref()]),
+        gtk::accessible::Relation::DescribedBy(&[img_hint.upcast_ref()]),
+    ]);
+    img_row.append(&img_text);
+    img_row.append(&img_switch);
+    settings_rows.append(&img_row);
+    let img_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let img_index_now = gtk::Button::builder().label("Index now").css_classes(["omni-answer-button"]).build();
+    let img_add = gtk::Button::builder().label("Add folder\u{2026}").css_classes(["omni-answer-button"]).build();
+    img_index_now.set_sensitive(images::installed() && !images.crawling());
+    img_add.set_sensitive(images::installed());
+    img_buttons.append(&img_index_now);
+    img_buttons.append(&img_add);
+    settings_rows.append(&img_buttons);
     settings_plane.append(&settings_rows);
     let search_view = search_view::SearchView::new();
 
@@ -1072,8 +1113,53 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         status_body,
         status_scroll,
         status_gen: Cell::new(0),
+        images: images.clone(),
     });
     *ui.me.borrow_mut() = Rc::downgrade(&ui);
+
+    // Image search: answers re-run the search; the crawl reports into Settings.
+    let weak = Rc::downgrade(&ui);
+    images.connect_results(move || {
+        if let Some(ui) = weak.upgrade() {
+            if ui.window.is_visible() && images::parse(ui.entry.text().trim()).is_some() {
+                refresh(&ui);
+            }
+        }
+    });
+    let (st, now_button, im) = (img_status.clone(), img_index_now.clone(), Rc::downgrade(&images));
+    images.connect_crawl(move |status| {
+        st.set_label(status);
+        now_button.set_sensitive(im.upgrade().is_some_and(|i| !i.crawling()));
+    });
+    img_switch.connect_active_notify(|switch| {
+        let on = switch.is_active();
+        if on == images::auto_crawl() {
+            return;
+        }
+        if let Err(error) = images::set_auto_crawl(on) {
+            switch.set_active(!on);
+            notify_user("Couldn’t save setting", &error.to_string());
+        }
+    });
+    let im = images.clone();
+    img_index_now.connect_clicked(move |b| {
+        b.set_sensitive(false);
+        im.crawl(None);
+    });
+    let (im, win) = (images.clone(), ui.window.clone());
+    img_add.connect_clicked(move |_| {
+        let dialog = gtk::FileDialog::builder().title("Add a folder of images").modal(true).build();
+        dialog.set_initial_folder(Some(&gio::File::for_path(glib::home_dir().join("Pictures"))));
+        let im = im.clone();
+        dialog.select_folder(Some(&win), gio::Cancellable::NONE, move |res| {
+            if let Ok(dir) = res {
+                if let Some(path) = dir.path() {
+                    im.crawl(Some(&path));
+                }
+            }
+        });
+    });
+    images.schedule_crawls();
 
     // Re-measure footer truncation whenever the strip's width changes.
     let u = ui.clone();
@@ -1584,6 +1670,9 @@ fn refresh(ui: &Ui) {
     } else if let Some(calc) = calc_hit(query) {
         // A complete calculation: the result is the only thing shown.
         hits.push(calc);
+    } else if let Some(img) = images::parse(query) {
+        // `img red terminal`: pictures ranked by meaning, nothing else.
+        hits = image_hits(ui, img);
     } else if let Some((dir, inner)) = parse_scope(query) {
         // Don't require dir.is_dir(): ~/music must scope when the folder is ~/Music.
         // Name search and Contents FTS are independent filters (OR for match kind, AND scope).
@@ -1822,6 +1911,7 @@ fn apply_hits(ui: &Ui, hits: &[Hit]) {
     let new_keys: Vec<String> = hits.iter().map(hit_key).collect();
     let query = ui.entry.text();
     let query = query.trim();
+    let query = images::parse(query).unwrap_or(query);
 
     // Fast path: identical identity sequence — patch labels only, no reparent.
     if old_keys == new_keys {
@@ -1948,6 +2038,50 @@ fn file_hit(
         action: Action::Open(gio::File::for_path(path)),
         file_menu: !is_dir,
         match_type: Some(match_type),
+        thumb: None,
+    }
+}
+
+/// Rows for `img …`. The helper answers asynchronously; until then the last answer stays up.
+fn image_hits(ui: &Ui, query: &str) -> Vec<Hit> {
+    let images = &ui.images;
+    images.warm();
+    if query.is_empty() {
+        return vec![info_hit("Describe the image you\u{2019}re looking for")];
+    }
+    let found = match images.results(query) {
+        images::Results::Ready(h) if h.is_empty() => return vec![info_hit("No matching images")],
+        images::Results::Ready(h) => h,
+        images::Results::Searching(h) if h.is_empty() => return vec![info_hit("Searching images\u{2026}")],
+        images::Results::Searching(h) => h,
+        images::Results::Empty => {
+            let msg = if images.crawling() { "Indexing images\u{2026} try again in a moment" } else { "No images indexed yet: Settings \u{2192} Image search \u{2192} Index now" };
+            return vec![info_hit(msg)];
+        }
+        images::Results::Unavailable => {
+            let msg = if images::installed() { "Image search couldn\u{2019}t start (see the omni log)" } else { "Image search isn\u{2019}t installed: rerun install.sh" };
+            return vec![info_hit(msg)];
+        }
+    };
+    found
+        .into_iter()
+        .map(|h| Hit {
+            thumb: Some(h.thumb),
+            ..file_hit(&h.path, false, MatchType::Name, None, query)
+        })
+        .collect()
+}
+
+fn info_hit(text: &str) -> Hit {
+    Hit {
+        title: text.to_string(),
+        subtitle: String::new(),
+        subtitle_markup: false,
+        icon: Some(gio::ThemedIcon::new("camera-photo-symbolic").upcast()),
+        action: Action::Info,
+        file_menu: false,
+        match_type: None,
+        thumb: None,
     }
 }
 
@@ -2197,6 +2331,7 @@ fn content_empty_hit(scoped: bool) -> Hit {
         action: Action::Info,
         file_menu: false,
         match_type: None,
+        thumb: None,
     }
 }
 
@@ -2209,6 +2344,7 @@ fn content_failed_hit(message: &str) -> Hit {
         action: Action::Info,
         file_menu: false,
         match_type: None,
+        thumb: None,
     }
 }
 
@@ -2223,6 +2359,7 @@ fn calc_hit(query: &str) -> Option<Hit> {
         action: Action::Copy(result),
         file_menu: false,
         match_type: None,
+        thumb: None,
     })
 }
 
@@ -3018,6 +3155,8 @@ fn motion_enabled() -> bool {
 /// Stable identity for keeping selection across list rebuilds.
 fn hit_key(hit: &Hit) -> String {
     match &hit.action {
+        // Image rows are built differently (big thumbnail), so never reuse a file row for one.
+        Action::Open(file) if hit.thumb.is_some() => format!("img:{}", file.uri()),
         Action::Open(file) | Action::OpenWith(_, file) => file.uri().to_string(),
         Action::App(info) => format!("app:{}", info.id().unwrap_or_default()),
         Action::AppAction(info, action) => {
@@ -3693,6 +3832,7 @@ fn app_hit(info: &gio::AppInfo, name: &str) -> Hit {
         action: Action::App(info.clone()),
         file_menu: false,
         match_type: None,
+        thumb: None,
     }
 }
 
@@ -3705,6 +3845,7 @@ fn action_hit(app: &apps::App, action: &apps::AppAction) -> Hit {
         action: Action::AppAction(app.info.clone(), action.clone()),
         file_menu: false,
         match_type: None,
+        thumb: None,
     }
 }
 
@@ -3733,6 +3874,7 @@ fn recent_hits(ui: &Ui) -> Vec<Hit> {
                 action: Action::Open(f.file),
                 file_menu: !f.is_dir,
                 match_type: Some(MatchType::Name),
+                thumb: None,
             },
         ));
     }
@@ -3749,6 +3891,7 @@ fn web_hit(ui: &Ui, query: &str) -> Hit {
         action: Action::Web(query.to_string()),
         file_menu: false,
         match_type: None,
+        thumb: None,
     }
 }
 
@@ -3764,6 +3907,7 @@ fn service_hit(s: &services::Service) -> Hit {
         action: Action::Service(s.clone()),
         file_menu: false,
         match_type: None,
+        thumb: None,
     }
 }
 
@@ -3779,6 +3923,7 @@ fn claude_hit(ui: &Ui, query: &str) -> Option<Hit> {
         action: Action::Claude(query.to_string()),
         file_menu: false,
         match_type: None,
+        thumb: None,
     })
 }
 
@@ -3788,6 +3933,15 @@ fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
     }
     let icon = match &hit.action {
         Action::Web(_) | Action::WebIn(..) => search_provider::mark_image(28),
+        _ if hit.thumb.is_some() => {
+            let image = match hit.thumb.as_deref().filter(|t| !t.as_os_str().is_empty()) {
+                Some(t) => gtk::Image::from_file(t),
+                None => gtk::Image::from_gicon(hit.icon.as_ref().unwrap_or(&gio::ThemedIcon::new("image-x-generic").upcast())),
+            };
+            image.set_pixel_size(IMAGE_THUMB_PX);
+            image.add_css_class("omni-image-thumb");
+            image
+        }
         _ => {
             let image = match &hit.icon {
                 Some(i) => gtk::Image::from_gicon(i),
@@ -3801,6 +3955,8 @@ fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
     icon.set_valign(gtk::Align::Center);
 
     let query = ui.entry.text();
+    // `img cat`: highlight "cat" in file names, not the "img" of img_0042.png.
+    let query = images::parse(query.trim()).unwrap_or(query.as_str()).to_string();
     let title = gtk::Label::builder()
         .use_markup(true)
         .xalign(0.0)

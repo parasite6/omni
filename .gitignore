@@ -5,3 +5,16 @@ docs*
 .s*
 test*
 /isolated-mailcount/
+# Claude Code sandbox stubs: empty files it mounts /dev/null over while a command runs
+/.bash_profile
+/.bashrc
+/.profile
+/.zprofile
+/.zshrc
+/.gitconfig
+/.gitmodules
+/.ripgreprc
+/.mcp.json
+/.idea
+/.vscode
+/.claude/
