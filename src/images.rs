@@ -154,7 +154,8 @@ impl Images {
 
     /// Start the helper ahead of the first query (`img` typed), hiding its ~2 s start.
     pub fn warm(self: &Rc<Self>) {
-        if self.server.borrow().is_none() && installed() {
+        // Not after it failed to load: that would respawn it on every refresh.
+        if self.server.borrow().is_none() && installed() && !self.failed.get() {
             self.start_server();
         }
     }
@@ -391,6 +392,9 @@ impl Images {
                 let Some(me) = me.upgrade() else { return };
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
                 match v.get("event").and_then(|e| e.as_str()) {
+                    Some("folder") if v.get("queued").and_then(|q| q.as_bool()).unwrap_or(false) => {
+                        *fs.borrow_mut() = Some("queued".into());
+                    }
                     Some("folder") => *fs.borrow_mut() = v.get("state").and_then(|s| s.as_str()).map(String::from),
                     Some("done") => ac.set(v.get("added").and_then(|a| a.as_u64()).unwrap_or(0)),
                     Some("downloading") => me.set_crawl_status("Downloading the image model (about 900 MB)…".into()),
@@ -416,6 +420,9 @@ impl Images {
                 let n = added_count.get();
                 let images = |n: u64| format!("{n} new image{}", if n == 1 { "" } else { "s" });
                 let lead = match (added_label, folder_state.borrow().as_deref()) {
+                    (Some((name, _)), Some("queued")) => {
+                        format!("{name} is listed; another crawl was running, so the next one indexes it.")
+                    }
                     (Some((name, _)), Some("same")) if n == 0 => {
                         format!("{name} is already indexed: no new images. Add it again with Subdirectories on to take those too.")
                     }

@@ -164,15 +164,15 @@ window.omni {
 /* ---------- settings navigation ---------- */
 
 .omni-settings-slip {
-  min-width: 44px;
-  min-height: 44px;
+  min-width: 40px;
+  min-height: 56px;
 }
 
 .omni-settings-button {
   min-width: 36px;
   min-height: 36px;
   padding: 0;
-  margin: 4px;
+  margin: 0;
   color: alpha(white, 0.82);
   background-color: transparent;
   background-image: none;
@@ -314,6 +314,13 @@ list.omni-results > row:disabled {
 
 .omni-results row image {
   -gtk-icon-shadow: none;
+}
+
+/* Hinted glyphs can ink a pixel row below the text's measured box, and GTK repaints only
+   that box: swapping a long message for a short one left dashes of the old g/y descenders.
+   An invisible shadow (no blur: just a second glyph pass) widens the box by 2px each way. */
+list.omni-results label {
+  text-shadow: 0 2px alpha(black, 0.01), 0 -2px alpha(black, 0.01);
 }
 
 .omni-title {

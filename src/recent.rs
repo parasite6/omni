@@ -95,24 +95,12 @@ thread_local! {
     static MIME_ICONS: RefCell<HashMap<String, gio::Icon>> = RefCell::new(HashMap::new());
 }
 
-/// System theme icon for a file or folder at 28px (caller sets pixel size).
-/// Prefer `standard::icon` from Gio, then MIME-themed icon (cached), then generics.
+/// System theme icon for a file or folder at 28px (caller sets pixel size), from the
+/// MIME type its name implies (cached). Never touches the file: this runs on the GTK thread
+/// for every row, and reading a file on a hung mount there would freeze the popup.
 pub fn icon(path: &std::path::Path, is_dir: bool) -> gio::Icon {
     if is_dir {
         return gio::ThemedIcon::new("folder").upcast();
-    }
-    let file = gio::File::for_path(path);
-    if let Ok(info) = file.query_info(
-        "standard::icon,standard::content-type",
-        gio::FileQueryInfoFlags::NONE,
-        gio::Cancellable::NONE,
-    ) {
-        if let Some(icon) = info.icon() {
-            return icon;
-        }
-        if let Some(ct) = info.content_type() {
-            return mime_icon(&ct);
-        }
     }
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let (ct, _) = gio::content_type_guess(Some(name.as_str()), None);

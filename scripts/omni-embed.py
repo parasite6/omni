@@ -29,7 +29,12 @@ CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omni"
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "omni"
 MODEL_REPO = "onnx-community/embeddinggemma-2-ONNX"
 MODEL_DIR = DATA / "models/embeddinggemma-2"
+# Everything runs on the GPU (the CPU is the busy part of this machine). fp16 builds the
+# index; queries use the 4-bit text model: same top results in testing, ~160 MB less RAM
+# and a third of the VRAM, ~7 ms a query.
+QUERY_MODEL = "model_q4.onnx"
 MODEL_FILES = ["onnx/model_fp16.onnx", "onnx/model_fp16.onnx_data",
+               "onnx/model_q4.onnx", "onnx/model_q4.onnx_data",
                "onnx/vision_encoder_fp16.onnx", "onnx/vision_encoder_fp16.onnx_data",
                "*.json", "*.jinja"]
 INDEX_DIR = DATA / "images"
@@ -45,7 +50,7 @@ IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 MAX_BYTES = 64 << 20
 THUMB_PX = 160
 IDLE_EXIT = 10.0
-SAVE_EVERY = 50
+SAVE_EVERY_S = 60  # checkpoint by time: by count, a big first crawl rewrites the index N^2/50 times
 
 
 def emit(obj):
@@ -73,6 +78,12 @@ def read_folders():
 
 def folders():
     return [(d, r) for d, r in read_folders() if d.is_dir()]
+
+
+def missing_folders():
+    """Listed folders that aren't there right now (an unmounted drive): their images stay
+    indexed instead of being dropped and re-embedded when it comes back."""
+    return [d for d, _ in read_folders() if not d.is_dir()]
 
 
 def add_folder(d, recursive):
@@ -108,13 +119,21 @@ def thumb_path(path):
 
 def load_index():
     import numpy as np
+    empty = {"paths": [], "mtimes": [], "sizes": [], "vecs": np.zeros((0, 768), np.float16), "bad": {}}
     try:
         with np.load(INDEX, allow_pickle=False) as z:
             return {"paths": list(z["paths"]), "mtimes": z["mtimes"].tolist(),
                     "sizes": z["sizes"].tolist(), "vecs": z["vecs"],
                     "bad": dict(zip(list(z["bad_paths"]), z["bad_mtimes"].tolist()))}
-    except (FileNotFoundError, KeyError, ValueError, OSError):
-        return {"paths": [], "mtimes": [], "sizes": [], "vecs": np.zeros((0, 768), np.float16), "bad": {}}
+    except FileNotFoundError:
+        return empty
+    except Exception as e:  # truncated or corrupt (BadZipFile, ...): set it aside and rebuild
+        print(f"omni-embed: index unreadable ({e}); rebuilding", file=sys.stderr)
+        try:
+            INDEX.replace(INDEX.with_name("index.corrupt.npz"))
+        except OSError:
+            pass
+        return empty
 
 
 def save_index(paths, mtimes, sizes, vecs, bad):
@@ -125,26 +144,49 @@ def save_index(paths, mtimes, sizes, vecs, bad):
              sizes=np.array(sizes, dtype=np.int64),
              vecs=np.asarray(vecs, np.float16).reshape(-1, 768),
              bad_paths=np.array(list(bad), dtype=str), bad_mtimes=np.array(list(bad.values()), dtype=np.int64))
+    with open(tmp, "rb") as f:
+        os.fsync(f.fileno())  # a crash right after the rename must not leave an empty index
     tmp.replace(INDEX)
     STATUS.write_text(json.dumps({"count": len(paths), "finished": int(time.time())}))
 
 
 # ---- model ----
 
-def session(name):
+def session(name, gpu=True):
     import onnxruntime as ort
-    try:
-        ort.preload_dlls()  # the pip CUDA/cuDNN libraries
-    except Exception:
-        pass
     opts = ort.SessionOptions()
     opts.log_severity_level = 3
-    providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in ort.get_available_providers()]
-    return ort.InferenceSession(str(MODEL_DIR / "onnx" / name), opts, providers=providers)
+    if gpu:
+        try:
+            ort.preload_dlls()  # the pip CUDA/cuDNN libraries
+        except Exception:
+            pass
+        providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in ort.get_available_providers()]
+    else:
+        providers = ["CPUExecutionProvider"]
+        opts.intra_op_num_threads = min(4, os.cpu_count() or 1)  # ~30 ms a query; leave cores free
+    if providers[0] == "CUDAExecutionProvider":
+        # Keep RAM for the rest of the system: weights go straight to the GPU, and the few
+        # CPU-side shape ops don't need a cached arena.
+        opts.add_session_config_entry("session.use_device_allocator_for_initializers", "1")
+        opts.enable_cpu_mem_arena = False
+    sess = ort.InferenceSession(str(MODEL_DIR / "onnx" / name), opts, providers=providers)
+    trim_heap()
+    return sess
+
+
+def trim_heap():
+    """Hand freed load-time buffers back to the OS instead of keeping them in our heap."""
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
 
 
 def ensure_model():
-    need = ["onnx/model_fp16.onnx_data", "onnx/vision_encoder_fp16.onnx_data", "tokenizer.json", "processor_config.json"]
+    need = ["onnx/model_fp16.onnx_data", "onnx/vision_encoder_fp16.onnx_data", f"onnx/{QUERY_MODEL}_data",
+            "tokenizer.json", "processor_config.json"]
     if all((MODEL_DIR / n).exists() for n in need):
         return
     emit({"event": "downloading"})
@@ -155,12 +197,12 @@ def ensure_model():
 class Text:
     """The text side: tokenizer + the main transformer. Images also go through it."""
 
-    def __init__(self):
+    def __init__(self, name="model_fp16.onnx", gpu=True):
         import numpy as np
         from tokenizers import Tokenizer
         self.np = np
         self.tok = Tokenizer.from_file(str(MODEL_DIR / "tokenizer.json"))
-        self.sess = session("model_fp16.onnx")
+        self.sess = session(name, gpu)
         self.none = np.zeros((0, 512), np.float32)
 
     def embed(self, text, image_features=None):
@@ -177,11 +219,14 @@ class Text:
 
 def serve():
     import numpy as np
-    if not (MODEL_DIR / "onnx/model_fp16.onnx_data").exists():
-        text = None
+    if (MODEL_DIR / f"onnx/{QUERY_MODEL}_data").exists():
+        text = Text(QUERY_MODEL)
+    elif (MODEL_DIR / "onnx/model_fp16.onnx_data").exists():
+        text = Text()  # installed before the 4-bit model: the next crawl downloads it
     else:
-        text = Text()
+        text = None
     index, index_mtime = None, -1  # -1: load on the first query even with no index file
+    trimmed = False
     emit({"event": "ready"})
     while True:
         r, _, _ = select.select([sys.stdin], [], [], IDLE_EXIT)
@@ -202,12 +247,15 @@ def serve():
                 m = None
             if m != index_mtime:
                 index, index_mtime = load_index(), m
-                vecs = index["vecs"].astype(np.float32)
+                vecs = index["vecs"]  # float16 as stored: half the RAM of a float32 copy
             if text is None or not index["paths"]:
                 emit({"q": q, "hits": [], "empty": True})
                 continue
             qv = text.embed(QUERY_PREFIX + q)
-            sims = vecs @ qv
+            if not trimmed:
+                trimmed = True
+                trim_heap()  # the first run loads the GPU kernels; drop its scratch buffers
+            sims = (vecs @ qv.astype(np.float16)).astype(np.float32)
             hits = []
             for i in np.argsort(-sims):
                 p = index["paths"][i]
@@ -246,7 +294,21 @@ def candidates():
 def make_thumb(im, p):
     th = im.copy()
     th.thumbnail((THUMB_PX, THUMB_PX))
-    th.save(thumb_path(p))
+    dest = thumb_path(p)
+    tmp = dest.with_name(dest.stem + ".tmp.png")
+    th.save(tmp)  # then rename: a killed crawl never leaves a half-written thumbnail behind
+    tmp.replace(dest)
+
+
+def prune_thumbs(paths):
+    """Thumbnails of images no longer indexed (deleted, moved, folder removed)."""
+    keep = {thumb_path(p).name for p in paths}
+    try:
+        for f in THUMBS.iterdir():
+            if f.name not in keep:
+                f.unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass
 
 
 def fill_thumbs(paths):
@@ -291,9 +353,9 @@ def crawl(add=None, recursive=False, fast=False):
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        emit({"event": "busy"})  # another crawl is running; it will pick the new folder up next time
-        if add:
-            add_folder(add, recursive)
+        if add:  # another crawl is running: the folder is listed now, indexed by the next crawl
+            emit({"event": "folder", "state": add_folder(add, recursive), "queued": True})
+        emit({"event": "busy"})
         return
     workers = room_to_go_fast() if fast else 0
     if not workers:
@@ -302,15 +364,19 @@ def crawl(add=None, recursive=False, fast=False):
         emit({"event": "folder", "state": add_folder(add, recursive)})
     found = candidates()
     old = load_index()
+    away = [str(d).rstrip("/") + "/" for d in missing_folders()]
     paths, mtimes, sizes, vecs = [], [], [], []
     for i, p in enumerate(old["paths"]):
-        if found.get(p) == (old["mtimes"][i], old["sizes"][i]):
+        unchanged = found.get(p) == (old["mtimes"][i], old["sizes"][i])
+        if unchanged or (p not in found and any(p.startswith(a) for a in away)):
             paths.append(p); mtimes.append(old["mtimes"][i]); sizes.append(old["sizes"][i]); vecs.append(old["vecs"][i])
-    bad = {p: m for p, m in old["bad"].items() if p in found and found[p][0] == m}
+    bad = {p: m for p, m in old["bad"].items() if (p in found and found[p][0] == m) or any(p.startswith(a) for a in away)}
     known = set(paths)
     todo = [p for p in found if p not in known and p not in bad]
     removed = len(old["paths"]) - len(paths)
-    fill_thumbs(paths)
+    fill_thumbs([p for p in paths if p in found])
+    if not away:  # with a folder away, its thumbnails are still wanted
+        prune_thumbs(paths)
     if not todo:
         if removed or len(bad) != len(old["bad"]):
             save_index(paths, mtimes, sizes, vecs, bad)
@@ -367,6 +433,7 @@ def crawl(add=None, recursive=False, fast=False):
                     yield p, e
 
     added = 0
+    last_save = time.monotonic()
     emit({"event": "progress", "done": 0, "total": len(todo), "fast": bool(workers)})
     for n, (p, o) in enumerate(prepared(), 1):
         try:
@@ -381,8 +448,9 @@ def crawl(add=None, recursive=False, fast=False):
         except Exception as e:  # unreadable or odd image: skip it until it changes
             bad[p] = found[p][0]
             print(f"omni-embed: skipped {p}: {e}", file=sys.stderr)
-        if n % SAVE_EVERY == 0:
+        if time.monotonic() - last_save >= SAVE_EVERY_S:
             save_index(paths, mtimes, sizes, vecs, bad)
+            last_save = time.monotonic()
         emit({"event": "progress", "done": n, "total": len(todo)})
     save_index(paths, mtimes, sizes, vecs, bad)
     emit({"event": "done", "count": len(paths), "added": added, "removed": removed})

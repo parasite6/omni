@@ -43,28 +43,9 @@ pub const MODELS: [(&str, &str); 4] = [
     ("claude-fable-5-1", "Fable 5.1"),
 ];
 pub const EFFORTS: [(&str, &str); 5] = [("low", "Low"), ("medium", "Medium"), ("high", "High"), ("xhigh", "Extra"), ("max", "Max")];
-/// The user's own agent instructions (identity, AgentMail rules, files, fail-safe),
+/// The user's own agent instructions,
 /// appended after the launcher instructions above. Edit src/agent_prompt.md and reinstall.
 const AGENT_PROMPT: &str = include_str!("agent_prompt.md");
-
-/// AgentMail tools the agent instructions reserve for the user. Denied outright, so no
-/// email or prompt injection can get them used, whatever the model decides.
-const AGENTMAIL_USER_ONLY: [&str; 9] = [
-    "create_inbox", "update_inbox", "delete_inbox", "delete_thread", "delete_list_entry",
-    "connect_provider", "connect_app", "agent_attach_human", "agent_verify",
-];
-
-/// AgentMail tools that only read. Not pre-approved: a prompt still appears unless every
-/// inbox field is the contactai inbox (or there is no inbox field). Sends and changes are
-/// in AGENTMAIL_USER_ONLY and stay disallowed. See `agentmail_read_is_contactai`.
-const AGENTMAIL_READ_ONLY: [&str; 14] = [
-    "list_inboxes", "get_inbox", "search_inboxes", "list_threads", "get_thread", "search_threads",
-    "list_messages", "get_message", "search_messages", "get_attachment", "list_drafts", "get_draft",
-    "list_list_entries", "get_list_entry",
-];
-const AGENTMAIL: &str = "mcp__claude_ai_AgentMail__";
-/// The only inbox a read may touch without asking. The agent prompt names this address.
-const CONTACTAI_INBOX: &str = "assistant@example.com";
 
 /// Tools Claude may use. WebSearch alone is pre-approved (it only sends a query); the rest
 /// go through Claude Code's permission checks and omni's prompt.
@@ -77,7 +58,7 @@ const PRE_APPROVED: &str = "WebSearch";
 /// `~/.s?h/id_ed25519` slipped past them in testing; the sandbox hides the path itself).
 /// Whole directories, not the one file inside them: a rule for `~/.docker/config.json` still
 /// left the rest of `~/.docker` readable. A secret that is itself a file stays listed too.
-const SECRETS: [&str; 88] = [
+const SECRETS: &[&str] = &[
     "~/.ssh", "~/.gnupg", "~/.pki", "~/.local/share/pki", "~/.cert", "~/.config/wireguard", "~/.config/kdeconnect",
     "~/.aws", "~/.azure", "~/.config/gcloud", "~/.config/gh", "~/.kube",
     "~/.local/share/keyrings", "~/.local/share/kwalletd", "~/.config/kwalletrc", "~/.password-store",
@@ -98,6 +79,11 @@ const SECRETS: [&str; 88] = [
     "~/.zsh_history", "~/.bash_history", "~/.histfile", "~/.viminfo", "~/.python_history", "~/.node_repl_history",
     "~/.lesshst", "~/.wget-hsts", "~/.mysql_history", "~/.psql_history", "~/.sqlite_history",
     "~/.cache/huggingface",
+    // Build-tool, cloud and database credentials; password-manager and CLI token stores.
+    "~/.m2", "~/.gradle", "~/.terraform.d", "~/.vault-token", "~/.s3cfg", "~/.pgpass", "~/.my.cnf",
+    "~/.gem", "~/.composer", "~/.config/op", "~/.config/1Password", "~/.config/keepassxc",
+    "~/.config/hub", "~/.config/doctl", "~/.config/helm", "~/.config/heroku", "~/.config/containers",
+    "~/.config/pip",
 ];
 
 /// Never writable by shell commands, even approved ones: files that run later as code
@@ -771,7 +757,7 @@ impl Answer {
             return; // stray output between turns
         }
         // Claude Code sometimes starts before the claude.ai connector list arrives (about one
-        // start in four in testing) and then has no AgentMail, Calendar, ... for the whole
+        // start in four in testing) and then has no Calendar, Notion, ... for the whole
         // conversation. If connectors worked before, restart and resend before any text.
         if event["type"] == "system" && event["subtype"] == "init" {
             let has = event["mcp_servers"].as_array().is_some_and(|s| s.iter().any(|x| x["name"].as_str().is_some_and(|n| n.starts_with("claude.ai "))));
@@ -847,20 +833,6 @@ impl Answer {
         let id = event["request_id"].as_str().unwrap_or_default().to_string();
         let request = &event["request"];
         if request["subtype"] == "can_use_tool" && self.busy.get() && !id.is_empty() {
-            let tool_name = request["tool_name"].as_str().unwrap_or_default();
-            // Reads of the contactai inbox (and list calls that name no inbox) skip the
-            // prompt. Any other inbox is shown like a normal request. Same payload as Once.
-            if agentmail_read_is_contactai(tool_name, &request["input"]) {
-                self.send_line(serde_json::json!({
-                    "type": "control_response",
-                    "response": {
-                        "subtype": "success",
-                        "request_id": id,
-                        "response": { "behavior": "allow", "updatedInput": request["input"] },
-                    },
-                }));
-                return;
-            }
             let first = self.pending.borrow().is_empty();
             self.pending.borrow_mut().push_back((id, request.clone()));
             if first {
@@ -1202,7 +1174,6 @@ fn spawn(model: &str, effort: &str) -> Result<(gio::Subprocess, Option<String>),
     let denied: String = SECRETS
         .iter()
         .flat_map(|p| [format!("Read({p})"), format!("Read({p}/**)"), format!("Edit({p})"), format!("Edit({p}/**)")])
-        .chain(AGENTMAIL_USER_ONLY.iter().map(|t| format!("{AGENTMAIL}{t}")))
         .collect::<Vec<_>>()
         .join(",");
     let system = format!("{SYSTEM}\n\n{AGENT_PROMPT}");
@@ -1218,7 +1189,7 @@ fn spawn(model: &str, effort: &str) -> Result<(gio::Subprocess, Option<String>),
             "allowUnsandboxedCommands": false,
             "autoAllowBashIfSandboxed": false,
             // A slice: serde_json only implements Serialize for arrays up to 32.
-            "filesystem": { "denyRead": SECRETS.as_slice(), "denyWrite": PROTECTED.as_slice() },
+            "filesystem": { "denyRead": SECRETS, "denyWrite": PROTECTED.as_slice() },
         }
     })
     .to_string();
@@ -1249,7 +1220,7 @@ fn spawn(model: &str, effort: &str) -> Result<(gio::Subprocess, Option<String>),
         // Permission prompts come to omni as control requests on stdout.
         "--permission-prompt-tool".as_ref(),
         "stdio".as_ref(),
-        // No --strict-mcp-config: the user's claude.ai connectors (AgentMail, Calendar,
+        // No --strict-mcp-config: the user's claude.ai connectors (Calendar,
         // Notion, ...) load, each call asking permission like any other tool. Local plugins
         // and their hooks don't: --setting-sources stays empty.
         "--setting-sources".as_ref(),
@@ -1354,7 +1325,7 @@ fn describe(request: &serde_json::Value) -> PermissionAsk {
         "Glob" | "Grep" => ("Claude wants to search files".to_string(), format!("{} {}", s("pattern"), s("path")).trim().to_string()),
         "WebFetch" => ("Claude wants to open a web page".to_string(), s("url")),
         "SandboxNetworkAccess" => ("A command Claude is running wants to reach the network".to_string(), s("host")),
-        // A connector's tool, "mcp__claude_ai_AgentMail__send_message": "AgentMail: send message".
+        // A connector's tool, "mcp__claude_ai_Gmail__send_message": "Gmail: send message".
         other if other.starts_with("mcp__") => {
             let rest = &other[5..];
             let (server, tool) = rest.split_once("__").unwrap_or((rest, ""));
@@ -1498,30 +1469,6 @@ fn trim_log(log: &mut String) {
     if log.len() > 8192 {
         let cut = log.floor_char_boundary(log.len() - 4096);
         log.drain(..cut);
-    }
-}
-
-/// True when this AgentMail read may run without a prompt: the tool only reads, and
-/// every string under a key that contains "inbox" is absent or the contactai address.
-/// `list_inboxes` has no such field, so it passes. A send/delete tool does not.
-fn agentmail_read_is_contactai(tool: &str, input: &serde_json::Value) -> bool {
-    let Some(name) = tool.strip_prefix(AGENTMAIL) else { return false };
-    AGENTMAIL_READ_ONLY.contains(&name) && inbox_only_contactai(input, false)
-}
-
-/// `from_inbox_key`: `value` is the contents of a field whose name contains "inbox"
-/// (`inbox_id`, `inbox`, `inboxId`, …). Strings there must be the contactai inbox;
-/// arrays under that key are held to the same rule. Other keys are only walked.
-fn inbox_only_contactai(value: &serde_json::Value, from_inbox_key: bool) -> bool {
-    match value {
-        // A value under an inbox key has to be the address itself. An object or array
-        // there is not that address, even when its nested keys don't say "inbox".
-        serde_json::Value::Object(map) if !from_inbox_key => map.iter().all(|(k, v)| {
-            inbox_only_contactai(v, k.to_ascii_lowercase().contains("inbox"))
-        }),
-        serde_json::Value::Array(items) if !from_inbox_key => items.iter().all(|v| inbox_only_contactai(v, false)),
-        serde_json::Value::String(s) => !from_inbox_key || s == CONTACTAI_INBOX,
-        _ => !from_inbox_key,
     }
 }
 
@@ -1821,8 +1768,8 @@ mod tests {
         let all = serde_json::json!({ "tool_name": "Edit", "input": { "file_path": "/x", "old_string": "a", "new_string": "b", "replace_all": true } });
         assert!(describe(&all).detail.contains("replaces every match"));
         // Extra directories are never granted by "Always".
-        let mail = serde_json::json!({ "tool_name": "mcp__claude_ai_AgentMail__send_message", "input": { "to": "a@b.c" } });
-        assert_eq!(describe(&mail).title, "Claude wants to use AgentMail: send message");
+        let mail = serde_json::json!({ "tool_name": "mcp__claude_ai_Gmail__send_message", "input": { "to": "a@b.c" } });
+        assert_eq!(describe(&mail).title, "Claude wants to use Gmail: send message");
         assert!(describe(&mail).detail.contains("a@b.c")); // the input is shown
         let dirs = serde_json::json!({ "tool_name": "Read", "input": {}, "permission_suggestions": [{ "type": "addDirectories", "directories": ["/"] }] });
         assert!(describe(&dirs).remember.is_none() && remembered(&dirs).is_empty());
@@ -1856,8 +1803,8 @@ mod tests {
             "//x"
         );
 
-        let asking = format!("{AGENTMAIL}get_message");
-        let other = format!("{AGENTMAIL}list_inboxes");
+        let asking = "mcp__claude_ai_Calendar__get_event".to_string();
+        let other = "mcp__claude_ai_Calendar__list_calendars".to_string();
         let wrong = serde_json::json!({
             "tool_name": asking,
             "input": {},
@@ -1881,24 +1828,6 @@ mod tests {
         });
         assert_eq!(remembered(&sneaky)[0]["rules"][0]["ruleContent"], "//tmp/notes");
         assert!(!serde_json::to_string(&remembered(&sneaky)).unwrap().contains(".bashrc"));
-    }
-
-    #[test]
-    fn agentmail_reads_only_the_contactai_inbox() {
-        let list = format!("{AGENTMAIL}list_inboxes");
-        assert!(agentmail_read_is_contactai(&list, &serde_json::json!({})));
-        let get = format!("{AGENTMAIL}get_message");
-        assert!(agentmail_read_is_contactai(&get, &serde_json::json!({ "inbox_id": CONTACTAI_INBOX })));
-        assert!(agentmail_read_is_contactai(&get, &serde_json::json!({})));
-        assert!(!agentmail_read_is_contactai(&get, &serde_json::json!({ "inbox": "other@example.com" })));
-        assert!(!agentmail_read_is_contactai(&get, &serde_json::json!({ "inboxId": "other@example.com" })));
-        assert!(!agentmail_read_is_contactai(&get, &serde_json::json!({ "nested": { "inbox_id": "other@example.com" } })));
-        assert!(!agentmail_read_is_contactai(&get, &serde_json::json!({ "inbox_id": { "id": "other@example.com" } })));
-        assert!(!agentmail_read_is_contactai(&get, &serde_json::json!({ "inbox_id": ["other@example.com"] })));
-        assert!(!agentmail_read_is_contactai(&get, &serde_json::json!({ "inbox_id": null })));
-        let del = format!("{AGENTMAIL}delete_inbox");
-        assert!(!agentmail_read_is_contactai(&del, &serde_json::json!({ "inbox_id": CONTACTAI_INBOX })));
-        assert!(!agentmail_read_is_contactai("Bash", &serde_json::json!({})));
     }
 
     #[test]

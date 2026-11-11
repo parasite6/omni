@@ -327,7 +327,7 @@ Right-click the web row (or `Menu` / `Shift`＋`F10`) to search in a:
 
 Type `img`, a space, and a description (`img red terminal`, `img cat on a couch`). Results are your pictures ranked by what's *in* them, with thumbnails; `Enter` and right-click work like any file.
 
-- **Model:** [embeddinggemma-2](https://huggingface.co/google/embeddinggemma-2) (ONNX fp16, about 900 MB, downloaded on the first crawl to `~/.local/share/omni/models`). It runs in `omni-embed.py` on the GPU, from its own venv (`~/.local/share/omni/embed-venv`, made by `install.sh` with `uv`; onnxruntime-gpu brings its own CUDA and cuDNN).
+- **Model:** [embeddinggemma-2](https://huggingface.co/google/embeddinggemma-2) (ONNX, about 1.05 GB, downloaded on the first crawl to `~/.local/share/omni/models`). It runs in `omni-embed.py` from its own venv (`~/.local/share/omni/embed-venv`, made by `install.sh` with `uv`; onnxruntime-gpu brings its own CUDA and cuDNN). Indexing runs the fp16 vision and text models on the GPU. Queries also run on the GPU, with the 4-bit text model: same top results as fp16 in testing, about 160 MB less RAM, about 7 ms per query. Installs from before this change keep using fp16 until the next crawl downloads the 4-bit model.
 - **Querying loads only the text side** (~540 MB). Typing `img` starts it (about 2 s), each query then takes a few ms, and it exits **10 s after the last query**.
 - **Indexing** loads the vision encoder too, embeds only new or changed images, then exits. A crawl with nothing new never loads the model. The hourly crawl stays out of the way (low priority, one image at a time, ~0.23 s each). **Index now** and adding a folder go full speed (decoding on worker threads while the GPU encodes, ~0.13 s each) when there's ≥1.8 GB free VRAM and ≥3 GB free RAM, otherwise they fall back to the gentle pace.
 - **When:** quietly 10 s after omni starts, then hourly. Settings → **Image search** turns that off; **Index now** runs it.
@@ -357,7 +357,7 @@ Press `Shift`＋`Enter` on anything you typed. omni runs the **Claude Code CLI**
 
 ### Tools and safety
 
-- **Tools:** web search/fetch, read/glob/grep, Bash (in a bubblewrap sandbox), edit and write, plus your claude.ai connectors (AgentMail, Calendar, …).
+- **Tools:** web search/fetch, read/glob/grep, Bash (in a bubblewrap sandbox), edit and write, plus your claude.ai connectors (Calendar, …).
 - **No local settings, plugins or hooks** (`--setting-sources ""`).
 - Anything that changes something asks on a dimmed prompt: **Deny** / **Allow once** / **Always allow** (this conversation only, and only for the exact command or file on screen).
 - **Secrets are unreadable** (`~/.ssh`, `~/.claude`, keyrings, browser profiles, shell histories, `~/.var/app`, …).
@@ -718,18 +718,15 @@ Each attack below was tested against Claude Code with omni's exact flags.
 
 ### 2026-10-11: claude.ai connectors
 
-- omni's Claude used to start with `--strict-mcp-config`, which loaded no MCP servers at all, so "use my AgentMail" had no tool and Claude went looking for a CLI.
-- That flag is gone, and `--setting-sources ""` stays. Your **claude.ai connectors** load (AgentMail, Google Calendar, Notion, Dropbox, Spotify, Hugging Face, …), but local plugins and their hooks don't. This costs about 2 s at conversation start.
-- Connector calls ask, like any other tool, with a readable title ("Claude wants to use AgentMail: List Inboxes") and the full input. Sending an email always shows what's being sent. "Always allow" for a connector covers that one tool for the rest of the chat, not a different one.
-- AgentMail reads of `assistant@example.com` (and list calls that name no inbox) run without a prompt. A read that names any other inbox asks.
+- omni's Claude used to start with `--strict-mcp-config`, which loaded no MCP servers at all, so "use my calendar" had no tool and Claude went looking for a CLI.
+- That flag is gone, and `--setting-sources ""` stays. Your **claude.ai connectors** load (Google Calendar, Notion, Dropbox, Spotify, Hugging Face, …), but local plugins and their hooks don't. This costs about 2 s at conversation start.
+- Connector calls ask, like any other tool, with a readable title ("Claude wants to use Google Calendar: List Events") and the full input. Sending an email always shows what's being sent. "Always allow" for a connector covers that one tool for the rest of the chat, not a different one.
 
 ### 2026-10-11: agent instructions
 
-- Your agent instructions live in `src/agent_prompt.md`: identity "Contact AI Agent", AgentMail rules, the `assistant@example.com` inbox, the injection protocol, the limit, the files and the fail-safe. omni appends them after its own launcher instructions. Edit that file and run `./install.sh` to change them.
-- **Enforced by omni, not just requested:**
-  - The AgentMail tools the instructions reserve for you are **denied outright**: `create_inbox`, `update_inbox`, `delete_inbox`, `delete_thread`, `delete_list_entry`, `connect_provider`, `agent_attach_human`, `agent_verify`, plus `connect_app`, the connector's actual "connect" tool. No email or injection can get them used.
-  - AgentMail's read-only tools (list, get or search inboxes, threads, messages, drafts, list entries; attachments) run without a prompt only when every inbox field is `assistant@example.com` or absent. Any other inbox asks. Sending, replying, forwarding, drafts and list changes still show omni's prompt, on top of the in-chat confirmation the instructions require.
-- **Connector race workaround:** Claude Code sometimes starts before the claude.ai connector list arrives (1 in 4 to 1 in 3 starts in testing) and then has no AgentMail for the whole conversation. When a start reports no connectors, omni restarts it and resends the message before any text appears, up to 3 times. If an account genuinely has none, it stops retrying. Simulated over 6 conversations: 6/6 got their connectors.
+- Your agent instructions live in `src/agent_prompt.md` (web search for current facts, no self-identifying tags). omni appends them after its own launcher instructions. Edit that file and run `./install.sh` to change them.
+- 2026-11-11: the AgentMail integration was removed: its email rules, inbox, injection protocol, limit, files and fail-safe left the instructions, and omni no longer denies AgentMail's admin tools or auto-approves its reads. A connected AgentMail would now ask like any other connector.
+- **Connector race workaround:** Claude Code sometimes starts before the claude.ai connector list arrives (1 in 4 to 1 in 3 starts in testing) and then has no connectors for the whole conversation. When a start reports no connectors, omni restarts it and resends the message before any text appears, up to 3 times. If an account genuinely has none, it stops retrying. Simulated over 6 conversations: 6/6 got their connectors.
 
 ### 2026-10-11: final audit (permissions, restarts, crash triggers)
 

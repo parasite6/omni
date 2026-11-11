@@ -47,9 +47,14 @@ const STAT_TIMEOUT: Duration = Duration::from_millis(200);
 /// what it already has instead of blocking forever.
 const DIR_JOB_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One stat batch at a time. A stuck stat cannot be cancelled, so a later keystroke
-/// skips the check rather than leaking a thread per keystroke.
+/// One stat batch at a time per lane. A stuck stat cannot be cancelled, so a later caller
+/// skips the check rather than leaking a thread per keystroke. Two lanes: background work
+/// (the walker's cleanup, live updates from LocalSearch) never makes a keystroke's search
+/// come back empty, and a burst of live updates can't starve the popup.
 static STAT_BUSY: AtomicBool = AtomicBool::new(false);
+static STAT_BUSY_BG: AtomicBool = AtomicBool::new(false);
+/// Live-update URNs held while no index exists yet (see the live thread).
+const LIVE_QUEUE_CAP: usize = 50_000;
 
 /// Parallel tests would otherwise flake on `STAT_BUSY`. Production skips instead of waiting.
 #[cfg(test)]
@@ -1009,11 +1014,20 @@ pub(crate) struct BatchResult<T> {
 /// is left running (`cancel` is set so it stops between paths) and is not joined.
 /// Do not call this while holding the index mutex, and do not call it from inside `work`.
 pub(crate) fn timed_batch<T: Send + 'static>(work: impl FnOnce(&mpsc::Sender<T>, &AtomicBool) + Send + 'static) -> Option<BatchResult<T>> {
+    timed_batch_on(&STAT_BUSY, work)
+}
+
+/// [`timed_batch`] for background threads (walker, live updates): its own gate.
+fn timed_batch_bg<T: Send + 'static>(work: impl FnOnce(&mpsc::Sender<T>, &AtomicBool) + Send + 'static) -> Option<BatchResult<T>> {
+    timed_batch_on(&STAT_BUSY_BG, work)
+}
+
+fn timed_batch_on<T: Send + 'static>(gate: &'static AtomicBool, work: impl FnOnce(&mpsc::Sender<T>, &AtomicBool) + Send + 'static) -> Option<BatchResult<T>> {
     // Tests run in parallel; production skips when a batch is already running.
     #[cfg(test)]
     let _serialize = STAT_TEST_LOCK.lock().unwrap();
 
-    if STAT_BUSY.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    if gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
         return None;
     }
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1024,18 +1038,19 @@ pub(crate) fn timed_batch<T: Send + 'static>(work: impl FnOnce(&mpsc::Sender<T>,
         // by the time it sees the channel disconnect.
         struct Done<T> {
             tx: Option<mpsc::Sender<T>>,
+            gate: &'static AtomicBool,
         }
         impl<T> Drop for Done<T> {
             fn drop(&mut self) {
-                STAT_BUSY.store(false, Ordering::Release);
+                self.gate.store(false, Ordering::Release);
                 self.tx.take();
             }
         }
-        let done = Done { tx: Some(tx) };
+        let done = Done { tx: Some(tx), gate };
         work(done.tx.as_ref().unwrap(), worker_cancel.as_ref());
     });
     if spawned.is_err() {
-        STAT_BUSY.store(false, Ordering::Release);
+        gate.store(false, Ordering::Release);
         return None;
     }
     let deadline = std::time::Instant::now() + STAT_TIMEOUT;
@@ -1057,6 +1072,17 @@ pub(crate) fn timed_batch<T: Send + 'static>(work: impl FnOnce(&mpsc::Sender<T>,
     Some(BatchResult { items, finished })
 }
 
+/// `path.is_dir()` off the caller thread: `None` when the stat didn't come back in time
+/// (a hung mount) or another stat is still stuck. For the GTK thread, which the watchdog
+/// kills if it blocks.
+pub fn is_dir_timed(path: &std::path::Path) -> Option<bool> {
+    let path = path.to_path_buf();
+    let batch = timed_batch(move |tx, _cancel| {
+        let _ = tx.send(path.is_dir());
+    })?;
+    batch.items.into_iter().next()
+}
+
 /// Canonicalize `path` off the caller thread. `None` if that stat was skipped (hung mount
 /// or another batch still running): the caller treats the scope as missing.
 fn canonicalize_within(path: &std::path::Path) -> Option<PathBuf> {
@@ -1069,7 +1095,8 @@ fn canonicalize_within(path: &std::path::Path) -> Option<PathBuf> {
     batch.items.into_iter().next()
 }
 
-/// Drop hits whose path no longer exists. A skipped or timed-out stat counts as missing.
+/// Drop hits whose path no longer exists. A timed-out stat counts as missing; a skipped
+/// batch (another stat still stuck) keeps them all unverified rather than showing nothing.
 fn drop_missing(hits: Vec<FileHit>) -> Vec<FileHit> {
     if hits.is_empty() {
         return hits;
@@ -1085,7 +1112,7 @@ fn drop_missing(hits: Vec<FileHit>) -> Vec<FileHit> {
             }
         }
     }) else {
-        return Vec::new();
+        return hits;
     };
     let mut keep = vec![false; hits.len()];
     for (i, exists) in batch.items {
@@ -1102,7 +1129,7 @@ fn extras_to_drop(items: &[(PathBuf, bool)], started_at: i64) -> HashSet<PathBuf
         return HashSet::new();
     }
     let paths: Vec<PathBuf> = items.iter().map(|(path, _)| path.clone()).collect();
-    let Some(batch) = timed_batch(move |tx, cancel| {
+    let Some(batch) = timed_batch_bg(move |tx, cancel| {
         for (i, path) in paths.into_iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 return;
@@ -1210,15 +1237,16 @@ pub fn start_walker(shared: Shared, every: std::time::Duration) {
 }
 
 /// Resolve one queue of URNs. Stops at the first stat batch that times out or is skipped,
-/// so a wedged path doesn't turn into a thread per path.
-fn apply_live(conn: &crate::sparql::Connection, shared: &Shared, urns: &[String], since: i64) {
+/// so a wedged path doesn't turn into a thread per path. Returns the URNs it never got to
+/// (a batch was skipped) so the caller queues them again instead of losing those files.
+fn apply_live(conn: &crate::sparql::Connection, shared: &Shared, urns: &[String], since: i64) -> Vec<String> {
     let not_before = since - 2;
-    for chunk in urns.chunks(500) {
+    for (n, chunk) in urns.chunks(500).enumerate() {
         let paths = resolve_urns(conn, chunk);
         if paths.is_empty() {
             continue;
         }
-        let Some(batch) = timed_batch(move |tx, cancel| {
+        let Some(batch) = timed_batch_bg(move |tx, cancel| {
             for path in paths {
                 if cancel.load(Ordering::Relaxed) {
                     return;
@@ -1233,7 +1261,7 @@ fn apply_live(conn: &crate::sparql::Connection, shared: &Shared, urns: &[String]
                 }
             }
         }) else {
-            return; // a stat batch is already running
+            return urns[n * 500..].to_vec(); // a stat batch is still stuck: retry later
         };
         let finished = batch.finished;
         if !batch.items.is_empty() {
@@ -1244,9 +1272,10 @@ fn apply_live(conn: &crate::sparql::Connection, shared: &Shared, urns: &[String]
             }
         }
         if !finished {
-            return; // this path wedged: skip the rest of the batch
+            return Vec::new(); // this path wedged: skip the rest of the batch
         }
     }
+    Vec::new()
 }
 
 /// The live-update worker: takes LocalSearch event URNs from a queue, resolves them in
@@ -1283,6 +1312,9 @@ pub fn start_live_worker(conn: Arc<crate::sparql::Connection>, shared: Shared) -
             // The first batch applied after the index appears uses walk_started, not `since`
             // (that has already moved to the end of the walk). Later batches use `since`.
             let mut caught_up = false;
+            // URNs handed back because a stat was stuck (hung mount): retried this much later,
+            // not on every 250ms wake, which would re-run their SPARQL lookup each time.
+            let mut retry_at: Option<std::time::Instant> = None;
             loop {
                 let mut disconnected = false;
                 if queued.is_empty() {
@@ -1301,6 +1333,13 @@ pub fn start_live_worker(conn: Arc<crate::sparql::Connection>, shared: Shared) -
                 }
                 loop {
                     match bound_rx.try_recv() {
+                        // Before the first index exists nothing drains this; a re-index at
+                        // login could grow it without bound. Past the cap, drop and ask for
+                        // a fresh walk (overflow), which finds those files instead.
+                        Ok(more) if queued.len() >= LIVE_QUEUE_CAP => {
+                            drop(more);
+                            shared.lock().unwrap().1.overflow = true;
+                        }
                         Ok(more) => queued.extend(more),
                         Err(mpsc::TryRecvError::Empty) => break,
                         Err(mpsc::TryRecvError::Disconnected) => {
@@ -1315,7 +1354,8 @@ pub fn start_live_worker(conn: Arc<crate::sparql::Connection>, shared: Shared) -
                         (guard.0.is_some(), guard.1.since, guard.1.walk_started)
                     };
                     // No index yet: keep the URNs and wait. recv_timeout above is the wait.
-                    if ready && (since != 0 || started != 0) {
+                    let backing_off = retry_at.is_some_and(|t| std::time::Instant::now() < t);
+                    if ready && (since != 0 || started != 0) && !backing_off {
                         let cutoff = if !caught_up {
                             caught_up = true;
                             if started != 0 { started } else { since }
@@ -1324,7 +1364,9 @@ pub fn start_live_worker(conn: Arc<crate::sparql::Connection>, shared: Shared) -
                         };
                         if cutoff != 0 {
                             let urns = std::mem::take(&mut queued);
-                            apply_live(&conn, &shared, &urns, cutoff);
+                            queued = apply_live(&conn, &shared, &urns, cutoff);
+                            retry_at = (!queued.is_empty())
+                                .then(|| std::time::Instant::now() + Duration::from_secs(30));
                         }
                     }
                 }
@@ -1712,12 +1754,18 @@ pub fn content_search_rg_stream(
     use std::io::{BufRead, BufReader};
     let reader = BufReader::new(stdout);
     let mut count = 0usize;
-    for line in reader.lines() {
+    // Raw bytes per line: a file name that isn't UTF-8 is still a path, and one such line
+    // must not end the stream (lines() errored on it and dropped every hit after it).
+    for line in reader.split(b'\n') {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         let Ok(line) = line else { break };
-        let path = PathBuf::from(line.trim());
+        let line = line.strip_suffix(b"\r").unwrap_or(&line);
+        if line.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(line));
         if !path.is_file() {
             continue;
         }

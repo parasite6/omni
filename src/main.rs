@@ -604,6 +604,7 @@ fn secret_env_name(name: &str) -> bool {
         || ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "APIKEY", "ACCESS_KEY", "PRIVATE_KEY", "CREDENTIAL"]
             .iter()
             .any(|w| up.contains(w))
+        || ["_KEY", "_PAT", "_AUTH"].iter().any(|s| up.ends_with(s))
 }
 
 fn use_display_gpu_only() {
@@ -868,14 +869,14 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .tooltip_text("Settings")
         .css_classes(["flat", "omni-settings-button"])
         .focus_on_click(false)
-        .halign(gtk::Align::End)
-        .valign(gtk::Align::Start)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
         .build();
     let settings_slip = gtk::Overlay::new();
     settings_slip.add_css_class("omni-settings-slip");
     settings_slip.set_halign(gtk::Align::End);
     settings_slip.set_valign(gtk::Align::Start);
-    settings_slip.set_size_request(44, 44);
+    settings_slip.set_size_request(40, 56); // the bar's right gutter, full bar height
     settings_slip.set_margin_top(0);
     settings_slip.set_overflow(gtk::Overflow::Hidden);
     settings_slip.set_child(Some(&settings_button));
@@ -2031,8 +2032,29 @@ fn apply_hits(ui: &Ui, hits: &[Hit]) {
 
 /// Update labels on a reused row. Returns false if structure must be rebuilt.
 fn refresh_row_contents(row: &gtk::ListBoxRow, hit: &Hit, query: &str) -> bool {
-    if row.has_css_class("omni-calc") || matches!(hit.action, Action::Copy(_) | Action::Info) {
+    if row.has_css_class("omni-calc") || matches!(hit.action, Action::Copy(_)) {
         return false;
+    }
+    if matches!(hit.action, Action::Info) {
+        if !hit.subtitle.is_empty() {
+            return false;
+        }
+        // icon | text-vbox(title): only the message changes.
+        let title = row
+            .child()
+            .and_then(|b| b.first_child())
+            .and_then(|i| i.next_sibling())
+            .and_then(|v| v.first_child())
+            .and_downcast::<gtk::Label>();
+        return match title {
+            Some(t) => {
+                if t.text() != hit.title {
+                    t.set_text(&hit.title);
+                }
+                true
+            }
+            None => false,
+        };
     }
     let Some(hbox) = row.child().and_downcast::<gtk::Box>() else {
         return false;
@@ -2448,7 +2470,8 @@ fn parse_scope(query: &str) -> Option<(PathBuf, &str)> {
 /// the colon yet: the folder itself, to open.
 fn scoped_hits(ui: &Ui, dir: &std::path::Path, inner: &str) -> Vec<Hit> {
     if inner.is_empty() {
-        return if dir.is_dir() {
+        // Timed: typing "/mnt/nas:" while that mount hangs must not freeze the popup.
+        return if files::is_dir_timed(dir) == Some(true) {
             vec![file_hit(dir, true, MatchType::Name, None, "")]
         } else {
             Vec::new()
@@ -2667,7 +2690,8 @@ fn schedule_visible_snippets(ui: &Ui) {
     };
     let paths: Vec<PathBuf> = {
         let hits = ui.hits.borrow();
-        let start = ui.list_scroll.vadjustment().value() as usize / ROW_HEIGHT as usize;
+        // The scroll value can be stale (past a list that just got shorter): clamp both ends.
+        let start = (ui.list_scroll.vadjustment().value() as usize / ROW_HEIGHT as usize).min(hits.len());
         let end = (start + MAX_VISIBLE_ROWS as usize + 2).min(hits.len());
         hits[start..end]
             .iter()
@@ -3230,7 +3254,13 @@ fn hit_key(hit: &Hit) -> String {
         Action::ServiceStatus(s) => format!("svc-status:{}", s.unit),
         Action::ServiceVerb(s, verb) => format!("svc-verb:{}:{}", s.unit, verb.label()),
         Action::DockPin(id, on) => format!("dock:{id}:{on}"),
-        Action::Info => format!("info:{}", hit.title),
+        // Messages that differ only in title share a key, so "Searching images…" →
+        // "No matching images" patches the text in place instead of rebuilding the row.
+        Action::Info => format!(
+            "info:{}:{}",
+            hit.icon.as_ref().and_then(|i| IconExt::to_string(i)).unwrap_or_default(),
+            hit.subtitle
+        ),
     }
 }
 
@@ -3316,6 +3346,16 @@ fn hide_selection_chrome(ui: &Ui) {
 }
 
 fn show_selection_chrome(ui: &Ui) {
+    // A message row (`img` placeholder, "Searching images…") can't be picked: no highlight.
+    let on_info = ui
+        .hits
+        .borrow()
+        .get(ui.selected_index.get())
+        .is_some_and(|h| matches!(h.action, Action::Info));
+    if on_info {
+        hide_selection_chrome(ui);
+        return;
+    }
     ui.selection_fill.set_visible(true);
     ui.selection_pill.set_visible(true);
     ui.selection_fill.set_opacity(1.0);
@@ -5333,9 +5373,22 @@ fn visible(text: &str) -> String {
 /// `@` — so `https://trusted.example/…@evil.example/…` shows `evil.example`, not the
 /// name before the `@` — and the host ends at the first `/`, `?`, or `#`.
 fn link_host(uri: &str) -> String {
-    let rest = uri.split_once("://").map(|(_, rest)| rest).unwrap_or(uri);
-    let rest = rest.rsplit_once('@').map(|(_, host)| host).unwrap_or(rest);
-    visible(rest.split(['/', '?', '#']).next().unwrap_or(""))
+    // Parse the way browsers do (WHATWG): tab/newline are dropped, '\' counts as '/', and
+    // extra slashes after the scheme are skipped. The authority ends at the first '/', '\',
+    // '?' or '#'; only an '@' inside it ends userinfo. So https://trusted.example/x@evil.example
+    // opens trusted.example, and https://evil.example\@trusted.example opens evil.example.
+    let uri: String = uri.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect();
+    let rest = uri.split_once(':').map(|(_, rest)| rest).unwrap_or(&uri);
+    let rest = rest.trim_start_matches(['/', '\\']);
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
+    // A non-ASCII host can imitate another (Cyrillic "а" for "a"): show what DNS sees too.
+    let ascii = glib::hostname_to_ascii(host).map(|a| a.to_string()).unwrap_or_default();
+    if !host.is_ascii() && !ascii.is_empty() && ascii != host {
+        format!("{} ({ascii})", visible(host))
+    } else {
+        visible(host)
+    }
 }
 
 /// A link in Claude's answer: opening it closes omni (ending the temporary conversation),
@@ -5358,7 +5411,7 @@ fn confirm_link(ui: &Ui, uri: &str) {
     })));
     ui.confirm_no_action.take();
     ui.confirm_always_action.take();
-    ui.confirm_yes.grab_focus();
+    ui.confirm_no.grab_focus(); // like permission prompts: a stray Enter doesn't open it
     ui.window.set_focus_visible(false);
 }
 
@@ -5881,7 +5934,16 @@ mod filter_tests {
     fn link_host_shows_the_real_host() {
         // Userinfo is not the host, including when a slash comes before the '@'.
         assert_eq!(link_host("https://user:pass@evil.example/phish"), "evil.example");
-        assert_eq!(link_host("https://trusted.example/secret@evil.example/login"), "evil.example");
+        assert_eq!(link_host("https://trusted.example/secret@evil.example/login"), "trusted.example");
+        assert_eq!(link_host("https://evil.example/@trusted.example/login"), "evil.example");
+        assert_eq!(link_host("https://evil.example?@trusted.example"), "evil.example");
+        assert_eq!(link_host("https://evil.example#@trusted.example"), "evil.example");
+        assert_eq!(link_host("https://evil.example\\@trusted.example/"), "evil.example");
+        assert_eq!(link_host("https:///evil.example/x"), "evil.example");
+        assert_eq!(link_host("https:\\\\evil.example"), "evil.example");
+        assert_eq!(link_host("https://ev\nil.example/"), "evil.example");
+        assert_eq!(link_host("mailto:someone@example.com"), "example.com");
+        assert_eq!(link_host("https://g\u{043e}\u{043e}gle.com/"), "g\u{043e}\u{043e}gle.com (xn--ggle-55da.com)");
         assert_eq!(link_host("https://example.com/path?q=1#top"), "example.com");
         assert_eq!(link_host("https://ex\u{202E}ample.com/path"), "ex\u{27e8}U+202E\u{27e9}ample.com");
     }
