@@ -113,8 +113,8 @@ pub struct Images {
     answer: RefCell<Option<(String, Vec<ImageHit>, bool)>>,
     on_results: RefCell<Option<Box<dyn Fn()>>>,
     crawling: Cell<bool>,
-    /// Folders chosen with Add folder… while a crawl was running: added when it ends.
-    pending_add: RefCell<Vec<PathBuf>>,
+    /// Folders added while a crawl was running (path, with subdirectories): done after it.
+    pending_add: RefCell<Vec<(PathBuf, bool)>>,
     /// A query lost with a dead server is asked again once; this is that query.
     retried: RefCell<Option<String>>,
     crawl_status: RefCell<String>,
@@ -327,7 +327,11 @@ impl Images {
         let status = std::fs::read_to_string(data_dir().join("images/status.json")).ok();
         let v = status.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
         let count = v.as_ref().and_then(|v| v.get("count")?.as_u64());
-        let folders = folders().iter().map(|f| crate::recent::folder_label(&f.join("x"))).collect::<Vec<_>>().join(", ");
+        let folders = folders()
+            .iter()
+            .map(|(f, rec)| format!("{}{}", label(f), if *rec { " (with subdirectories)" } else { "" }))
+            .collect::<Vec<_>>()
+            .join(", ");
         match count {
             Some(n) => format!("{n} image{} indexed from {folders}.", if n == 1 { "" } else { "s" }),
             None => format!("Nothing indexed yet. Indexes {folders}."),
@@ -338,23 +342,37 @@ impl Images {
         self.crawling.get()
     }
 
-    /// Embed new and changed images; `add` joins the folder list first. One crawl at a time.
-    pub fn crawl(self: &Rc<Self>, add: Option<&Path>) {
+    /// Embed new and changed images. One crawl at a time.
+    /// - `add`: a folder (and whether to take its subdirectories) joins the list first.
+    /// - `fast`: the user asked (Index now, adding a folder): full speed when the machine has
+    ///   the room. Otherwise the quiet background pace.
+    pub fn crawl(self: &Rc<Self>, add: Option<(&Path, bool)>, fast: bool) {
         if !installed() {
             return;
         }
         if self.crawling.get() {
-            if let Some(dir) = add {
-                self.pending_add.borrow_mut().push(dir.to_path_buf());
-                self.set_crawl_status(format!("{} is next, after this crawl.", crate::recent::folder_label(&dir.join("x"))));
+            if let Some((dir, rec)) = add {
+                self.pending_add.borrow_mut().push((dir.to_path_buf(), rec));
+                self.set_crawl_status(format!("{} is next, after this crawl.", label(dir)));
             }
             return;
         }
-        let add = add.map(|p| p.to_string_lossy().into_owned());
+        let dir = add.map(|(p, _)| p.to_string_lossy().into_owned());
         let mut args = vec!["crawl"];
-        if let Some(a) = add.as_deref() {
-            args.push(a);
+        if fast {
+            args.push("--fast");
         }
+        if let Some(d) = dir.as_deref() {
+            args.extend(["--add", d]);
+            if add.is_some_and(|(_, rec)| rec) {
+                args.push("--recursive");
+            }
+        }
+        let added_label = add.map(|(p, rec)| (label(p), rec));
+        // What the crawl reported: the added folder's state ("new", "deeper", "same") and
+        // how many images it embedded.
+        let folder_state: Rc<RefCell<Option<String>>> = Rc::default();
+        let added_count: Rc<Cell<u64>> = Rc::default();
         let proc = match spawn(&args) {
             Ok(p) => p,
             Err(e) => {
@@ -366,12 +384,15 @@ impl Images {
         self.set_crawl_status("Looking for new images…".into());
         let me = Rc::downgrade(self);
         let me_eof = me.clone();
+        let (fs, ac) = (folder_state.clone(), added_count.clone());
         read_lines(
             &proc,
             move |line| {
                 let Some(me) = me.upgrade() else { return };
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
                 match v.get("event").and_then(|e| e.as_str()) {
+                    Some("folder") => *fs.borrow_mut() = v.get("state").and_then(|s| s.as_str()).map(String::from),
+                    Some("done") => ac.set(v.get("added").and_then(|a| a.as_u64()).unwrap_or(0)),
                     Some("downloading") => me.set_crawl_status("Downloading the image model (about 900 MB)…".into()),
                     Some("progress") => {
                         let done = v.get("done").and_then(|d| d.as_u64()).unwrap_or(0);
@@ -386,14 +407,28 @@ impl Images {
                 let Some(me) = me_eof.upgrade() else { return };
                 me.crawling.set(false);
                 let next = me.pending_add.borrow_mut().pop();
-                if let Some(dir) = next {
-                    me.crawl(Some(&dir));
+                if let Some((dir, rec)) = next {
+                    me.crawl(Some((&dir, rec)), true);
                     return;
                 }
                 // New vectors: answers cached for the old index are stale.
                 *me.answer.borrow_mut() = None;
-                let s = me.index_summary();
-                me.set_crawl_status(s);
+                let n = added_count.get();
+                let images = |n: u64| format!("{n} new image{}", if n == 1 { "" } else { "s" });
+                let lead = match (added_label, folder_state.borrow().as_deref()) {
+                    (Some((name, _)), Some("same")) if n == 0 => {
+                        format!("{name} is already indexed: no new images. Add it again with Subdirectories on to take those too.")
+                    }
+                    (Some((name, _)), Some("same")) => format!("{name} is already indexed: {} added.", images(n)),
+                    (Some((name, _)), Some("deeper")) => format!("{name} now includes its subdirectories: {}.", images(n)),
+                    (Some((name, rec)), _) => {
+                        format!("Added {name}{}: {}.", if rec { " with subdirectories" } else { "" }, images(n))
+                    }
+                    (None, _) if fast => format!("Done: {}.", images(n)),
+                    (None, _) => String::new(),
+                };
+                let summary = me.index_summary();
+                me.set_crawl_status(if lead.is_empty() { summary } else { format!("{lead}\n{summary}") });
                 if let Some(f) = me.on_results.borrow().as_ref() {
                     f();
                 }
@@ -407,13 +442,13 @@ impl Images {
         glib::timeout_add_local_once(CRAWL_FIRST, move || {
             let Some(me) = me.upgrade() else { return };
             if auto_crawl() {
-                me.crawl(None);
+                me.crawl(None, false);
             }
             let weak = Rc::downgrade(&me);
             glib::timeout_add_local(CRAWL_EVERY, move || {
                 let Some(me) = weak.upgrade() else { return glib::ControlFlow::Break };
                 if auto_crawl() {
-                    me.crawl(None);
+                    me.crawl(None, false);
                 }
                 glib::ControlFlow::Continue
             });
@@ -438,20 +473,33 @@ pub fn set_auto_crawl(on: bool) -> std::io::Result<()> {
     std::fs::write(path, if on { "on\n" } else { "off\n" })
 }
 
-/// Folders the crawl walks (same file and default as omni-embed.py).
-pub fn folders() -> Vec<PathBuf> {
+/// `~/Wallpapers` for display.
+fn label(dir: &Path) -> String {
+    crate::recent::folder_label(&dir.join("x"))
+}
+
+/// Folders the crawl walks and whether it takes their subdirectories (same file and default
+/// as omni-embed.py: one per line, a trailing `/**` for subdirectories; none = ~/Pictures/**).
+pub fn folders() -> Vec<(PathBuf, bool)> {
     let home = glib::home_dir();
     match std::fs::read_to_string(glib::user_config_dir().join("omni/image-folders")) {
         Ok(s) => s
             .lines()
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            .map(|l| match l.strip_prefix("~/") {
-                Some(rest) => home.join(rest),
-                None => PathBuf::from(l),
+            .map(|l| {
+                let (l, rec) = match l.strip_suffix("/**") {
+                    Some(base) => (base, true),
+                    None => (l, false),
+                };
+                let path = match l.strip_prefix("~") {
+                    Some(rest) => home.join(rest.trim_start_matches('/')),
+                    None => PathBuf::from(l),
+                };
+                (path, rec)
             })
             .collect(),
-        Err(_) => vec![home.join("Pictures")],
+        Err(_) => vec![(home.join("Pictures"), true)],
     }
 }
 

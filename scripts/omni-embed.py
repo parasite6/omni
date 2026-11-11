@@ -3,9 +3,13 @@
     omni-embed.py serve        answer queries on stdin, one JSON line each:
                                {"q": "<description>", "k": 12} -> {"q": ..., "hits": [{"p", "t", "s"}]}
                                Loads only the text side. Exits after IDLE_EXIT s with no query.
-    omni-embed.py crawl [DIR]  embed new or changed images in the configured folders (DIR is
-                               added to them first). Loads the vision encoder only when there
-                               is something to embed, and exits when done. Progress on stdout.
+    omni-embed.py crawl [--fast] [--add DIR [--recursive]]
+                               embed new or changed images in the configured folders (DIR is
+                               added first; --recursive takes its subdirectories too). Loads the
+                               vision encoder only when there is something to embed, and exits
+                               when done. Progress on stdout. Without --fast it stays out of the
+                               way (low priority, one image at a time); --fast (Index now) runs
+                               at full speed when the machine has the room.
 
 Runs in its own venv (onnxruntime-gpu brings its own CUDA and cuDNN), started by omni.
 """
@@ -32,14 +36,14 @@ INDEX_DIR = DATA / "images"
 INDEX = INDEX_DIR / "index.npz"
 STATUS = INDEX_DIR / "status.json"
 LOCK = INDEX_DIR / "crawl.lock"
-THUMBS = CACHE / "thumbs"
+THUMBS = CACHE / "thumbs-160"  # versioned by size: a new size regenerates them
 FOLDERS = CONFIG / "image-folders"
 
 QUERY_PREFIX = "task: search result | query: "
 DOC_PREFIX = "title: none | text: "  # measured better than a bare image for text->image search
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 MAX_BYTES = 64 << 20
-THUMB_PX = 96
+THUMB_PX = 160
 IDLE_EXIT = 10.0
 SAVE_EVERY = 50
 
@@ -49,24 +53,51 @@ def emit(obj):
     sys.stdout.flush()
 
 
-def folders():
+# image-folders: one folder per line; a trailing "/**" also takes its subdirectories.
+# No file: ~/Pictures with its subdirectories.
+
+def read_folders():
+    """[(Path, recursive)] as written, existing or not."""
     try:
         lines = [l.strip() for l in FOLDERS.read_text().splitlines()]
-        dirs = [Path(os.path.expanduser(l)) for l in lines if l and not l.startswith("#")]
     except FileNotFoundError:
-        dirs = [HOME / "Pictures"]
-    return [d for d in dirs if d.is_dir()]
+        return [(HOME / "Pictures", True)]
+    out = []
+    for l in lines:
+        if not l or l.startswith("#"):
+            continue
+        rec = l.endswith("/**")
+        out.append((Path(os.path.expanduser(l[:-3] if rec else l)), rec))
+    return out
 
 
-def add_folder(d):
+def folders():
+    return [(d, r) for d, r in read_folders() if d.is_dir()]
+
+
+def add_folder(d, recursive):
+    """Add (or widen to subdirectories) a folder. Returns "new", "deeper" or "same"."""
     d = Path(os.path.expanduser(d)).resolve()
-    current = [str(f.resolve()) for f in folders()] if FOLDERS.exists() else [str((HOME / "Pictures").resolve())]
-    if str(d) not in current:
-        current.append(str(d))
-    FOLDERS.parent.mkdir(parents=True, exist_ok=True)
-    tmp = FOLDERS.with_suffix(".new")
-    tmp.write_text("".join(c + "\n" for c in current))
-    tmp.replace(FOLDERS)
+    current = [(f.resolve(), r) for f, r in read_folders()]
+    state = "new"
+    for i, (f, r) in enumerate(current):
+        if f == d:
+            state = "deeper" if recursive and not r else "same"
+            current[i] = (f, r or recursive)  # never narrowed by re-adding without the toggle
+            break
+    else:
+        current.append((d, recursive))
+    if state != "same":
+        def show(f, r):
+            s = str(f)
+            if s == str(HOME) or s.startswith(str(HOME) + "/"):
+                s = "~" + s[len(str(HOME)):]
+            return s + ("/**" if r else "")
+        FOLDERS.parent.mkdir(parents=True, exist_ok=True)
+        tmp = FOLDERS.with_suffix(".new")
+        tmp.write_text("".join(show(f, r) + "\n" for f, r in current))
+        tmp.replace(FOLDERS)
+    return state
 
 
 def thumb_path(path):
@@ -196,9 +227,9 @@ def serve():
 
 def candidates():
     out = {}
-    for root in folders():
+    for root, recursive in folders():
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")] if recursive else []
             for f in filenames:
                 if f.startswith(".") or os.path.splitext(f)[1].lower() not in IMAGE_EXT:
                     continue
@@ -212,7 +243,48 @@ def candidates():
     return out
 
 
-def crawl(add=None):
+def make_thumb(im, p):
+    th = im.copy()
+    th.thumbnail((THUMB_PX, THUMB_PX))
+    th.save(thumb_path(p))
+
+
+def fill_thumbs(paths):
+    """Thumbnails missing for indexed images (cleared cache, new size): PIL only, no model."""
+    from PIL import Image, ImageOps
+    THUMBS.mkdir(parents=True, exist_ok=True)
+    for p in paths:
+        if thumb_path(p).exists():
+            continue
+        try:
+            with Image.open(p) as im:
+                im.seek(0)
+                make_thumb(ImageOps.exif_transpose(im).convert("RGB"), p)
+        except Exception as e:
+            print(f"omni-embed: no thumbnail for {p}: {e}", file=sys.stderr)
+
+
+def room_to_go_fast():
+    """Index now: full speed only with free VRAM (vision + text ~1.2 GB) and RAM to spare.
+    Returns worker threads for decoding/preprocessing, or 0 to stay gentle."""
+    try:
+        import subprocess
+        out = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=5).stdout.split()
+        if out and int(out[0]) < 1800:
+            return 0
+    except Exception:
+        pass  # no nvidia-smi: ORT falls back on its own; judge by RAM and CPUs
+    try:
+        avail = next(int(l.split()[1]) for l in open("/proc/meminfo") if l.startswith("MemAvailable:"))
+        if avail < 3 << 20:  # kB: under 3 GB free
+            return 0
+    except Exception:
+        pass
+    return max(1, min(4, (os.cpu_count() or 2) // 4))
+
+
+def crawl(add=None, recursive=False, fast=False):
     import numpy as np
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
     lock = open(LOCK, "w")
@@ -221,11 +293,13 @@ def crawl(add=None):
     except BlockingIOError:
         emit({"event": "busy"})  # another crawl is running; it will pick the new folder up next time
         if add:
-            add_folder(add)
+            add_folder(add, recursive)
         return
-    os.nice(10)
+    workers = room_to_go_fast() if fast else 0
+    if not workers:
+        os.nice(10)
     if add:
-        add_folder(add)
+        emit({"event": "folder", "state": add_folder(add, recursive)})
     found = candidates()
     old = load_index()
     paths, mtimes, sizes, vecs = [], [], [], []
@@ -236,6 +310,7 @@ def crawl(add=None):
     known = set(paths)
     todo = [p for p in found if p not in known and p not in bad]
     removed = len(old["paths"]) - len(paths)
+    fill_thumbs(paths)
     if not todo:
         if removed or len(bad) != len(old["bad"]):
             save_index(paths, mtimes, sizes, vecs, bad)
@@ -254,21 +329,53 @@ def crawl(add=None):
     proc = Gemma4ImageProcessorPil.from_pretrained(str(MODEL_DIR))
     boi, img_tok, eoi = "<|image>", "<|image|>", "<image|>"
     THUMBS.mkdir(parents=True, exist_ok=True)
+    def prepare(p):
+        """CPU half (decode, thumbnail, patches): runs ahead on worker threads with --fast."""
+        with Image.open(p) as im:
+            im.seek(0)
+            im = ImageOps.exif_transpose(im).convert("RGB")  # camera photos stand upright
+        make_thumb(im, p)
+        return proc(images=[im], return_tensors="np")
+
+    def prepared():
+        """(path, processor output or exception), in order. With workers, the GPU never waits
+        on PIL: a bounded window of images is decoded while the current one is encoded."""
+        if not workers:
+            for p in todo:
+                try:
+                    yield p, prepare(p)
+                except Exception as e:
+                    yield p, e
+            return
+        from concurrent.futures import ThreadPoolExecutor
+        from collections import deque
+        with ThreadPoolExecutor(workers) as pool:
+            window = deque()
+            it = iter(todo)
+            for p in it:
+                window.append((p, pool.submit(prepare, p)))
+                if len(window) >= workers * 2:
+                    break
+            while window:
+                p, fut = window.popleft()
+                nxt = next(it, None)
+                if nxt is not None:
+                    window.append((nxt, pool.submit(prepare, nxt)))
+                try:
+                    yield p, fut.result()
+                except Exception as e:
+                    yield p, e
+
     added = 0
-    emit({"event": "progress", "done": 0, "total": len(todo)})
-    for n, p in enumerate(todo, 1):
+    emit({"event": "progress", "done": 0, "total": len(todo), "fast": bool(workers)})
+    for n, (p, o) in enumerate(prepared(), 1):
         try:
-            with Image.open(p) as im:
-                im.seek(0)
-                im = ImageOps.exif_transpose(im).convert("RGB")  # camera photos stand upright
-            o = proc(images=[im], return_tensors="np")
+            if isinstance(o, Exception):
+                raise o
             feats = vision.run(None, {"pixel_values": o["pixel_values"].astype(np.float32),
                                       "pixel_position_ids": o["image_position_ids"].astype(np.int64)})[0]
             soft = int(o["num_soft_tokens_per_image"][0])
             v = text.embed(DOC_PREFIX + boi + img_tok * soft + eoi, feats[:soft].astype(np.float32))
-            th = im.copy()
-            th.thumbnail((THUMB_PX, THUMB_PX))
-            th.save(thumb_path(p))
             paths.append(p); mtimes.append(found[p][0]); sizes.append(found[p][1]); vecs.append(v.astype(np.float16))
             added += 1
         except Exception as e:  # unreadable or odd image: skip it until it changes
@@ -286,7 +393,9 @@ def main():
     if cmd == "serve":
         serve()
     elif cmd == "crawl":
-        crawl(sys.argv[2] if len(sys.argv) > 2 else None)
+        args = sys.argv[2:]
+        add = args[args.index("--add") + 1] if "--add" in args else None
+        crawl(add, recursive="--recursive" in args, fast="--fast" in args)
     else:
         print(__doc__, file=sys.stderr)
         sys.exit(2)

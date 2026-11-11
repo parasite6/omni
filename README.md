@@ -329,10 +329,10 @@ Type `img`, a space, and a description (`img red terminal`, `img cat on a couch`
 
 - **Model:** [embeddinggemma-2](https://huggingface.co/google/embeddinggemma-2) (ONNX fp16, about 900 MB, downloaded on the first crawl to `~/.local/share/omni/models`). It runs in `omni-embed.py` on the GPU, from its own venv (`~/.local/share/omni/embed-venv`, made by `install.sh` with `uv`; onnxruntime-gpu brings its own CUDA and cuDNN).
 - **Querying loads only the text side** (~540 MB). Typing `img` starts it (about 2 s), each query then takes a few ms, and it exits **10 s after the last query**.
-- **Indexing** loads the vision encoder too, embeds only new or changed images, then exits. A crawl with nothing new never loads the model. About 0.2 s per image: a couple hundred take ~30 s.
-- **When:** quietly 10 s after omni starts, then hourly. Settings → **Image search** turns that off; **Index now** runs it; **Add folder…** adds a folder and indexes it right away.
-- **Folders:** `~/Pictures` by default; the list is `~/.config/omni/image-folders` (one per line). Hidden folders are skipped. PNG, JPEG, WebP, GIF (first frame), BMP.
-- **Index:** `~/.local/share/omni/images/index.npz` (paths and vectors); thumbnails in `~/.cache/omni/thumbs`.
+- **Indexing** loads the vision encoder too, embeds only new or changed images, then exits. A crawl with nothing new never loads the model. The hourly crawl stays out of the way (low priority, one image at a time, ~0.23 s each). **Index now** and adding a folder go full speed (decoding on worker threads while the GPU encodes, ~0.13 s each) when there's ≥1.8 GB free VRAM and ≥3 GB free RAM, otherwise they fall back to the gentle pace.
+- **When:** quietly 10 s after omni starts, then hourly. Settings → **Image search** turns that off; **Index now** runs it.
+- **Folders:** `~/Pictures` with its subdirectories by default. Add more in Settings → Image search: type a path, turn on **Subdirectories** to take everything under it (off by default), **Add**. Adding a folder again just checks for new images; adding it again with Subdirectories on widens it. The list is `~/.config/omni/image-folders` (one per line, a trailing `/**` = with subdirectories). Hidden folders are skipped. PNG, JPEG, WebP, GIF (first frame), BMP.
+- **Index:** `~/.local/share/omni/images/index.npz` (paths and vectors); thumbnails in `~/.cache/omni/thumbs-160`.
 
 ---
 
@@ -398,7 +398,7 @@ The full permission, sandbox and connector story is in the [status log](#status-
 | Folders whose contents aren't indexed | `SKIP_INSIDE` in `files.rs` |
 | How long Chromium stays after the last search | `IDLE_EXIT` in `web_client.rs` (10 s) |
 | Running programs on open | Settings → **Run programs** |
-| Image search folders | `~/.config/omni/image-folders` or Settings → **Add folder…** |
+| Image search folders | Settings → **Image search**, or `~/.config/omni/image-folders` |
 | Claude's agent instructions | `src/agent_prompt.md`, then run `./install.sh` |
 
 ### Things omni remembers

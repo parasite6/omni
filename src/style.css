@@ -238,7 +238,7 @@ list.omni-results:backdrop {
   background-color: transparent;
   background-image: none;
   background: none;
-  padding: 4px 0 0 0;
+  padding: 4px 0 6px 0; /* LIST_PAD_TOP / LIST_PAD_BOTTOM in main.rs */
   margin: 0;
   outline: none;
   box-shadow: none;
@@ -719,9 +719,128 @@ list.omni-results > row.omni-calc.activatable:hover {
   background-color: alpha(white, 0.04);
 }
 
-/* Settings rows (search engine, run programs) and browser surface. */
+/* Settings rows (search engine, run programs, image search) and browser surface. */
 .omni-settings-rows {
-  margin: 12px 18px 24px;
+  margin: 8px 18px 20px;
+}
+
+.omni-settings-row {
+  padding: 12px 0;
+  border-bottom: 1px solid alpha(@omni_divider, 0.06);
+}
+
+.omni-settings-row:last-child {
+  border-bottom: none;
+}
+
+.omni-settings-title {
+  font-size: 14px;
+  font-weight: 500;
+  color: @omni_text;
+}
+
+.omni-settings-status {
+  color: alpha(@omni_accent, 0.85);
+}
+
+/* Switches: a dark track that lights accent when on; no GTK on/off glyphs. */
+switch.omni-switch {
+  min-width: 36px;
+  min-height: 20px;
+  padding: 2px;
+  margin: 0;
+  border-radius: 999px;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  background-image: none;
+  background-color: alpha(@omni_hover, 0.10);
+  transition: background-color 150ms ease;
+}
+
+switch.omni-switch:hover {
+  background-color: alpha(@omni_hover, 0.14);
+}
+
+switch.omni-switch:checked {
+  background-color: alpha(@omni_accent, 0.40);
+}
+
+switch.omni-switch:checked:hover {
+  background-color: alpha(@omni_accent, 0.48);
+}
+
+switch.omni-switch:focus-visible {
+  outline: 1px solid alpha(@omni_accent, 0.6);
+  outline-offset: 2px;
+}
+
+switch.omni-switch > image {
+  opacity: 0;
+  -gtk-icon-size: 0;
+}
+
+switch.omni-switch > slider {
+  min-width: 16px;
+  min-height: 16px;
+  margin: 0;
+  border-radius: 999px;
+  border: none;
+  outline: none;
+  background-image: none;
+  background-color: @omni_text_secondary;
+  box-shadow: 0 1px 3px alpha(black, 0.45);
+  transition: background-color 150ms ease;
+}
+
+switch.omni-switch:checked > slider {
+  background-color: @omni_accent;
+}
+
+switch.omni-switch:disabled {
+  opacity: 0.45;
+}
+
+/* Inline text field (Image search → add a folder). */
+entry.omni-settings-entry {
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: @omni_text;
+  caret-color: @omni_accent;
+  background-color: alpha(@omni_hover, 0.04);
+  background-image: none;
+  border: 1px solid alpha(@omni_border, 0.06);
+  box-shadow: none;
+  outline: none;
+}
+
+entry.omni-settings-entry:focus-within {
+  border-color: alpha(@omni_accent, 0.55);
+  background-color: alpha(@omni_hover, 0.06);
+}
+
+entry.omni-settings-entry text placeholder {
+  color: @omni_placeholder;
+}
+
+entry.omni-settings-entry text selection {
+  background-color: alpha(@omni_accent, 0.35);
+}
+
+.omni-settings-action {
+  color: @omni_text;
+  background-color: alpha(@omni_hover, 0.04);
+}
+
+.omni-settings-action:hover {
+  background-color: alpha(@omni_accent, 0.12);
+  color: @omni_accent;
+}
+
+.omni-settings-action:disabled {
+  opacity: 0.45;
 }
 .omni-web-plane {
   padding: 4px;

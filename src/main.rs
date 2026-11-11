@@ -48,7 +48,8 @@ const REPLY_PLACEHOLDER: &str = "Reply to Claude \u{b7} Esc to go back to search
 const MAX_FILTERED: usize = 8;
 /// Image search (`img red terminal`): rows shown and their thumbnail size.
 const MAX_IMAGES: usize = 8;
-const IMAGE_THUMB_PX: i32 = 48;
+const IMAGE_THUMB_W: i32 = 46;
+const IMAGE_THUMB_H: i32 = 34;
 
 /// Result kinds the filter can show (bits). All bits set = no filter.
 const SHOW_APPS: u8 = 1;
@@ -81,6 +82,11 @@ const CARD_CHROME: i32 = 108;
 /// Result row height and how many fit before the list scrolls (style.css --row-height).
 const ROW_HEIGHT: i32 = 52;
 const MAX_VISIBLE_ROWS: i32 = 7;
+/// The list's top + bottom padding (style.css list.omni-results): part of its height cap, so
+/// the last visible row never sits under the path footer.
+const LIST_PAD_TOP: i32 = 4;
+const LIST_PAD_BOTTOM: i32 = 6;
+const LIST_CAP: i32 = MAX_VISIBLE_ROWS * ROW_HEIGHT + LIST_PAD_TOP + LIST_PAD_BOTTOM;
 /// Selection highlight base height for scaleY (matches row height).
 const SEL_BASE_H: f64 = ROW_HEIGHT as f64;
 /// Accent pill size / inset (style.css .omni-selection-pill).
@@ -765,7 +771,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         // Scrolls (wheel, keys, selection) but never shows a scrollbar.
         .vscrollbar_policy(gtk::PolicyType::External)
         .propagate_natural_height(true)
-        .max_content_height(MAX_VISIBLE_ROWS * ROW_HEIGHT)
+        .max_content_height(LIST_CAP)
         .child(&list_overlay)
         .build();
     let reveal = gtk::Revealer::builder()
@@ -901,18 +907,30 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     let settings_rows = gtk::Box::new(gtk::Orientation::Vertical, 16);
     settings_rows.add_css_class("omni-settings-rows");
     let search_settings = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    search_settings.add_css_class("omni-settings-row");
     let search_label = gtk::Label::builder().label("Search engine").xalign(0.0).hexpand(true).build();
-    let names: Vec<_> = search_provider::SearchProvider::ALL.iter().map(|p| p.name()).collect();
-    let engine_dropdown = gtk::DropDown::from_strings(&names);
-    engine_dropdown.set_selected(search_provider::SearchProvider::ALL.iter().position(|p| *p == provider).unwrap_or(0) as u32);
+    search_label.add_css_class("omni-settings-title");
+    // Same look as the result filter: a quiet text button that opens an omni menu.
+    let engine_label = gtk::Label::new(Some(provider.name()));
+    let engine_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    engine_content.append(&engine_label);
+    engine_content.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+    let engine_button = gtk::Button::builder()
+        .child(&engine_content)
+        .css_classes(["omni-toggle", "omni-filter"])
+        .valign(gtk::Align::Center)
+        .build();
+    engine_button.update_relation(&[gtk::accessible::Relation::LabelledBy(&[search_label.upcast_ref()])]);
     search_settings.append(&search_label);
-    search_settings.append(&engine_dropdown);
+    search_settings.append(&engine_button);
     settings_rows.append(&search_settings);
     let run_programs = load_run_programs_setting();
     let run_row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    run_row.add_css_class("omni-settings-row");
     let run_text = gtk::Box::new(gtk::Orientation::Vertical, 2);
     run_text.set_hexpand(true);
     let run_title = gtk::Label::builder().label("Run programs").xalign(0.0).build();
+    run_title.add_css_class("omni-settings-title");
     run_text.append(&run_title);
     let run_hint = gtk::Label::builder()
         .label("Executable files run after you confirm. Off: they open in their default app.")
@@ -922,7 +940,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .build();
     run_hint.add_css_class("omni-status-hint");
     run_text.append(&run_hint);
-    let run_switch = gtk::Switch::builder().active(run_programs).valign(gtk::Align::Center).build();
+    let run_switch = gtk::Switch::builder().active(run_programs).valign(gtk::Align::Center).css_classes(["omni-switch"]).build();
     // Screen readers announce the switch by its title, with the hint as its description.
     run_switch.update_relation(&[
         gtk::accessible::Relation::LabelledBy(&[run_title.upcast_ref()]),
@@ -932,10 +950,13 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     run_row.append(&run_switch);
     settings_rows.append(&run_row);
     let images = images::Images::new();
+    let img_section = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    img_section.add_css_class("omni-settings-row");
     let img_row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
     let img_text = gtk::Box::new(gtk::Orientation::Vertical, 2);
     img_text.set_hexpand(true);
     let img_title = gtk::Label::builder().label("Image search").xalign(0.0).build();
+    img_title.add_css_class("omni-settings-title");
     img_text.append(&img_title);
     let img_hint = gtk::Label::builder()
         .label("Type img and a description. New pictures are indexed quietly every hour on the GPU.")
@@ -947,23 +968,41 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     img_text.append(&img_hint);
     let img_status = gtk::Label::builder().label(images.crawl_status()).xalign(0.0).wrap(true).max_width_chars(1).build();
     img_status.add_css_class("omni-status-hint");
+    img_status.add_css_class("omni-settings-status");
     img_text.append(&img_status);
-    let img_switch = gtk::Switch::builder().active(images::auto_crawl()).valign(gtk::Align::Center).build();
+    let img_switch = gtk::Switch::builder().active(images::auto_crawl()).valign(gtk::Align::Center).css_classes(["omni-switch"]).build();
     img_switch.update_relation(&[
         gtk::accessible::Relation::LabelledBy(&[img_title.upcast_ref()]),
         gtk::accessible::Relation::DescribedBy(&[img_hint.upcast_ref()]),
     ]);
     img_row.append(&img_text);
     img_row.append(&img_switch);
-    settings_rows.append(&img_row);
+    img_section.append(&img_row);
+    // A folder is typed, not picked: a file dialog would open underneath omni's overlay.
     let img_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let img_index_now = gtk::Button::builder().label("Index now").css_classes(["omni-answer-button"]).build();
-    let img_add = gtk::Button::builder().label("Add folder\u{2026}").css_classes(["omni-answer-button"]).build();
+    let img_folder = gtk::Entry::builder()
+        .placeholder_text("Add a folder, e.g. ~/Wallpapers")
+        .hexpand(true)
+        .css_classes(["omni-settings-entry"])
+        .build();
+    // Off: just the folder itself. On: everything under it too.
+    let img_subdirs = gtk::ToggleButton::builder()
+        .label("Subdirectories")
+        .tooltip_text("Also index every folder inside it")
+        .css_classes(["omni-toggle"])
+        .valign(gtk::Align::Center)
+        .build();
+    let img_add = gtk::Button::builder().label("Add").css_classes(["omni-toggle", "omni-settings-action"]).build();
+    let img_index_now = gtk::Button::builder().label("Index now").css_classes(["omni-toggle", "omni-settings-action"]).build();
     img_index_now.set_sensitive(images::installed() && !images.crawling());
     img_add.set_sensitive(images::installed());
-    img_buttons.append(&img_index_now);
+    img_folder.set_sensitive(images::installed());
+    img_buttons.append(&img_folder);
+    img_buttons.append(&img_subdirs);
     img_buttons.append(&img_add);
-    settings_rows.append(&img_buttons);
+    img_buttons.append(&img_index_now);
+    img_section.append(&img_buttons);
+    settings_rows.append(&img_section);
     settings_plane.append(&settings_rows);
     let search_view = search_view::SearchView::new();
 
@@ -1122,6 +1161,9 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     images.connect_results(move || {
         if let Some(ui) = weak.upgrade() {
             if ui.window.is_visible() && images::parse(ui.entry.text().trim()).is_some() {
+                // A new answer is a new ranking: select its best match, don't follow the row
+                // that was on top for the shorter query typed a moment ago.
+                ui.shown_query.borrow_mut().clear();
                 refresh(&ui);
             }
         }
@@ -1144,21 +1186,32 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     let im = images.clone();
     img_index_now.connect_clicked(move |b| {
         b.set_sensitive(false);
-        im.crawl(None);
+        im.crawl(None, true);
     });
-    let (im, win) = (images.clone(), ui.window.clone());
-    img_add.connect_clicked(move |_| {
-        let dialog = gtk::FileDialog::builder().title("Add a folder of images").modal(true).build();
-        dialog.set_initial_folder(Some(&gio::File::for_path(glib::home_dir().join("Pictures"))));
-        let im = im.clone();
-        dialog.select_folder(Some(&win), gio::Cancellable::NONE, move |res| {
-            if let Ok(dir) = res {
-                if let Some(path) = dir.path() {
-                    im.crawl(Some(&path));
-                }
+    let add_folder = {
+        let (im, entry, st, subdirs) = (images.clone(), img_folder.clone(), img_status.clone(), img_subdirs.clone());
+        move || {
+            let text = entry.text().trim().to_string();
+            if text.is_empty() {
+                return;
             }
-        });
-    });
+            let path = match text.strip_prefix("~") {
+                Some(rest) => glib::home_dir().join(rest.trim_start_matches('/')),
+                None => PathBuf::from(&text),
+            };
+            if !path.is_dir() {
+                st.set_label(&format!("{text} isn\u{2019}t a folder."));
+                return;
+            }
+            entry.set_text("");
+            im.crawl(Some((&path, subdirs.is_active())), true);
+            subdirs.set_active(false);
+        }
+    };
+    let add = Rc::new(add_folder);
+    let a = add.clone();
+    img_add.connect_clicked(move |_| a());
+    img_folder.connect_activate(move |_| add());
     images.schedule_crawls();
 
     // Re-measure footer truncation whenever the strip's width changes.
@@ -1179,13 +1232,20 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     let u = ui.clone();
     ui.search_view.back.connect_clicked(move |_| show_launcher(&u));
     let u = ui.clone();
-    engine_dropdown.connect_selected_notify(move |dropdown| {
-        if let Some(&provider) = search_provider::SearchProvider::ALL.get(dropdown.selected() as usize) {
-            u.search_provider.set(provider);
-            if let Err(error) = save_search_provider(provider) {
-                notify_user("Couldn’t save search engine", &error.to_string());
+    engine_button.connect_clicked(move |button| {
+        let names: Vec<&str> = search_provider::SearchProvider::ALL.iter().map(|p| p.name()).collect();
+        let current = search_provider::SearchProvider::ALL.iter().position(|p| *p == u.search_provider.get()).unwrap_or(0);
+        let label = engine_label.clone();
+        let me = u.clone();
+        show_pick_menu(&u, button.upcast_ref(), &names, current, move |i| {
+            if let Some(&provider) = search_provider::SearchProvider::ALL.get(i) {
+                me.search_provider.set(provider);
+                label.set_label(provider.name());
+                if let Err(error) = save_search_provider(provider) {
+                    notify_user("Couldn’t save search engine", &error.to_string());
+                }
             }
-        }
+        });
     });
     let u = ui.clone();
     run_switch.connect_active_notify(move |switch| {
@@ -3729,6 +3789,62 @@ fn show_filter_menu(ui: &Ui, keyboard: bool) {
     menu.popup();
 }
 
+/// A one-choice omni menu under `anchor` (Settings' search engine): the current choice lit,
+/// picking one closes it.
+fn show_pick_menu(ui: &Ui, anchor: &gtk::Widget, names: &[&str], current: usize, on_pick: impl Fn(usize) + 'static) {
+    let Some(me) = ui.me.borrow().upgrade() else { return };
+    let menu = gtk::Popover::builder().has_arrow(false).autohide(false).position(gtk::PositionType::Bottom).build();
+    menu.add_css_class("omni-menu");
+    menu.add_css_class("omni-filter-menu");
+    let items = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let on_pick = Rc::new(on_pick);
+    let mut first = None;
+    for (i, name) in names.iter().enumerate() {
+        let label = gtk::Label::builder().label(*name).xalign(0.0).build();
+        let button = gtk::Button::builder().child(&label).css_classes(["flat", "omni-menu-item"]).build();
+        if i == current {
+            button.add_css_class("omni-filter-on");
+        }
+        let (me, on_pick) = (me.clone(), on_pick.clone());
+        button.connect_clicked(move |_| {
+            on_pick(i);
+            dismiss_menu(&me);
+        });
+        first.get_or_insert_with(|| button.clone());
+        items.append(&button);
+    }
+    let (_, nat, _, _) = items.measure(gtk::Orientation::Horizontal, -1);
+    items.set_size_request(nat.max(anchor.width() + 24), -1);
+    let window = ui.window.clone();
+    items.connect_map(move |_| {
+        if let Some(first) = &first {
+            first.grab_focus();
+        }
+        window.set_focus_visible(false);
+    });
+    menu.set_child(Some(&items));
+    menu.set_parent(anchor);
+    menu.set_offset(0, 6);
+    let weak = Rc::downgrade(&me);
+    menu.connect_closed(move |menu| {
+        let menu = menu.clone();
+        let weak = weak.clone();
+        glib::idle_add_local_once(move || {
+            if menu.parent().is_some() {
+                menu.unparent();
+            }
+            let Some(ui) = weak.upgrade() else { return };
+            if ui.menu.borrow().as_ref() == Some(&menu) {
+                ui.menu.replace(None);
+            }
+        });
+    });
+    if let Some(old) = ui.menu.replace(Some(menu.clone())) {
+        old.popdown();
+    }
+    menu.popup();
+}
+
 /// Claude's model and effort dropdown, from the chip in the answer header: two groups
 /// with the current choice lit. Stays open while picking; a change applies from the next
 /// message (mid-conversation the conversation carries on with the new model).
@@ -3931,24 +4047,16 @@ fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
     if matches!(hit.action, Action::Copy(_)) {
         return calc_row(hit);
     }
-    let icon = match &hit.action {
-        Action::Web(_) | Action::WebIn(..) => search_provider::mark_image(28),
-        _ if hit.thumb.is_some() => {
-            let image = match hit.thumb.as_deref().filter(|t| !t.as_os_str().is_empty()) {
-                Some(t) => gtk::Image::from_file(t),
-                None => gtk::Image::from_gicon(hit.icon.as_ref().unwrap_or(&gio::ThemedIcon::new("image-x-generic").upcast())),
-            };
-            image.set_pixel_size(IMAGE_THUMB_PX);
-            image.add_css_class("omni-image-thumb");
-            image
-        }
+    let icon: gtk::Widget = match &hit.action {
+        Action::Web(_) | Action::WebIn(..) => search_provider::mark_image(28).upcast::<gtk::Widget>(),
+        _ if hit.thumb.is_some() => thumb_tile(hit.thumb.as_deref().unwrap_or(std::path::Path::new(""))).upcast(),
         _ => {
             let image = match &hit.icon {
                 Some(i) => gtk::Image::from_gicon(i),
                 None => gtk::Image::from_icon_name("application-x-executable"),
             };
             image.set_pixel_size(28);
-            image
+            image.upcast()
         }
     };
     icon.set_halign(gtk::Align::Center);
@@ -4010,6 +4118,50 @@ fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
         row.set_selectable(false);
     }
     row
+}
+
+/// An image row's thumbnail: cover-cropped into a rounded tile with a faint rim, so pictures
+/// of any shape line up and sit softly in the 52px row.
+fn thumb_tile(thumb: &std::path::Path) -> gtk::DrawingArea {
+    let area = gtk::DrawingArea::builder().content_width(IMAGE_THUMB_W).content_height(IMAGE_THUMB_H).build();
+    let pixbuf = (!thumb.as_os_str().is_empty()).then(|| gtk::gdk_pixbuf::Pixbuf::from_file(thumb).ok()).flatten();
+    area.set_draw_func(move |_, cr, w, h| {
+        let (w, h) = (w as f64, h as f64);
+        let r = 7.0;
+        let rounded = |cr: &gtk::cairo::Context, inset: f64| {
+            let (x0, y0, x1, y1) = (inset, inset, w - inset, h - inset);
+            cr.new_sub_path();
+            cr.arc(x1 - r, y0 + r, r, -std::f64::consts::FRAC_PI_2, 0.0);
+            cr.arc(x1 - r, y1 - r, r, 0.0, std::f64::consts::FRAC_PI_2);
+            cr.arc(x0 + r, y1 - r, r, std::f64::consts::FRAC_PI_2, std::f64::consts::PI);
+            cr.arc(x0 + r, y0 + r, r, std::f64::consts::PI, 1.5 * std::f64::consts::PI);
+            cr.close_path();
+        };
+        cr.save().ok();
+        rounded(cr, 0.0);
+        cr.clip();
+        match &pixbuf {
+            Some(pb) => {
+                let (pw, ph) = (pb.width() as f64, pb.height() as f64);
+                let s = (w / pw).max(h / ph);
+                cr.translate((w - pw * s) / 2.0, (h - ph * s) / 2.0);
+                cr.scale(s, s);
+                gdk::prelude::GdkCairoContextExt::set_source_pixbuf(cr, pb, 0.0, 0.0);
+                cr.source().set_filter(gtk::cairo::Filter::Good);
+                cr.paint().ok();
+            }
+            None => {
+                cr.set_source_rgba(1.0, 1.0, 1.0, 0.06);
+                cr.paint().ok();
+            }
+        }
+        cr.restore().ok();
+        rounded(cr, 0.5);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.10);
+        cr.set_line_width(1.0);
+        cr.stroke().ok();
+    });
+    area
 }
 
 /// Accent-color markup for query matches in a title (weight unchanged).
@@ -4519,8 +4671,9 @@ fn scroll_to_cached(ui: &Ui, index: usize) {
     let adj = ui.list_scroll.vadjustment();
     if top < adj.value() {
         adj.set_value(top);
-    } else if bottom > adj.value() + adj.page_size() {
-        adj.set_value(bottom - adj.page_size());
+    } else if bottom + LIST_PAD_BOTTOM as f64 > adj.value() + adj.page_size() {
+        // Keep the bottom padding in view too: the highlight ends clear of the path footer.
+        adj.set_value(bottom + LIST_PAD_BOTTOM as f64 - adj.page_size());
     }
 }
 
@@ -5418,7 +5571,7 @@ fn place_on_focused_monitor(ui: &Ui) {
 fn fit_to_monitor(ui: &Ui, height: i32) {
     let room = (height - CARD_TOP - BOTTOM_GAP - CARD_CHROME).max(200);
     // List: at most 7 rows; shrinks with content below that.
-    let list_cap = (MAX_VISIBLE_ROWS * ROW_HEIGHT).min(room);
+    let list_cap = LIST_CAP.min(room);
     ui.list_scroll.set_max_content_height(list_cap);
     ui.answer.set_max_height(room);
     ui.search_view.set_height(room.saturating_sub(60));
