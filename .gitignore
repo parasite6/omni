@@ -16,5 +16,6 @@ test*
 /.idea
 /.vscode
 /.claude/
-/docs/superpowers/
+/docs/
 /.delta/
+*super*
