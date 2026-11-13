@@ -223,7 +223,7 @@ One- and two-letter queries match name starts only. Every shown path is checked,
 - It is matched case-insensitively (`~/music` works), and symlinked folders resolve to their real location.
 - Scoped searches show files and folders only, and respect the filter.
 
-**Contents search** (<kbd>Ctrl</kbd> + <kbd>T</kbd>) also lists files whose text matches, from LocalSearch's full-text index. It is off by default and remembered in `~/.local/state/omni/contents`. It waits for a 0.7 s pause in typing, runs off the UI thread, and its results slot in when they arrive. A selection you moved with the arrow keys stays where you put it.
+**Contents search** (<kbd>Ctrl</kbd> + <kbd>T</kbd>) also lists files whose text matches. It is off by default and remembered in `~/.local/state/omni/contents`. Two sources run side by side, off the UI thread: LocalSearch's full-text index, and ripgrep over `~/Documents` and `~/Projects` (LocalSearch skips git repositories by default; ripgrep honours `.gitignore`). Every word must appear somewhere in the file, the last word also matches as a prefix, and any capital letter makes the search case-sensitive. It waits for a short pause in typing, results slot in as each source answers, and ripgrep's matches are listed above LocalSearch's. A selection you moved with the arrow keys stays where you put it.
 
 **Right-click a file** for **Open** or **Open with**. The file type is guessed from the name, so opening the menu never touches the disk.
 

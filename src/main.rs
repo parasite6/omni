@@ -25,7 +25,7 @@ mod web_protocol;
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,8 +36,8 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 const APP_ID: &str = "dev.omni.Launcher";
 
 /// LocalSearch change events received / file paths added from them (for the debug query).
-pub static LIVE_EVENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-pub static LIVE_ADDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static LIVE_EVENTS: AtomicUsize = AtomicUsize::new(0);
+pub static LIVE_ADDED: AtomicUsize = AtomicUsize::new(0);
 const MAX_APPS: usize = 6;
 const MAX_ACTIONS: usize = 3;
 /// Recent apps/files/folders shown under the bar when nothing is typed.
@@ -71,6 +71,8 @@ const MAX_OPEN_WITH: usize = 10;
 const CONTENT_DELAY: Duration = Duration::from_millis(120);
 /// Reuse identical Contents results for this long.
 const CONTENT_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Give up on a LocalSearch contents query after this long (ripgrep hits still show).
+const CONTENT_LS_TIMEOUT: Duration = Duration::from_secs(5);
 /// Flush streamed content hits to the UI at least this often.
 const CONTENT_BATCH: Duration = Duration::from_millis(50);
 /// Re-walk the disk this often (new files arrive in between via LocalSearch's events).
@@ -182,6 +184,10 @@ impl ContentKey {
 struct ContentHit {
     path: PathBuf,
     snippet: Option<String>,
+    /// Found by ripgrep in the user's own trees. These rank above LocalSearch's hits, which
+    /// arrive sooner but come from the whole home index (package caches and all), so
+    /// arrival order must not decide rank.
+    from_rg: bool,
 }
 
 /// In-memory Contents results. Old hits stay visible until the new request's first batch.
@@ -330,6 +336,8 @@ struct Ui {
     content_cancel: RefCell<Arc<AtomicBool>>,
     /// Live ripgrep child so a newer query can kill it immediately.
     content_rg: Arc<Mutex<Option<std::process::Child>>>,
+    /// In-flight LocalSearch query; cancelled so a superseded search stops occupying the indexer.
+    content_ls_cancel: RefCell<Option<gio::Cancellable>>,
     path_reveal: gtk::Revealer,
     path_box: gtk::Box,
     path_label: gtk::Label,
@@ -341,6 +349,9 @@ struct Ui {
     hover_gen: Cell<u64>,
     /// Query the list was last built for (to keep the selection when results fill in).
     shown_query: RefCell<String>,
+    /// The user chose the selected row (keys, wheel, hover, click) since the query last
+    /// changed. Only then do results filling in keep that row; otherwise the top row wins.
+    sel_chosen: Cell<bool>,
     /// Heartbeat timer for the watchdog; runs only while the popup is open.
     heartbeat: RefCell<Option<glib::SourceId>>,
     /// In a conversation with Claude: the search bar is the reply box, typing doesn't search.
@@ -1195,6 +1206,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         content_gen: Cell::new(0),
         content_cancel: RefCell::new(Arc::new(AtomicBool::new(false))),
         content_rg: Arc::new(Mutex::new(None)),
+        content_ls_cancel: RefCell::new(None),
         path_reveal: path_reveal.clone(),
         path_box: path_box.clone(),
         path_label: path_label.clone(),
@@ -1202,6 +1214,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         path_trunc_cache: RefCell::default(),
         hover_gen: Cell::new(0),
         shown_query: RefCell::default(),
+        sel_chosen: Cell::new(false),
         heartbeat: RefCell::default(),
         menu: RefCell::default(),
         chatting: Cell::new(false),
@@ -1879,12 +1892,15 @@ fn refresh(ui: &Ui) {
         hits.extend(claude_hit(ui, query));
     }
 
-    // Results filling in for the same query keep the same result (by stable id). A new
-    // query re-ranks everything, so the best match (row 0) is selected: following the old
-    // pick let a weaker match stay selected below better ones that just appeared.
+    // Results filling in for the same query keep a row the user chose (by stable id).
+    // Otherwise the best match (row 0) is selected, so a late, better result (contents
+    // hits arriving after the web row was on top) takes the selection.
     let prev_index = ui.selected_index.get();
     let same_query = *ui.shown_query.borrow() == query;
-    let prev_key = same_query
+    if !same_query {
+        ui.sel_chosen.set(false);
+    }
+    let prev_key = (same_query && ui.sel_chosen.get())
         .then(|| ui.hits.borrow().get(prev_index).map(hit_key))
         .flatten();
     let chrome_was_shown =
@@ -2243,10 +2259,13 @@ fn highlight_snippet(snippet: &str, query: &str) -> String {
     highlight_title(snippet, query)
 }
 
+/// `OMNI_LOG_CONTENTS` prints to stderr; the probe log (`omni-debug` marker) also gets
+/// these lines, so content timings survive a reinstall that restarts the daemon.
 fn contents_log(msg: impl std::fmt::Display) {
     if std::env::var_os("OMNI_LOG_CONTENTS").is_some() {
         eprintln!("omni[contents]: {msg}");
     }
+    probe::log(format_args!("contents: {msg}"));
 }
 
 fn sel_log(msg: impl std::fmt::Display) {
@@ -2568,6 +2587,9 @@ fn scoped_hits(ui: &Ui, dir: &std::path::Path, inner: &str) -> Vec<Hit> {
 
 fn cancel_content_backends(ui: &Ui) {
     ui.content_cancel.borrow().store(true, Ordering::SeqCst);
+    if let Some(c) = ui.content_ls_cancel.borrow_mut().take() {
+        c.cancel();
+    }
     if let Ok(mut slot) = ui.content_rg.lock() {
         if let Some(mut child) = slot.take() {
             let _ = child.kill();
@@ -2698,11 +2720,7 @@ fn apply_content_batch(
                     hits.clear();
                     *pending_key = Some(key.clone());
                 }
-                for h in batch {
-                    if !hits.iter().any(|e| e.path == h.path) {
-                        hits.push(h);
-                    }
-                }
+                insert_content_hits(hits, batch);
                 if done {
                     *searching = false;
                     *pending_key = None;
@@ -2712,9 +2730,11 @@ fn apply_content_batch(
                 }
             }
             _ => {
+                let mut hits = Vec::new();
+                insert_content_hits(&mut hits, batch);
                 *cache = ContentCache::Active {
                     key: key.clone(),
-                    hits: batch,
+                    hits,
                     searching: !done,
                     pending_key: if done { None } else { Some(key.clone()) },
                     ready_at: if done { Some(Instant::now()) } else { None },
@@ -2743,10 +2763,28 @@ fn apply_content_batch(
             t0.elapsed().as_millis(),
             key.query
         ));
-        if !done {
-            schedule_visible_snippets(ui);
+        schedule_visible_snippets(ui);
+    }
+}
+
+/// Add new content hits (dropping paths already present), ripgrep hits ahead of
+/// LocalSearch hits; each group keeps arrival order. A path both found upgrades to rg rank.
+fn insert_content_hits(hits: &mut Vec<ContentHit>, batch: Vec<ContentHit>) {
+    for h in batch {
+        if let Some(i) = hits.iter().position(|e| e.path == h.path) {
+            if h.from_rg && !hits[i].from_rg {
+                let mut old = hits.remove(i);
+                old.from_rg = true;
+                let at = hits.iter().position(|e| !e.from_rg).unwrap_or(hits.len());
+                hits.insert(at, old);
+            }
+            continue;
+        }
+        if h.from_rg {
+            let at = hits.iter().position(|e| !e.from_rg).unwrap_or(hits.len());
+            hits.insert(at, h);
         } else {
-            schedule_visible_snippets(ui);
+            hits.push(h);
         }
     }
 }
@@ -2873,6 +2911,13 @@ fn start_content_search(ui: &Ui, query: &str, scope: Option<&std::path::Path>, t
         return;
     }
     let conn = ui.sparql.borrow().clone();
+    let ls_cancel = gio::Cancellable::new();
+    *ui.content_ls_cancel.borrow_mut() = Some(ls_cancel.clone());
+    // A hung indexer must not leave "searching" stuck: give up on it after a few seconds.
+    {
+        let c = ls_cancel.clone();
+        glib::timeout_add_local_once(CONTENT_LS_TIMEOUT, move || c.cancel());
+    }
     let entry_snapshot = ui.entry.text().trim().to_string();
     let rg_slot = ui.content_rg.clone();
     let q = key.query.clone();
@@ -2938,129 +2983,122 @@ fn start_content_search(ui: &Ui, query: &str, scope: Option<&std::path::Path>, t
         }
     });
 
+    let sink = ContentSink {
+        tx,
+        generation,
+        key: key_for_worker,
+        t0,
+        entry_snapshot,
+        first: Arc::new(AtomicBool::new(true)),
+        remaining: Arc::new(AtomicUsize::new(2)),
+        found: Arc::new(AtomicUsize::new(0)),
+        error: Arc::new(Mutex::new(None)),
+    };
+
+    // LocalSearch (whole home index, tens of ms) and ripgrep (the user's own trees) run
+    // side by side; each streams its own batches and the last to finish sends `done`.
+    {
+        let sink = sink.clone();
+        let q = q.clone();
+        let scope = scope_path.clone();
+        let cancel = cancel.clone();
+        std::thread::Builder::new()
+            .name("omni-content-ls".into())
+            .spawn(move || {
+                let Some(conn) = conn.filter(|_| !cancel.load(Ordering::Relaxed)) else {
+                    sink.finish("ls", None);
+                    return;
+                };
+                let (hits, _sparql, err) =
+                    files::content_search_localsearch(&conn, &q, MAX_CONTENT, scope.as_deref(), Some(&ls_cancel));
+                if !cancel.load(Ordering::Relaxed) {
+                    sink.send(hits.into_iter().map(|h| ContentHit { path: h.path, snippet: None, from_rg: false }).collect());
+                }
+                sink.finish("ls", err);
+            })
+            .expect("content search thread");
+    }
+
     std::thread::Builder::new()
-        .name("omni-content".into())
+        .name("omni-content-rg".into())
         .spawn(move || {
-            let first_flag = Arc::new(AtomicBool::new(true));
-            let (stx, srx) =
-                std::sync::mpsc::channel::<(Vec<files::FtsHit>, String, Option<String>)>();
-
-            if let Some(conn) = conn {
-                let q2 = q.clone();
-                let scope2 = scope_path.clone();
-                let cancel2 = cancel.clone();
-                std::thread::Builder::new()
-                    .name("omni-content-ls".into())
-                    .spawn(move || {
-                        if cancel2.load(Ordering::Relaxed) {
-                            let _ = stx.send((Vec::new(), String::new(), None));
-                            return;
-                        }
-                        let r = files::content_search_localsearch(
-                            &conn,
-                            &q2,
-                            MAX_CONTENT,
-                            scope2.as_deref(),
-                        );
-                        let _ = stx.send(r);
-                    })
-                    .ok();
-            } else {
-                let _ = stx.send((Vec::new(), String::new(), None));
-            }
-
             let mut batch: Vec<ContentHit> = Vec::new();
             let mut last_flush = Instant::now();
             let mut total = 0usize;
-            let send_batch =
-                |chunk: Vec<ContentHit>, first_flag: &AtomicBool, tx: &std::sync::mpsc::Sender<ContentBatchMsg>| {
-                    if chunk.is_empty() {
-                        return;
-                    }
-                    let is_first = first_flag.swap(false, Ordering::SeqCst);
-                    let _ = tx.send(ContentBatchMsg {
-                        generation,
-                        key: key_for_worker.clone(),
-                        hits: chunk,
-                        done: false,
-                        err: None,
-                        t0,
-                        first: is_first,
-                        entry_snapshot: entry_snapshot.clone(),
-                    });
-                };
-
-            files::content_search_rg_stream(
-                &q,
-                MAX_CONTENT,
-                scope_path.as_deref(),
-                &cancel,
-                &rg_slot,
-                |hit| {
-                    total += 1;
-                    batch.push(ContentHit {
-                        path: hit.path,
-                        snippet: None,
-                    });
-                    if total == 1 || last_flush.elapsed() >= CONTENT_BATCH {
-                        send_batch(std::mem::take(&mut batch), &first_flag, &tx);
-                        last_flush = Instant::now();
-                    }
-                },
-            );
-            send_batch(std::mem::take(&mut batch), &first_flag, &tx);
-            contents_log(format!(
-                "timing rg_done t={}ms count={total} query={:?}",
-                t0.elapsed().as_millis(),
-                key_for_worker.query
-            ));
-
-            let (ls_hits, sparql, ls_err) = srx
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap_or_else(|_| (Vec::new(), String::new(), None));
-            contents_log(format!(
-                "timing ls_done t={}ms count={} sparql_len={} err={ls_err:?} query={:?}",
-                t0.elapsed().as_millis(),
-                ls_hits.len(),
-                sparql.len(),
-                key_for_worker.query
-            ));
-
-            if cancel.load(Ordering::Relaxed) {
-                let _ = tx.send(ContentBatchMsg {
-                    generation,
-                    key: key_for_worker,
-                    hits: Vec::new(),
-                    done: true,
-                    err: None,
-                    t0,
-                    first: false,
-                    entry_snapshot,
-                });
-                return;
-            }
-
-            let ls_batch: Vec<ContentHit> = ls_hits
-                .into_iter()
-                .map(|h| ContentHit {
-                    path: h.path,
-                    snippet: None,
-                })
-                .collect();
-            let is_first = first_flag.swap(false, Ordering::SeqCst);
-            let fail = ls_err.filter(|_| total == 0 && ls_batch.is_empty());
-            let _ = tx.send(ContentBatchMsg {
-                generation,
-                key: key_for_worker,
-                hits: ls_batch,
-                done: true,
-                err: fail,
-                t0,
-                first: is_first,
-                entry_snapshot,
+            files::content_search_rg_stream(&q, MAX_CONTENT, scope_path.as_deref(), &cancel, &rg_slot, |hit| {
+                total += 1;
+                batch.push(ContentHit { path: hit.path, snippet: None, from_rg: true });
+                if total == 1 || last_flush.elapsed() >= CONTENT_BATCH {
+                    sink.send(std::mem::take(&mut batch));
+                    last_flush = Instant::now();
+                }
             });
+            if !cancel.load(Ordering::Relaxed) {
+                sink.send(batch);
+            }
+            sink.finish("rg", None);
         })
         .expect("content search thread");
+}
+
+/// The content worker threads' shared way back to the UI thread. Exactly one `done`
+/// message is sent (by whichever backend finishes last): the UI poll stops at the first.
+#[derive(Clone)]
+struct ContentSink {
+    tx: std::sync::mpsc::Sender<ContentBatchMsg>,
+    generation: u64,
+    key: ContentKey,
+    t0: Instant,
+    entry_snapshot: String,
+    first: Arc<AtomicBool>,
+    /// Backends still running.
+    remaining: Arc<AtomicUsize>,
+    /// Hits sent so far (all backends).
+    found: Arc<AtomicUsize>,
+    /// A backend's failure, shown only when nothing at all was found.
+    error: Arc<Mutex<Option<String>>>,
+}
+
+impl ContentSink {
+    fn msg(&self, hits: Vec<ContentHit>, done: bool, err: Option<String>, first: bool) -> ContentBatchMsg {
+        ContentBatchMsg {
+            generation: self.generation,
+            key: self.key.clone(),
+            hits,
+            done,
+            err,
+            t0: self.t0,
+            first,
+            entry_snapshot: self.entry_snapshot.clone(),
+        }
+    }
+
+    fn send(&self, hits: Vec<ContentHit>) {
+        if hits.is_empty() {
+            return;
+        }
+        self.found.fetch_add(hits.len(), Ordering::SeqCst);
+        let first = self.first.swap(false, Ordering::SeqCst);
+        let _ = self.tx.send(self.msg(hits, false, None, first));
+    }
+
+    fn finish(&self, backend: &str, err: Option<String>) {
+        contents_log(format!(
+            "timing {backend}_done t={}ms found_so_far={} err={err:?} query={:?}",
+            self.t0.elapsed().as_millis(),
+            self.found.load(Ordering::SeqCst),
+            self.key.query
+        ));
+        if let Some(e) = err {
+            *self.error.lock().unwrap() = Some(e);
+        }
+        if self.remaining.fetch_sub(1, Ordering::SeqCst) != 1 {
+            return;
+        }
+        let err = self.error.lock().unwrap().take().filter(|_| self.found.load(Ordering::SeqCst) == 0);
+        let first = self.first.swap(false, Ordering::SeqCst);
+        let _ = self.tx.send(self.msg(Vec::new(), true, err, first));
+    }
 }
 
 /// Connect to LocalSearch off the UI thread; then listen for new files (added to the
@@ -3571,6 +3609,7 @@ fn cancel_selection_session(ui: &Ui) {
     ui.hover_pending_index.set(None);
     ui.hover_pointer.set((f64::NAN, f64::NAN));
     set_sel_transition_enabled(ui, false);
+    ui.sel_chosen.set(false);
     ui.selected_index.set(0);
     ui.list_scroll.vadjustment().set_value(0.0);
     // Reset transform to row-0 slot so reopen never inherits a lower-row y.
@@ -3595,6 +3634,7 @@ fn snap_selection_chrome(ui: &Ui) {
 
 /// Set owned selection; chrome placement updates the footer (no separate selection signal).
 fn set_selected_index(ui: &Ui, index: usize, animate: bool) {
+    ui.sel_chosen.set(true);
     let t0 = std::time::Instant::now();
     let count = ui.hits.borrow().len();
     sel_log(format!(

@@ -1412,7 +1412,7 @@ impl QueryToken {
     }
 }
 
-/// Split `query` on whitespace; keep `"quoted phrases"` as one token. Same tokens feed
+/// Split `query` on whitespace; keep `"quoted phrases"` (opened at a word start) as one token. Same tokens feed
 /// filename matching and LocalSearch `fts:match`.
 pub fn parse_query_tokens(query: &str) -> Vec<QueryToken> {
     let query = bounded_query(query);
@@ -1439,7 +1439,9 @@ pub fn parse_query_tokens(query: &str) -> Vec<QueryToken> {
                 break;
             }
         } else {
-            let end = rest.find(|c: char| c.is_whitespace() || c == '"').unwrap_or(rest.len());
+            // A quote inside a word is part of it (`print("hi")` is one literal token);
+            // only a quote at the start of a word opens a phrase.
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
             let word = &rest[..end];
             if !word.is_empty() {
                 tokens.push(QueryToken::Word(word.to_string()));
@@ -1498,8 +1500,13 @@ pub fn scope_file_uri(dir: &std::path::Path) -> String {
 }
 
 /// Build the LocalSearch FTS SPARQL for `query` (content via `fts:match`, not filename).
-/// Optional `scope` restricts to files under that directory (recursive STRSTARTS on nie:url).
+/// Optional `scope` restricts to files under that directory (recursive STRSTARTS on the file IRI).
 /// Paths only (no `fts:snippet`): snippets are filled lazily for visible rows.
+///
+/// Shape matters for speed: `nie:isStoredAs` already names the file by its `file://` IRI,
+/// so there is no `nie:url` join and no `DISTINCT` (duplicates are dropped by the caller),
+/// and no `fts:rank` (ranking scores every match: seconds for a common word, against tens
+/// of ms unranked).
 pub fn content_search_sparql(query: &str, limit: usize, scope: Option<&std::path::Path>) -> Option<String> {
     let tokens = parse_query_tokens(query);
     let fts = fts_match_expression(&tokens)?;
@@ -1507,13 +1514,11 @@ pub fn content_search_sparql(query: &str, limit: usize, scope: Option<&std::path
     let scope_filter = scope
         .map(|dir| {
             let uri = crate::sparql::escape(&scope_file_uri(dir));
-            format!(" FILTER(STRSTARTS(?u, \"{uri}\"))")
+            format!(" FILTER(STRSTARTS(STR(?u), \"{uri}\"))")
         })
         .unwrap_or_default();
     Some(format!(
-        "SELECT DISTINCT ?u WHERE {{ \
-         ?d fts:match \"{fts}\" ; nie:isStoredAs ?f . ?f nie:url ?u .{scope_filter} \
-         }} ORDER BY DESC(fts:rank(?d)) LIMIT {limit}"
+        "SELECT ?u WHERE {{ ?d fts:match \"{fts}\" ; nie:isStoredAs ?u .{scope_filter} }} LIMIT {limit}"
     ))
 }
 
@@ -1525,29 +1530,37 @@ pub fn content_search(
     limit: usize,
     scope: Option<&std::path::Path>,
 ) -> Vec<PathBuf> {
-    content_search_localsearch(conn, query, limit, scope)
+    content_search_localsearch(conn, query, limit, scope, None)
         .0
         .into_iter()
         .map(|h| h.path)
         .collect()
 }
 
-/// LocalSearch only (no ripgrep). Returns `(hits, sparql, error)`.
+/// LocalSearch only (no ripgrep). Returns `(hits, sparql, error)`. A cancelled query is
+/// not an error: it returns no hits and no message.
 pub fn content_search_localsearch(
     conn: &crate::sparql::Connection,
     query: &str,
     limit: usize,
     scope: Option<&std::path::Path>,
+    cancellable: Option<&gio::Cancellable>,
 ) -> (Vec<FtsHit>, String, Option<String>) {
-    let Some(sparql) = content_search_sparql(query, limit, scope) else {
+    // Over-fetch a little: several index entries can share one file, and missing files drop out.
+    let Some(sparql) = content_search_sparql(query, limit.saturating_mul(2), scope) else {
         return (Vec::new(), String::new(), None);
     };
-    match conn.query(&sparql) {
+    match conn.query_cancellable(&sparql, cancellable) {
         Ok(rows) => {
+            let mut seen = HashSet::new();
             let hits = rows
                 .iter()
                 .filter_map(|r| {
-                    let path = uri_to_path(r.first()?)?;
+                    let uri = r.first()?;
+                    if !seen.insert(uri.clone()) {
+                        return None;
+                    }
+                    let path = uri_to_path(uri)?;
                     if !path.exists() {
                         return None;
                     }
@@ -1556,9 +1569,11 @@ pub fn content_search_localsearch(
                         snippet: None,
                     })
                 })
+                .take(limit)
                 .collect();
             (hits, sparql, None)
         }
+        Err(e) if e.matches(gio::IOErrorEnum::Cancelled) => (Vec::new(), sparql, None),
         Err(e) => {
             eprintln!("omni: content search failed: {e}");
             (Vec::new(), sparql, Some(e.to_string()))
@@ -1571,41 +1586,72 @@ fn collapse_ws(s: &str) -> String {
 }
 
 /// Roots to scan with ripgrep: the scope folder, or configured trees when unscoped
-/// (`~/Documents/github`, `~/Projects`, `~/Documents` — never `$HOME`).
+/// (`~/Documents/github`, `~/Projects`, `~/Documents` — never `$HOME`). A root inside
+/// another root is dropped: ripgrep would scan it twice and print every hit twice.
 fn content_rg_roots(scope: Option<&std::path::Path>) -> Vec<PathBuf> {
     if let Some(dir) = scope {
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         return if dir.is_dir() { vec![dir] } else { Vec::new() };
     }
     let home = glib::home_dir();
-    let mut roots = Vec::new();
-    for rel in ["Documents/github", "Projects", "Documents"] {
-        let p = home.join(rel);
-        if p.is_dir() {
-            roots.push(p);
-        }
-    }
-    roots
+    let candidates = ["Documents/github", "Projects", "Documents"]
+        .iter()
+        .filter_map(|rel| std::fs::canonicalize(home.join(rel)).ok())
+        .filter(|p| p.is_dir())
+        .collect();
+    outermost_roots(candidates)
 }
 
-/// Whether `query` tokens need regex (prefix on last word, or special chars). Else `-F`.
-fn rg_use_fixed_strings(tokens: &[QueryToken]) -> bool {
-    if tokens.is_empty() {
-        return true;
-    }
-    let last = tokens.len() - 1;
-    for (i, tok) in tokens.iter().enumerate() {
-        match tok {
-            QueryToken::Phrase(_) => {}
-            QueryToken::Word(w) if i == last => return false, // prefix `\w*`
-            QueryToken::Word(w) => {
-                if w.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '-') {
-                    return false;
-                }
-            }
+/// Keep only roots that are not inside (or equal to) another kept root.
+fn outermost_roots(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots.sort_by_key(|p| p.components().count());
+    let mut kept: Vec<PathBuf> = Vec::new();
+    for r in roots {
+        if !kept.iter().any(|k| r.starts_with(k)) {
+            kept.push(r);
         }
     }
-    true
+    kept
+}
+
+fn token_text(tok: &QueryToken) -> &str {
+    match tok {
+        QueryToken::Word(s) | QueryToken::Phrase(s) => s,
+    }
+}
+
+/// One case rule for ripgrep and the in-process check, so they can't disagree:
+/// any uppercase letter anywhere makes the whole query case-sensitive.
+fn query_case_sensitive(tokens: &[QueryToken]) -> bool {
+    tokens.iter().any(|t| token_text(t).chars().any(char::is_uppercase))
+}
+
+/// The token ripgrep searches for; the rest are checked in-process. Longest is usually rarest.
+fn rg_driver_index(tokens: &[QueryToken]) -> usize {
+    tokens
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, t)| (token_text(t).len(), std::cmp::Reverse(*i)))
+        .map_or(0, |(i, _)| i)
+}
+
+/// Whether `path` contains every needle anywhere (not necessarily on one line). Reads at
+/// most 1 MB, the same cap ripgrep is given. Needles are pre-lowercased when
+/// `case_sensitive` is false; the file is ASCII-folded to match (so `Ä` doesn't fold).
+fn file_has_all(path: &std::path::Path, needles: &[Vec<u8>], case_sensitive: bool) -> bool {
+    use std::io::Read;
+    if needles.is_empty() {
+        return true;
+    }
+    let Ok(file) = std::fs::File::open(path) else { return false };
+    let mut buf = Vec::new();
+    if file.take(1024 * 1024).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    if !case_sensitive {
+        buf.make_ascii_lowercase();
+    }
+    needles.iter().all(|n| memchr::memmem::find(&buf, n).is_some())
 }
 
 fn rg_binary() -> Option<&'static str> {
@@ -1626,18 +1672,6 @@ fn rg_binary() -> Option<&'static str> {
     })
 }
 
-/// Escape a literal for ripgrep's default regex mode (prefix `term*`).
-fn rg_regex_literal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 2);
-    for c in s.chars() {
-        if matches!(c, '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^' | '$') {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// Blocking collect helper (tests). Prefer [`content_search_rg_stream`] in production.
 pub fn content_search_rg(query: &str, limit: usize, scope: Option<&std::path::Path>) -> Vec<FtsHit> {
     let cancel = AtomicBool::new(false);
@@ -1651,6 +1685,12 @@ pub fn content_search_rg(query: &str, limit: usize, scope: Option<&std::path::Pa
 
 /// Stream ripgrep hits via `on_hit`. Kills the process at `limit` or when `cancel` is set.
 /// No snippets here — callers fill those lazily for visible rows.
+///
+/// Every token must appear somewhere in the file (lines may differ). ripgrep has no
+/// "all of these patterns" switch, so it searches for one driver token and each file it
+/// lists is checked for the others here (it was just read, so it's in the page cache).
+/// All tokens are literals (`-F`): a file contains `foo` exactly when it contains a word
+/// starting with `foo`, so prefix matching needs no regex.
 pub fn content_search_rg_stream(
     query: &str,
     limit: usize,
@@ -1674,30 +1714,34 @@ pub fn content_search_rg_stream(
         return 0;
     };
 
+    let case_sensitive = query_case_sensitive(&tokens);
+    let driver = rg_driver_index(&tokens);
+    let others: Vec<Vec<u8>> = tokens
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != driver)
+        .map(|(_, t)| {
+            let t = token_text(t);
+            if case_sensitive { t.as_bytes().to_vec() } else { t.to_lowercase().into_bytes() }
+        })
+        .collect();
+
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(16);
     let mut cmd = std::process::Command::new(rg);
     cmd.args([
         "--files-with-matches",
-        "--max-count",
-        "1",
+        "--fixed-strings",
+        if case_sensitive { "--case-sensitive" } else { "--ignore-case" },
         "--max-filesize",
         "1M",
-        "--max-columns",
-        "300",
-        "--smart-case",
         "--no-messages",
         "--color=never",
         "--threads",
         &threads.to_string(),
     ]);
-    // Hidden dirs skipped by default (node_modules/.git via gitignore + these globs).
-    // Explicit scope may be a hidden folder — still search it as the root.
-    if scope.is_none() {
-        cmd.args(["--glob", "!.*/**"]);
-    }
+    // Hidden files/dirs are skipped by default and .gitignore is honoured; these cover
+    // build trees outside git repos. An explicit hidden scope is still searched as the root.
     cmd.args([
-        "--glob",
-        "!.git/**",
         "--glob",
         "!**/node_modules/**",
         "--glob",
@@ -1707,25 +1751,9 @@ pub fn content_search_rg_stream(
         "--glob",
         "!**/.cache/**",
     ]);
-    if tokens.len() > 1 {
-        cmd.arg("--all-match");
-    }
-    let fixed = rg_use_fixed_strings(&tokens);
-    if fixed {
-        cmd.arg("--fixed-strings");
-    }
-    let last = tokens.len() - 1;
-    for (i, tok) in tokens.iter().enumerate() {
-        let pat = match tok {
-            QueryToken::Phrase(p) if fixed => p.clone(),
-            QueryToken::Phrase(p) => rg_regex_literal(p),
-            QueryToken::Word(w) if fixed => w.clone(),
-            QueryToken::Word(w) if i == last => format!("{}\\w*", rg_regex_literal(w)),
-            QueryToken::Word(w) => rg_regex_literal(w),
-        };
-        cmd.arg("-e");
-        cmd.arg(pat);
-    }
+    cmd.arg("-e");
+    cmd.arg(token_text(&tokens[driver]));
+    cmd.arg("--");
     for root in &roots {
         cmd.arg(root);
     }
@@ -1740,6 +1768,7 @@ pub fn content_search_rg_stream(
         }
     };
     let stdout = child.stdout.take();
+    let pid = child.id();
     {
         let mut slot = child_slot.lock().unwrap();
         if let Some(mut old) = slot.take() {
@@ -1766,7 +1795,7 @@ pub fn content_search_rg_stream(
             continue;
         }
         let path = PathBuf::from(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(line));
-        if !path.is_file() {
+        if !file_has_all(&path, &others, case_sensitive) {
             continue;
         }
         on_hit(FtsHit {
@@ -1779,7 +1808,12 @@ pub fn content_search_rg_stream(
         }
     }
     // Cap reached or EOF: kill so a rare-term scan of a huge tree doesn't keep running.
-    if let Some(mut child) = child_slot.lock().unwrap().take() {
+    // Only our own child: a newer search may already have put its ripgrep in the slot.
+    let mine = {
+        let mut slot = child_slot.lock().unwrap();
+        if slot.as_ref().is_some_and(|c| c.id() == pid) { slot.take() } else { None }
+    };
+    if let Some(mut child) = mine {
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -1847,7 +1881,11 @@ mod tests {
         assert!(q.contains("fts:match"), "{q}");
         assert!(!q.contains("fts:snippet"), "{q}");
         assert!(q.contains("omnicontentprobeQUUX42XYZ*"), "{q}");
-        assert!(q.contains("ORDER BY DESC(fts:rank(?d))"), "{q}");
+        // Fast shape: the file IRI straight from nie:isStoredAs; no join, DISTINCT or rank.
+        assert!(q.contains("nie:isStoredAs ?u"), "{q}");
+        assert!(!q.contains("nie:url"), "{q}");
+        assert!(!q.contains("DISTINCT"), "{q}");
+        assert!(!q.contains("fts:rank"), "{q}");
         assert!(!q.contains("nfo:fileName"), "{q}");
         assert!(!q.contains("STRSTARTS"), "{q}");
         // Multi-word: AND all terms; prefix * only on the last bare word.
@@ -1863,10 +1901,10 @@ mod tests {
     fn content_sparql_scope_uses_strstarts_on_file_uri() {
         let dir = PathBuf::from("/home/someone/Documents");
         let q = content_search_sparql("needle", 4, Some(&dir)).unwrap();
-        assert!(q.contains("STRSTARTS(?u,"), "{q}");
+        // ?u is an IRI: STRSTARTS needs its string form.
+        assert!(q.contains("STRSTARTS(STR(?u),"), "{q}");
         assert!(q.contains("file:///home/someone/Documents/"), "{q}");
         assert!(q.contains("fts:match"), "{q}");
-        assert!(q.contains("ORDER BY DESC(fts:rank(?d))"), "{q}");
     }
 
     #[test]
@@ -1884,14 +1922,48 @@ mod tests {
         let _rm = Rm(dir.clone());
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let path = dir.join("note.txt");
-        std::fs::write(&path, b"unique zebrafluxcapacitor token here\n").unwrap();
+        std::fs::write(&path, b"unique zebrafluxcapacitor token here\nsecond Quasarline below\n").unwrap();
         let hits = content_search_rg("zebrafluxcapacitor", 4, Some(&dir));
         assert!(
             hits.iter().any(|h| h.path == path),
             "rg must find content inside a .git tree LocalSearch skips: {hits:?}"
         );
+        // Every word must be in the file, but they may sit on different lines.
+        let both = content_search_rg("zebrafluxcapacitor quasarline", 4, Some(&dir));
+        assert!(both.iter().any(|h| h.path == path), "{both:?}");
+        // Prefix of the last word still matches (zebraflux → zebrafluxcapacitor).
+        let prefix = content_search_rg("quasarline zebraflux", 4, Some(&dir));
+        assert!(prefix.iter().any(|h| h.path == path), "{prefix:?}");
+        // An uppercase letter makes the query case-sensitive.
+        let exact = content_search_rg("Quasarline zebraflux", 4, Some(&dir));
+        assert!(exact.iter().any(|h| h.path == path), "{exact:?}");
+        let wrong_case = content_search_rg("QUASARLINE zebraflux", 4, Some(&dir));
+        assert!(wrong_case.is_empty(), "{wrong_case:?}");
         let miss = content_search_rg("zebrafluxcapacitor nowhere", 4, Some(&dir));
         assert!(miss.is_empty(), "{miss:?}");
+    }
+
+    #[test]
+    fn content_rg_roots_drop_nested_roots() {
+        let roots = outermost_roots(vec![
+            PathBuf::from("/h/Documents/github"),
+            PathBuf::from("/h/Projects"),
+            PathBuf::from("/h/Documents"),
+            PathBuf::from("/h/Documents"),
+            PathBuf::from("/h/Documentsx"),
+        ]);
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("/h/Projects"), PathBuf::from("/h/Documents"), PathBuf::from("/h/Documentsx")]
+        );
+    }
+
+    #[test]
+    fn content_rg_driver_is_longest_token_and_case_rule_is_global() {
+        let t = parse_query_tokens("fn main \"hello there\"");
+        assert_eq!(rg_driver_index(&t), 2);
+        assert!(!query_case_sensitive(&t));
+        assert!(query_case_sensitive(&parse_query_tokens("fn Main")));
     }
 
     #[test]
@@ -1911,6 +1983,12 @@ mod tests {
                 QueryToken::Phrase("crystal clear".into()),
                 QueryToken::Word("water".into()),
             ]
+        );
+        // Code-like text with inner quotes stays one literal token.
+        assert_eq!(parse_query_tokens(r#"print("Fuck")"#), vec![QueryToken::Word(r#"print("Fuck")"#.into())]);
+        assert_eq!(
+            parse_query_tokens(r#"x="a b" y"#),
+            vec![QueryToken::Word(r#"x="a"#.into()), QueryToken::Word(r#"b""#.into()), QueryToken::Word("y".into())]
         );
         assert_eq!(fts_match_expression(&parse_query_tokens("alpha beta")).as_deref(), Some("alpha beta*"));
         assert_eq!(

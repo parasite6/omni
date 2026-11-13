@@ -5,6 +5,7 @@
 
 use std::ffi::{CStr, CString, c_char, c_int, c_long, c_void};
 
+use gtk::gio;
 use gtk::glib;
 use gtk::glib::translate::*;
 
@@ -57,10 +58,18 @@ impl Connection {
 
     /// Run a query and collect every row (each column as a string; missing = "").
     pub fn query(&self, sparql: &str) -> Result<Vec<Vec<String>>, glib::Error> {
+        self.query_cancellable(sparql, None)
+    }
+
+    /// [`Self::query`] that stops early (with `G_IO_ERROR_CANCELLED`) once `cancellable`
+    /// is cancelled, so a superseded search stops occupying the indexer.
+    pub fn query_cancellable(&self, sparql: &str, cancellable: Option<&gio::Cancellable>) -> Result<Vec<Vec<String>>, glib::Error> {
         let sparql = CString::new(sparql).map_err(|_| glib::Error::new(glib::FileError::Inval, "query contains a NUL byte"))?;
+        let cancel_ptr: *mut c_void = cancellable.map_or(std::ptr::null_mut(), |c| ToGlibPtr::<*mut gio::ffi::GCancellable>::to_glib_none(c).0 as *mut c_void);
         let mut error = std::ptr::null_mut();
-        // SAFETY: self.0 is a live connection; sparql is a valid C string.
-        let cursor = unsafe { tracker_sparql_connection_query(self.0, sparql.as_ptr(), std::ptr::null_mut(), &mut error) };
+        // SAFETY: self.0 is a live connection; sparql is a valid C string; the cancellable
+        // (if any) is borrowed for the duration of this call.
+        let cursor = unsafe { tracker_sparql_connection_query(self.0, sparql.as_ptr(), cancel_ptr, &mut error) };
         if cursor.is_null() {
             return Err(unsafe { from_glib_full(error) });
         }
@@ -69,7 +78,7 @@ impl Connection {
         unsafe {
             let n = tracker_sparql_cursor_get_n_columns(cursor);
             let mut error = std::ptr::null_mut();
-            while tracker_sparql_cursor_next(cursor, std::ptr::null_mut(), &mut error) != 0 {
+            while tracker_sparql_cursor_next(cursor, cancel_ptr, &mut error) != 0 {
                 let row = (0..n)
                     .map(|c| {
                         let s = tracker_sparql_cursor_get_string(cursor, c, std::ptr::null_mut());
