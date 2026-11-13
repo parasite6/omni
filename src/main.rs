@@ -17,6 +17,8 @@ mod search_provider;
 mod search_view;
 mod sparql;
 mod util;
+mod terminal;
+mod program;
 mod web;
 mod web_protocol;
 
@@ -255,6 +257,9 @@ struct Ui {
     search_provider: Cell<search_provider::SearchProvider>,
     /// Executable files run (after a confirmation) instead of opening in their default app.
     run_programs: Cell<bool>,
+    program_probe_pending: Cell<bool>,
+    program_probe_generation: Cell<u64>,
+    program_probe_workers: Cell<usize>,
     search_view: search_view::SearchView,
     entry: gtk::SearchEntry,
     list: gtk::ListBox,
@@ -371,6 +376,27 @@ struct Ui {
 }
 
 fn main() -> glib::ExitCode {
+    let helper_args: Vec<_> = std::env::args_os().collect();
+    if helper_args.get(1).is_some_and(|a| a == "--run-approved") {
+        scrub_env();
+        let mut status = match helper_args.get(4).filter(|s| !s.is_empty()) {
+            Some(path) => match std::os::unix::net::UnixStream::connect(path) {
+                Ok(stream) => Some(stream),
+                Err(e) => { eprintln!("omni: couldn't acknowledge launch: {e}"); return glib::ExitCode::FAILURE; }
+            },
+            None => None,
+        };
+        let result = match (helper_args.get(2), helper_args.get(3)) {
+            (Some(path), Some(identity)) => program::execute_notified(std::path::Path::new(path), &identity.to_string_lossy(), status.as_mut()),
+            _ => Err(std::io::Error::other("Missing approved program arguments")),
+        };
+        if let Err(e) = result {
+            use std::io::Write;
+            if let Some(status) = &mut status { let _ = write!(status, "{e}"); }
+            eprintln!("omni: {e}");
+        }
+        return glib::ExitCode::FAILURE;
+    }
     probe::init();
     probe::log("process start");
     scrub_env();
@@ -1122,6 +1148,9 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         settings_back: settings_back.clone(),
         search_provider: Cell::new(provider),
         run_programs: Cell::new(run_programs),
+        program_probe_pending: Cell::new(false),
+        program_probe_generation: Cell::new(0),
+        program_probe_workers: Cell::new(0),
         search_view,
         entry: entry.clone(),
         list: list.clone(),
@@ -1755,6 +1784,8 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
 
 /// Recompute results for the current query and rebuild the list.
 fn refresh(ui: &Ui) {
+    ui.program_probe_pending.set(false);
+    ui.program_probe_generation.set(ui.program_probe_generation.get().wrapping_add(1));
     // In a conversation the bar is the reply box: typing there is a reply, not a search.
     if ui.chatting.get() {
         return;
@@ -4816,6 +4847,10 @@ fn activate(ui: &Ui, index: usize) {
 }
 
 fn run(ui: &Ui, action: Action) {
+    run_checked(ui, action, true);
+}
+
+fn run_checked(ui: &Ui, action: Action, inspect_program: bool) {
     if matches!(action, Action::Info) {
         return;
     }
@@ -4865,10 +4900,44 @@ fn run(ui: &Ui, action: Action) {
         }
         return;
     }
-    if let Action::Open(file) = &action {
-        if let Some(path) = file.path().filter(|path| ui.run_programs.get() && is_program(path)) {
-            confirm_run(ui, path);
-            return;
+    if inspect_program {
+        if let Action::Open(file) = &action {
+            if let Some(path) = file.path().filter(|_| ui.run_programs.get()) {
+                if ui.program_probe_pending.get() { return; }
+                if ui.program_probe_workers.get() >= 2 { notify_user("File inspection busy", "A filesystem is not responding. Try again when it becomes available."); return; }
+                ui.program_probe_pending.set(true);
+                ui.program_probe_workers.set(ui.program_probe_workers.get() + 1);
+                let Some(me) = ui.me.borrow().upgrade() else { ui.program_probe_pending.set(false); return };
+                let query = ui.entry.text();
+                let generation = ui.program_probe_generation.get();
+                let weak = Rc::downgrade(&me);
+                let timeout = glib::timeout_add_local_once(Duration::from_secs(3), move || {
+                    if let Some(me) = weak.upgrade() {
+                        if me.program_probe_generation.get() == generation && me.program_probe_pending.get() {
+                            me.program_probe_generation.set(generation.wrapping_add(1));
+                            me.program_probe_pending.set(false);
+                            notify_user("File inspection timed out", "The filesystem did not respond. No program was launched.");
+                        }
+                    }
+                });
+                glib::spawn_future_local(async move {
+                    let probe_path = path.clone();
+                    let result = gio::spawn_blocking(move || program::inspect(&probe_path)).await;
+                    me.program_probe_workers.set(me.program_probe_workers.get().saturating_sub(1));
+                    // A timeout may have removed itself; remove only a live source.
+                    if glib::MainContext::default().find_source_by_id(&timeout).is_some() { timeout.remove(); }
+                    if me.program_probe_generation.get() == generation { me.program_probe_pending.set(false); }
+                    if me.program_probe_generation.get() != generation || !me.window.is_visible() || me.entry.text() != query || me.confirm.is_visible() || me.mode.get() != UiMode::Launcher { return; }
+                    match result {
+                        Ok(Ok(Some(identity))) => confirm_run(&me, path, identity),
+                        Ok(Ok(None)) => run_checked(&me, action, false),
+                        Ok(Err(e)) if matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::IsADirectory) => run_checked(&me, action, false),
+                        Ok(Err(e)) => notify_user("Couldn't inspect file", &e.to_string()),
+                        Err(_) => notify_user("Couldn't inspect file", "File inspection failed"),
+                    }
+                });
+                return;
+            }
         }
     }
     // Close first: launching can block (D-Bus activated apps wait up to 25 s), and the
@@ -5376,6 +5445,7 @@ fn confirm(ui: &Ui, text: &str, detail: &str, action: impl FnOnce(&Ui) + 'static
 /// Fill in and show the confirmation layer. `code`: the detail is a command or path,
 /// shown whole (wrapped, monospace) instead of shortened.
 fn show_confirm(ui: &Ui, text: &str, detail: &str, code: bool) {
+    ui.confirm.remove_css_class("omni-run-confirm");
     ui.confirm_text.set_label(text);
     ui.confirm_link_label.set_label(detail);
     ui.confirm_link_label.set_visible(!detail.is_empty());
@@ -5507,25 +5577,14 @@ fn confirm_link(ui: &Ui, uri: &str) {
 /// A file omni would run rather than open: a regular file the user may execute that is a
 /// binary (ELF, AppImages included) or a script with a `#!` line. The exec bit alone isn't
 /// enough: on NTFS / exFAT drives every file has it.
+#[cfg(test)]
 fn is_program(path: &std::path::Path) -> bool {
-    use std::io::Read;
-    use std::os::unix::ffi::OsStrExt;
-    if !path.is_file() {
-        return false;
-    }
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return false };
-    // SAFETY: a valid NUL-terminated path; access only reads it.
-    if unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } != 0 {
-        return false;
-    }
-    let mut magic = [0u8; 4];
-    let Ok(n) = std::fs::File::open(path).and_then(|mut f| f.read(&mut magic)) else { return false };
-    magic[..n].starts_with(b"\x7fELF") || magic[..n].starts_with(b"#!")
+    program::inspect(path).ok().flatten().is_some()
 }
 
 /// Running a program found by a search is easy to do by accident (a stray Enter on the
 /// wrong row), so ask first. Cancel has the focus, so Enter alone never runs anything.
-fn confirm_run(ui: &Ui, path: PathBuf) {
+fn confirm_run(ui: &Ui, path: PathBuf, identity: program::Identity) {
     // No line breaks: a file name with one could fake a second line of the question.
     let name = visible(&path.file_name().unwrap_or_default().to_string_lossy()).replace(['\n', '\t'], " ");
     show_confirm(
@@ -5534,12 +5593,13 @@ fn confirm_run(ui: &Ui, path: PathBuf) {
         &visible(&path.to_string_lossy()),
         true,
     );
+    ui.confirm.add_css_class("omni-run-confirm");
     ui.confirm_yes.set_label("Run");
     ui.confirm_no.set_label("Cancel");
     ui.confirm_always.set_visible(false);
     ui.confirm_action.replace(Some(Box::new(move |ui: &Ui| {
         hide(ui);
-        run_program(&path);
+        run_program(&path, &identity);
     })));
     ui.confirm_no_action.take();
     ui.confirm_always_action.take();
@@ -5548,8 +5608,9 @@ fn confirm_run(ui: &Ui, path: PathBuf) {
 }
 
 /// Start `path` from its own folder (programs often look for files beside themselves).
+/// Open the preferred terminal so output and interactive input have a visible home.
 /// GIO reaps it when it exits; omni doesn't wait for it.
-fn run_program(path: &std::path::Path) {
+fn run_program(path: &std::path::Path, identity: &program::Identity) {
     let launcher = gio::SubprocessLauncher::new(gio::SubprocessFlags::STDIN_INHERIT);
     if let Some(dir) = path.parent() {
         launcher.set_cwd(dir);
@@ -5557,10 +5618,33 @@ fn run_program(path: &std::path::Path) {
     for (key, value) in util::missing_x11_env() {
         launcher.setenv(key, value, true);
     }
-    match launcher.spawn(&[path.as_os_str()]) {
+    let receipt = match program::Receipt::new() {
+        Ok(receipt) => receipt,
+        Err(e) => { notify_user("Couldn't prepare program launch", &e.to_string()); return; }
+    };
+    let args = match terminal::approved_command(path, identity.encode(), &receipt.path()) {
+        Ok(args) => args,
+        Err(e) => {
+            notify_user("Couldn't open terminal", &e);
+            return;
+        }
+    };
+    match launcher.spawn(&args.iter().map(|s| s.as_os_str()).collect::<Vec<_>>()) {
         Ok(child) => {
-            child.wait_async(gio::Cancellable::NONE, |_| {});
-            recent::record(&gio::File::for_path(path));
+            let path = path.to_owned();
+            glib::spawn_future_local(async move {
+                match gio::spawn_blocking(move || receipt.wait()).await {
+                    Ok(Ok(())) => recent::record(&gio::File::for_path(path)),
+                    Ok(Err(e)) => notify_user("Program did not start", &e.to_string()),
+                    Err(_) => notify_user("Program did not start", "Launch acknowledgement failed"),
+                }
+            });
+            child.wait_check_async(gio::Cancellable::NONE, move |result| {
+                match result {
+                    Ok(()) => {},
+                    Err(e) => notify_user("Terminal or program launch failed", &e.to_string()),
+                }
+            });
         }
         Err(e) => {
             eprintln!("omni: couldn't run {}: {e}", path.display());
@@ -5592,6 +5676,8 @@ fn close_confirm(ui: &Ui) {
 }
 
 fn hide(ui: &Ui) {
+    ui.program_probe_pending.set(false);
+    ui.program_probe_generation.set(ui.program_probe_generation.get().wrapping_add(1));
     probe::log("hide enter");
     ui.search_view.stop();
     // Release the exclusive grab and flush it before unmapping. Launching blocks this

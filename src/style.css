@@ -1072,3 +1072,65 @@ entry.omni-settings-entry text selection {
 .omni-search-brand {
   color: @omni_text_secondary;
 }
+
+/* Executable prompt: compact surfaces and quiet interaction feedback. */
+.omni-run-confirm .omni-confirm-box {
+  padding: 16px;
+  border-radius: 8px;
+  border: 1px solid alpha(@omni_border, 0.08);
+  box-shadow: none;
+  border-spacing: 10px;
+}
+
+.omni-run-confirm .omni-confirm-text {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.omni-run-confirm .omni-confirm-code {
+  padding: 8px;
+  border-radius: 4px;
+  background-color: alpha(@omni_hover, 0.03);
+  color: @omni_text_secondary;
+}
+
+.omni-run-confirm .omni-answer-button {
+  min-height: 28px;
+  padding: 0 12px;
+  border-radius: 4px;
+  border: none;
+  outline: none;
+  box-shadow: none;
+  transition: background-color 100ms ease;
+}
+
+.omni-run-confirm .omni-answer-button:focus-visible {
+  outline: none;
+  box-shadow: none;
+  background-color: alpha(@omni_hover, 0.08);
+}
+
+.omni-run-confirm .omni-answer-button:hover {
+  background-color: alpha(@omni_hover, 0.08);
+}
+
+.omni-run-confirm .omni-answer-button:active {
+  background-color: alpha(@omni_hover, 0.12);
+}
+
+.omni-run-confirm .omni-confirm-yes {
+  background-color: alpha(@omni_accent, 0.10);
+}
+
+.omni-run-confirm .omni-confirm-yes:hover,
+.omni-run-confirm .omni-confirm-yes:focus-visible {
+  background-color: alpha(@omni_accent, 0.16);
+}
+
+.omni-run-confirm .omni-confirm-yes:active {
+  background-color: alpha(@omni_accent, 0.22);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .omni-run-confirm .omni-answer-button { transition: none; }
+}

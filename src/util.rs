@@ -121,3 +121,13 @@ mod tests {
         assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
     }
 }
+
+#[cfg(test)]
+pub fn private_test_dir(prefix: &str) -> std::path::PathBuf {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let template = std::env::temp_dir().join(format!("{prefix}-XXXXXX"));
+    let mut bytes = std::ffi::CString::new(template.as_os_str().as_bytes()).unwrap().into_bytes_with_nul();
+    assert!(!unsafe { libc::mkdtemp(bytes.as_mut_ptr().cast()) }.is_null());
+    bytes.pop();
+    std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes))
+}
