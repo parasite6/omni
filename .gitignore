@@ -17,3 +17,4 @@ test*
 /.vscode
 /.claude/
 /docs/superpowers/
+/.delta/
