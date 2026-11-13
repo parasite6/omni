@@ -151,4 +151,68 @@ mod tests {
         assert!(parse(&[1, 0, 0, 0, 9], &mut out).is_err());
         assert!(parse(&u32::MAX.to_le_bytes(), &mut out).is_err());
     }
+    #[test]
+    fn every_split_of_a_message_waits_for_the_complete_payload() {
+        let frame = Writer::new(LOAD, 42).str("https://example.test/é?q=☃").finish();
+        for split in 0..frame.len() {
+            let mut messages = Vec::new();
+            assert_eq!(parse(&frame[..split], &mut messages), Ok(0), "split {split}");
+            assert!(messages.is_empty());
+        }
+        let mut messages = Vec::new();
+        assert_eq!(parse(&frame, &mut messages), Ok(frame.len()));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].str().as_deref(), Some("https://example.test/é?q=☃"));
+    }
+
+    #[test]
+    fn byte_at_a_time_stream_preserves_order_and_exactly_once_delivery() {
+        let mut wire = Writer::new(LOAD, 8).str("one").finish();
+        wire.extend(Writer::new(LOAD, 9).str("two").finish());
+        wire.extend(Writer::new(CLOSE, 8).finish());
+        let mut pending = Vec::new();
+        let mut received = Vec::new();
+        for byte in wire {
+            pending.push(byte);
+            let consumed = {
+                let mut messages = Vec::new();
+                let consumed = parse(&pending, &mut messages).unwrap();
+                received.extend(messages.iter_mut().map(|m| (m.tag, m.id, m.str())));
+                consumed
+            };
+            pending.drain(..consumed);
+        }
+        assert!(pending.is_empty());
+        assert_eq!(received, vec![(LOAD, 8, Some("one".into())), (LOAD, 9, Some("two".into())), (CLOSE, 8, None)]);
+    }
+
+    #[test]
+    fn payload_readers_reject_truncation_and_invalid_utf8() {
+        for payload in [vec![0, 0, 0], vec![5, 0, 0, 0, b'a'], vec![1, 0, 0, 0, 0xff]] {
+            let frame = Writer::new(LOAD, 1).bytes(&payload).finish();
+            let mut messages = Vec::new();
+            parse(&frame, &mut messages).unwrap();
+            assert_eq!(messages[0].str(), None);
+        }
+        let frame = Writer::new(VISIBLE, 1).flag(false).flag(true).int(i32::MIN).finish();
+        let mut messages = Vec::new();
+        parse(&frame, &mut messages).unwrap();
+        let message = &mut messages[0];
+        assert_eq!(message.flag(), Some(false));
+        assert_eq!(message.flag(), Some(true));
+        assert_eq!(message.int(), Some(i32::MIN));
+        assert_eq!(message.int(), None);
+        assert_eq!(message.flag(), None);
+    }
+
+    #[test]
+    fn frame_length_limits_distinguish_incomplete_from_invalid() {
+        for length in [0, 1, 4, MAX_MESSAGE as u32 + 1, u32::MAX] {
+            assert!(parse(&length.to_le_bytes(), &mut Vec::new()).is_err());
+        }
+        for length in [5, MAX_MESSAGE as u32] {
+            assert_eq!(parse(&length.to_le_bytes(), &mut Vec::new()), Ok(0));
+        }
+    }
+
 }

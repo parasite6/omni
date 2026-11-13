@@ -1870,10 +1870,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires ripgrep; run explicitly with --ignored"]
     fn content_rg_finds_file_under_git_scope() {
-        if rg_binary().is_none() {
-            return;
-        }
+        assert!(rg_binary().is_some(), "ripgrep is required for this integration check");
         let dir = std::env::temp_dir().join(format!("omni-rg-{}-git", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         struct Rm(PathBuf);
@@ -2117,4 +2116,45 @@ mod tests {
         let _ = index.search(&border, 5, 3, None);
         let _ = index.search(&"é".repeat(200), 5, 3, None);
     }
+    #[test]
+    fn fts_operators_and_punctuation_are_literal_search_terms() {
+        for word in ["AND", "or", "NOT", "NEAR", "a-b", "é", "x:y", "*"] {
+            let tokens = vec![QueryToken::Word(word.into())];
+            let expression = fts_match_expression(&tokens).unwrap();
+            assert_eq!(expression, format!("\"{word}\""));
+        }
+        assert_eq!(fts_match_expression(&[QueryToken::Phrase("say \"hi\"".into())]).as_deref(), Some("\"say \"\"hi\"\"\""));
+        assert_eq!(fts_match_expression(&[]), None);
+    }
+
+    #[test]
+    fn busy_stat_gate_does_not_start_another_worker() {
+        static BUSY: AtomicBool = AtomicBool::new(true);
+        let result = timed_batch_on::<()>(&BUSY, |_, _| panic!("busy gate must skip work"));
+        assert!(result.is_none());
+        assert!(BUSY.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stat_timeout_preserves_partial_results_cancels_and_releases_gate() {
+        static GATE: AtomicBool = AtomicBool::new(false);
+        let (ended, exit) = mpsc::channel();
+        let batch = timed_batch_on(&GATE, move |tx, cancel| {
+            tx.send(7).unwrap();
+            while !cancel.load(Ordering::Acquire) { std::thread::yield_now(); }
+            ended.send(()).unwrap();
+        }).expect("fresh gate");
+        assert!(!batch.finished);
+        assert_eq!(batch.items, vec![7]);
+        exit.recv_timeout(Duration::from_secs(2)).expect("worker observed cancellation");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while GATE.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!GATE.load(Ordering::Acquire), "completed worker must release gate");
+        let next = timed_batch_on(&GATE, |tx, _| { tx.send(8).unwrap(); }).unwrap();
+        assert!(next.finished);
+        assert_eq!(next.items, vec![8]);
+    }
+
 }

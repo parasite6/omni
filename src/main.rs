@@ -5,12 +5,14 @@ mod apps;
 mod calc;
 mod dock;
 mod files;
+mod filter_label;
 mod glass;
 mod images;
 mod probe;
 mod recent;
 mod ring;
 mod services;
+mod search_icon;
 mod search_provider;
 mod search_view;
 mod sparql;
@@ -665,6 +667,35 @@ fn load_css() {
     }
 }
 
+// Keep the input target fixed; only its non-interactive thumb is animated.
+fn settings_switch(active: bool) -> gtk::ToggleButton {
+    let thumb = gtk::Box::builder()
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Center)
+        .can_target(false)
+        .css_classes(["omni-switch-thumb"])
+        .build();
+    let button = gtk::ToggleButton::builder()
+        .active(active)
+        .focus_on_click(false)
+        .child(&thumb)
+        .valign(gtk::Align::Center)
+        .accessible_role(gtk::AccessibleRole::Switch)
+        .css_classes(["omni-switch"])
+        .build();
+    let sync_state = |button: &gtk::ToggleButton| {
+        let checked = if button.is_active() { gtk::AccessibleTristate::True }
+            else { gtk::AccessibleTristate::False };
+        button.update_state(&[gtk::accessible::State::Checked(checked)]);
+    };
+    sync_state(&button);
+    button.connect_toggled(move |button| {
+        sync_state(button);
+        button.add_css_class("omni-switch-animated");
+    });
+    button
+}
+
 fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     load_css();
 
@@ -699,12 +730,13 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     let contents = gtk::ToggleButton::builder()
         .label("Contents")
         .tooltip_text("Also match text inside files (Ctrl+T)")
-        .css_classes(["omni-toggle"])
+        .css_classes(["omni-toggle", "omni-contents-toggle"])
         .valign(gtk::Align::Center)
         .focus_on_click(false)
         .build();
 
-    let filter_label = gtk::Label::new(Some("All"));
+    let filter_label = gtk::Label::builder().label("All").xalign(0.0).build();
+    filter_label::configure(&filter_label);
     let filter_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     filter_content.set_halign(gtk::Align::Center);
     filter_content.append(&filter_label);
@@ -712,16 +744,24 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     let filter_button = gtk::Button::builder()
         .child(&filter_content)
         .tooltip_text("Show only some kinds of results (Ctrl+F)")
-        .css_classes(["omni-toggle", "omni-filter"])
+        .css_classes(["omni-toggle", "omni-filter", "omni-dropdown-trigger"])
         .valign(gtk::Align::Center)
         .focus_on_click(false)
         .build();
 
+    let launcher_plane = gtk::Overlay::new();
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     bar.add_css_class("omni-bar");
+    let header = gtk::Overlay::builder().child(&bar).build();
     // Overlay kept for layout stability; SearchRing currently draws nothing (flat search).
     let search = gtk::Overlay::builder().child(&entry).hexpand(true).build();
     search.add_overlay(&ring::SearchRing::new());
+    // Reserve room for the larger mark and its softly tethered glass lens.
+    if let Some(icon) = entry.first_child().filter(|c| c.is::<gtk::Image>()) {
+        icon.set_opacity(0.0);
+        icon.set_size_request(64, -1);
+        search.add_overlay(&search_icon::new(&search, &header, &launcher_plane));
+    }
     bar.append(&search);
     bar.append(&filter_button);
     bar.append(&contents);
@@ -785,10 +825,11 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     // Face = content + path strip edge-to-edge inside the frame (mockup vessel).
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.add_css_class("omni-content");
-    content.append(&bar);
+    content.append(&header);
     content.append(&reveal);
     let surface = gtk::Box::new(gtk::Orientation::Vertical, 0);
     surface.add_css_class("omni-glass");
+    surface.add_css_class("omni-launcher-surface");
     surface.append(&content);
 
     // Claude's answer replaces the result list while it's showing.
@@ -863,7 +904,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .build();
     surface.append(&path_reveal);
 
-    let launcher_plane = gtk::Overlay::builder().child(&surface).build();
+    launcher_plane.set_child(Some(&surface));
     let settings_button = gtk::Button::builder()
         .icon_name("preferences-system-symbolic")
         .tooltip_text("Settings")
@@ -887,7 +928,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     let gear = settings_button.clone();
     corner_hover.connect_leave(move |_| gear.set_can_target(false));
     settings_slip.add_controller(corner_hover);
-    launcher_plane.add_overlay(&settings_slip);
+    header.add_overlay(&settings_slip);
 
     let back_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     back_content.append(&gtk::Image::from_icon_name("go-previous-symbolic"));
@@ -911,14 +952,14 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     search_settings.add_css_class("omni-settings-row");
     let search_label = gtk::Label::builder().label("Search engine").xalign(0.0).hexpand(true).build();
     search_label.add_css_class("omni-settings-title");
-    // Same look as the result filter: a quiet text button that opens an omni menu.
+    // The provider trigger and popup share the same compact surface and width.
     let engine_label = gtk::Label::new(Some(provider.name()));
     let engine_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     engine_content.append(&engine_label);
     engine_content.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
     let engine_button = gtk::Button::builder()
         .child(&engine_content)
-        .css_classes(["omni-toggle", "omni-filter"])
+        .css_classes(["omni-toggle", "omni-filter", "omni-dropdown-trigger"])
         .valign(gtk::Align::Center)
         .build();
     engine_button.update_relation(&[gtk::accessible::Relation::LabelledBy(&[search_label.upcast_ref()])]);
@@ -941,7 +982,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .build();
     run_hint.add_css_class("omni-status-hint");
     run_text.append(&run_hint);
-    let run_switch = gtk::Switch::builder().active(run_programs).valign(gtk::Align::Center).css_classes(["omni-switch"]).build();
+    let run_switch = settings_switch(run_programs);
     // Screen readers announce the switch by its title, with the hint as its description.
     run_switch.update_relation(&[
         gtk::accessible::Relation::LabelledBy(&[run_title.upcast_ref()]),
@@ -971,7 +1012,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     img_status.add_css_class("omni-status-hint");
     img_status.add_css_class("omni-settings-status");
     img_text.append(&img_status);
-    let img_switch = gtk::Switch::builder().active(images::auto_crawl()).valign(gtk::Align::Center).css_classes(["omni-switch"]).build();
+    let img_switch = settings_switch(images::auto_crawl());
     img_switch.update_relation(&[
         gtk::accessible::Relation::LabelledBy(&[img_title.upcast_ref()]),
         gtk::accessible::Relation::DescribedBy(&[img_hint.upcast_ref()]),
@@ -1341,8 +1382,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     filter_label.set_label(&filter_name(ui.filter.get()));
     let u = ui.clone();
     filter_button.connect_clicked(move |_| {
-        show_filter_menu(&u, false);
-        u.entry.grab_focus();
+        show_filter_menu(&u, u.window.gets_focus_visible());
     });
 
     // Re-read apps when something is installed or removed. GIO stops sending "changed"
@@ -3700,6 +3740,49 @@ fn filter_click(bits: u8, clicked: u8) -> u8 {
     if next == 0 { SHOW_ALL } else { next }
 }
 
+
+fn set_dropdown_option_checked(button: &gtk::Button, checked: bool) {
+    button.update_state(&[gtk::accessible::State::Checked(if checked {
+        gtk::AccessibleTristate::True
+    } else {
+        gtk::AccessibleTristate::False
+    })]);
+    if let Some(check) = button.child().and_then(|row| row.last_child()) {
+        check.set_opacity(if checked { 1.0 } else { 0.0 });
+    }
+    if checked { button.add_css_class("omni-filter-on"); }
+    else { button.remove_css_class("omni-filter-on"); }
+}
+
+fn fit_dropdown_to_options(items: &gtk::Box) {
+    // Measure all rows afresh, independent of the trigger's selected label.
+    items.set_size_request(-1, -1);
+    let (_, natural, _, _) = items.measure(gtk::Orientation::Horizontal, -1);
+    items.set_size_request(natural, -1);
+}
+
+fn match_dropdown_width(menu: &gtk::Popover, items: &gtk::Box, anchor: &gtk::Widget) {
+    items.set_size_request((anchor.width() - 2).max(0), -1);
+    let Some(label) = anchor.first_child().and_then(|content| content.first_child()).and_downcast::<gtk::Label>() else { return };
+    let weak_items = items.downgrade();
+    let weak_anchor = anchor.downgrade();
+    // GtkWidget has no width notification. A changed label invalidates its
+    // natural size before the next allocation; use that to resize the popup.
+    let handler = label.connect_label_notify(move |_| {
+        if let (Some(items), Some(anchor)) = (weak_items.upgrade(), weak_anchor.upgrade()) {
+            let (_, natural, _, _) = anchor.measure(gtk::Orientation::Horizontal, -1);
+            items.set_size_request((natural - 2).max(0), -1);
+        }
+    });
+    let weak_label = label.downgrade();
+    let handler = RefCell::new(Some(handler));
+    menu.connect_closed(move |_| {
+        if let (Some(label), Some(handler)) = (weak_label.upgrade(), handler.borrow_mut().take()) {
+            label.disconnect(handler);
+        }
+    });
+}
+
 /// The filter dropdown: All / Apps / Files / Folders, picked ones lit. It stays open while
 /// kinds are picked, and the results update behind it on every click.
 fn show_filter_menu(ui: &Ui, keyboard: bool) {
@@ -3710,10 +3793,11 @@ fn show_filter_menu(ui: &Ui, keyboard: bool) {
         .position(gtk::PositionType::Bottom)
         .build();
     menu.add_css_class("omni-menu");
-    let items = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu.add_css_class("omni-filter-menu");
+    menu.add_css_class("omni-dropdown-menu");
+    let items = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).accessible_role(gtk::AccessibleRole::Menu).build();
 
-    // Rows are just the kind names; picked ones are lit (no checkmark column, so the
-    // menu fits the button's width).
+    // Use the same compact label/check layout as the provider picker.
     let rows: Vec<(u8, &str)> = std::iter::once((SHOW_ALL, "All")).chain(FILTER_KINDS).collect();
     let buttons: Rc<Vec<(u8, gtk::Button)>> = Rc::new(
         rows.iter()
@@ -3724,10 +3808,18 @@ fn show_filter_menu(ui: &Ui, keyboard: bool) {
                     .halign(gtk::Align::Start)
                     .ellipsize(gtk::pango::EllipsizeMode::End)
                     .build();
+                label.set_hexpand(true);
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                row.append(&label);
+                let check = gtk::Image::builder().icon_name("object-select-symbolic").accessible_role(gtk::AccessibleRole::Presentation).build();
+                check.add_css_class("omni-dropdown-check");
+                check.set_pixel_size(14);
+                row.append(&check);
                 (
                     *bit,
                     gtk::Button::builder()
-                        .child(&label)
+                        .child(&row)
+                        .accessible_role(gtk::AccessibleRole::MenuItemCheckbox)
                         .css_classes(["flat", "omni-menu-item"])
                         .build(),
                 )
@@ -3740,11 +3832,7 @@ fn show_filter_menu(ui: &Ui, keyboard: bool) {
             let bits = ui.filter.get();
             for (bit, button) in buttons.iter() {
                 let on = if *bit == SHOW_ALL { bits == SHOW_ALL } else { bits != SHOW_ALL && bits & bit != 0 };
-                if on {
-                    button.add_css_class("omni-filter-on");
-                } else {
-                    button.remove_css_class("omni-filter-on");
-                }
+                set_dropdown_option_checked(button, on);
             }
             if let Some(label) = ui.filter_button.child().and_then(|c| c.first_child()).and_downcast::<gtk::Label>() {
                 label.set_label(&filter_name(bits));
@@ -3779,43 +3867,26 @@ fn show_filter_menu(ui: &Ui, keyboard: bool) {
         }
         window.set_focus_visible(keyboard);
     });
-    menu.add_css_class("omni-filter-menu");
     menu.set_child(Some(&items));
     menu.set_parent(&ui.filter_button);
-    // Fit-content width, min = All button + 24px. Centered under the button, 6px below;
-    // clamp so the popup stays 8px inside the panel's right edge.
-    let button = &ui.filter_button;
-    let mut widest = 0;
-    for (_, b) in buttons.iter() {
-        let (_, nat, _, _) = b.measure(gtk::Orientation::Horizontal, -1);
-        widest = widest.max(nat);
-    }
-    let pad = 8; // contents padding 4px × 2
-    let width = (widest + pad).max(button.width() + 24).max(1);
-    items.set_size_request(width, -1);
-    menu.set_halign(gtk::Align::Center);
-    let mut ox = 0i32;
-    if let (Some(panel), Some(btn)) = (ui.card.compute_bounds(&ui.window), button.compute_bounds(&ui.window)) {
-        let btn_cx = btn.x() + btn.width() / 2.0;
-        let panel_right = panel.x() + panel.width() - 8.0;
-        let pop_right = btn_cx + width as f32 / 2.0;
-        if pop_right > panel_right {
-            ox = (panel_right - pop_right).round() as i32;
-        }
-    }
-    menu.set_offset(ox, 6);
-    menu.set_pointing_to(Some(&gdk::Rectangle::new(0, 0, button.width(), button.height())));
+    fit_dropdown_to_options(&items);
+    menu.set_offset(0, 2);
 
     let weak = Rc::downgrade(&me);
     menu.connect_closed(move |menu| {
         let menu = menu.clone();
+        let anchor = menu.parent();
         let weak = weak.clone();
         glib::idle_add_local_once(move || {
             if menu.parent().is_some() {
                 menu.unparent();
             }
             let Some(ui) = weak.upgrade() else { return };
-            if ui.menu.borrow().as_ref() == Some(&menu) {
+            let current = ui.menu.borrow().as_ref() == Some(&menu);
+            if current || ui.menu.borrow().is_none() {
+                if let Some(anchor) = anchor { anchor.remove_css_class("omni-dropdown-open"); }
+            }
+            if current {
                 ui.menu.replace(None);
                 if ui.window.is_visible() {
                     ui.entry.grab_focus();
@@ -3826,6 +3897,7 @@ fn show_filter_menu(ui: &Ui, keyboard: bool) {
     if let Some(old) = ui.menu.replace(Some(menu.clone())) {
         old.popdown();
     }
+    ui.filter_button.add_css_class("omni-dropdown-open");
     menu.popup();
 }
 
@@ -3833,18 +3905,24 @@ fn show_filter_menu(ui: &Ui, keyboard: bool) {
 /// picking one closes it.
 fn show_pick_menu(ui: &Ui, anchor: &gtk::Widget, names: &[&str], current: usize, on_pick: impl Fn(usize) + 'static) {
     let Some(me) = ui.me.borrow().upgrade() else { return };
+    let keyboard = ui.window.gets_focus_visible();
     let menu = gtk::Popover::builder().has_arrow(false).autohide(false).position(gtk::PositionType::Bottom).build();
     menu.add_css_class("omni-menu");
     menu.add_css_class("omni-filter-menu");
-    let items = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu.add_css_class("omni-dropdown-menu");
+    let items = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(2).accessible_role(gtk::AccessibleRole::Menu).build();
     let on_pick = Rc::new(on_pick);
     let mut first = None;
     for (i, name) in names.iter().enumerate() {
-        let label = gtk::Label::builder().label(*name).xalign(0.0).build();
-        let button = gtk::Button::builder().child(&label).css_classes(["flat", "omni-menu-item"]).build();
-        if i == current {
-            button.add_css_class("omni-filter-on");
-        }
+        let label = gtk::Label::builder().label(*name).xalign(0.0).hexpand(true).build();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        row.append(&label);
+        let check = gtk::Image::builder().icon_name("object-select-symbolic").accessible_role(gtk::AccessibleRole::Presentation).build();
+        check.add_css_class("omni-dropdown-check");
+        check.set_pixel_size(14);
+        row.append(&check);
+        let button = gtk::Button::builder().child(&row).accessible_role(gtk::AccessibleRole::MenuItemRadio).css_classes(["flat", "omni-menu-item"]).build();
+        set_dropdown_option_checked(&button, i == current);
         let (me, on_pick) = (me.clone(), on_pick.clone());
         button.connect_clicked(move |_| {
             on_pick(i);
@@ -3853,35 +3931,46 @@ fn show_pick_menu(ui: &Ui, anchor: &gtk::Widget, names: &[&str], current: usize,
         first.get_or_insert_with(|| button.clone());
         items.append(&button);
     }
-    let (_, nat, _, _) = items.measure(gtk::Orientation::Horizontal, -1);
-    items.set_size_request(nat.max(anchor.width() + 24), -1);
+    // The popup's 1px border is outside the content width. Its row uses the
+    // same label/icon spacing and horizontal padding as the trigger.
+    match_dropdown_width(&menu, &items, anchor);
     let window = ui.window.clone();
     items.connect_map(move |_| {
         if let Some(first) = &first {
             first.grab_focus();
         }
-        window.set_focus_visible(false);
+        window.set_focus_visible(keyboard);
     });
     menu.set_child(Some(&items));
     menu.set_parent(anchor);
-    menu.set_offset(0, 6);
+    menu.set_offset(0, 2);
     let weak = Rc::downgrade(&me);
     menu.connect_closed(move |menu| {
         let menu = menu.clone();
+        let anchor = menu.parent();
         let weak = weak.clone();
         glib::idle_add_local_once(move || {
             if menu.parent().is_some() {
                 menu.unparent();
             }
             let Some(ui) = weak.upgrade() else { return };
-            if ui.menu.borrow().as_ref() == Some(&menu) {
+            let current = ui.menu.borrow().as_ref() == Some(&menu);
+            if current || ui.menu.borrow().is_none() {
+                if let Some(anchor) = &anchor { anchor.remove_css_class("omni-dropdown-open"); }
+            }
+            if current {
                 ui.menu.replace(None);
+                if keyboard && ui.window.is_visible() {
+                    if let Some(anchor) = &anchor { anchor.grab_focus(); }
+                    ui.window.set_focus_visible(true);
+                }
             }
         });
     });
     if let Some(old) = ui.menu.replace(Some(menu.clone())) {
         old.popdown();
     }
+    anchor.add_css_class("omni-dropdown-open");
     menu.popup();
 }
 
@@ -5898,14 +5987,125 @@ mod filter_tests {
     }
 
     #[test]
-    fn settings_gear_css_has_rest_hover_and_reduced_motion_states() {
-        assert!(DEFAULT_CSS.contains(".omni-settings-slip"));
-        assert!(DEFAULT_CSS.contains(".omni-settings-slip:hover .omni-settings-button"));
-        assert!(DEFAULT_CSS.contains("padding: 0 40px 0 18px;"));
-        assert!(DEFAULT_CSS.contains("color: alpha(white, 0.82);"));
-        assert!(DEFAULT_CSS.contains("background-color: transparent;\n  background-image: none;\n  border: none;"));
-        assert!(DEFAULT_CSS.contains("prefers-reduced-motion: reduce"));
-        assert!(DEFAULT_CSS.contains(".omni-settings-button {\n    transition: none;"));
+    #[ignore = "requires a GTK display; run with --ignored --test-threads=1"]
+    fn settings_controls_activate_once_without_mouse_focus_and_css_parses() {
+        gtk::init().expect("GTK display required for this explicit integration check");
+        let diagnostics = Rc::new(RefCell::new(Vec::new()));
+        let errors = diagnostics.clone();
+        let provider = gtk::CssProvider::new();
+        provider.connect_parsing_error(move |_, _, error| errors.borrow_mut().push(error.to_string()));
+        provider.load_from_string(DEFAULT_CSS);
+        assert!(diagnostics.borrow().is_empty(), "GTK CSS errors: {:?}", diagnostics.borrow());
+
+        for initial in [false, true] {
+            let button = settings_switch(initial);
+            assert_eq!(button.accessible_role(), gtk::AccessibleRole::Switch);
+            assert!(!button.gets_focus_on_click());
+            assert!(button.can_focus(), "keyboard navigation must remain available");
+            assert!(!button.has_css_class("omni-switch-animated"), "no animation on creation");
+            assert!(!button.child().unwrap().can_target(), "thumb must not intercept input");
+            let changes = Rc::new(Cell::new(0));
+            let count = changes.clone();
+            button.connect_active_notify(move |_| count.set(count.get() + 1));
+            for activation in 1..=10 {
+                button.emit_clicked();
+                assert_eq!(button.is_active(), if activation % 2 == 0 { initial } else { !initial });
+                assert_eq!(changes.get(), activation, "one state change per activation");
+            }
+            assert!(button.has_css_class("omni-switch-animated"));
+            // Persistence failure handlers can still restore the previous state.
+            button.set_active(!initial);
+            button.set_active(initial);
+            assert_eq!(changes.get(), 12);
+        }
+
+        for role in [gtk::AccessibleRole::MenuItemCheckbox, gtk::AccessibleRole::MenuItemRadio] {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            row.append(&gtk::Label::new(Some("Option")));
+            let check = gtk::Image::from_icon_name("object-select-symbolic");
+            row.append(&check);
+            let option = gtk::Button::builder().child(&row).accessible_role(role).build();
+            assert_eq!(option.accessible_role(), role);
+            for checked in [true, false, true] {
+                set_dropdown_option_checked(&option, checked);
+                assert!(gtk::test_accessible_has_state(&option, gtk::AccessibleState::Checked));
+                assert_eq!(option.has_css_class("omni-filter-on"), checked);
+                assert_eq!(check.opacity(), if checked { 1.0 } else { 0.0 });
+            }
+        }
+
+        // Provider labels can grow while their menu stays open. Keep popup sizing
+        // in sync, then disconnect the temporary listener when it closes.
+        let label = gtk::Label::builder().label("All").width_chars(8).build();
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        row.append(&label);
+        let anchor = gtk::Button::builder().child(&row).build();
+        let menu = gtk::Popover::new();
+        let items = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        match_dropdown_width(&menu, &items, anchor.upcast_ref());
+        label.set_label("Apps + Files + Folders");
+        let wide = items.width_request();
+        label.set_label("All");
+        assert!(items.width_request() < wide, "popup follows both growing and shrinking labels");
+        menu.emit_by_name::<()>("closed", &[]);
+        let closed_width = items.width_request();
+        label.set_label("Apps + Files + Folders");
+        assert_eq!(items.width_request(), closed_width, "closed menus stop observing labels");
+
+        // The All menu has a different sizing policy: always fit every option,
+        // regardless of which trigger label was selected before reopening.
+        let mut expected = None;
+        for selected in ["All", "Services", "Apps + Files", "All"] {
+            label.set_label(selected);
+            let options = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            for name in std::iter::once("All").chain(FILTER_KINDS.iter().map(|(_, name)| *name)) {
+                options.append(&gtk::Button::with_label(name));
+            }
+            let (_, longest, _, _) = options.measure(gtk::Orientation::Horizontal, -1);
+            fit_dropdown_to_options(&options);
+            assert_eq!(options.width_request(), longest);
+            if let Some(width) = expected { assert_eq!(options.width_request(), width); }
+            expected = Some(options.width_request());
+        }
+
+        // Compare actual styled trigger and option widths, rather than merely
+        // asserting the sizing helper's requested value.
+        let display = gdk::Display::default().unwrap();
+        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+        let root = gtk::Window::builder().css_classes(["omni"]).build();
+        let selected = gtk::Label::builder().label("All").xalign(0.0).build();
+        let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        content.append(&selected);
+        content.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+        let trigger = gtk::Button::builder().child(&content)
+            .css_classes(["omni-toggle", "omni-filter", "omni-dropdown-trigger"]).build();
+        root.set_child(Some(&trigger));
+        filter_label::configure(&selected);
+        selected.set_label("Services");
+        selected.set_label("All");
+        let popup = gtk::Popover::builder().has_arrow(false)
+            .css_classes(["omni-menu", "omni-filter-menu", "omni-dropdown-menu"]).build();
+        popup.set_parent(&trigger);
+        let options = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        popup.set_child(Some(&options));
+        for name in std::iter::once("All").chain(FILTER_KINDS.iter().map(|(_, name)| *name)) {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            row.append(&gtk::Label::new(Some(name)));
+            let check = gtk::Image::from_icon_name("object-select-symbolic");
+            check.add_css_class("omni-dropdown-check");
+            row.append(&check);
+            options.append(&gtk::Button::builder().child(&row).css_classes(["flat", "omni-menu-item"]).build());
+        }
+        fit_dropdown_to_options(&options);
+        for name in ["All", "Services", "All"] {
+            selected.set_label(name);
+            let (_, trigger_width, _, _) = trigger.measure(gtk::Orientation::Horizontal, -1);
+            assert_eq!(trigger_width, options.width_request() + 2, "trigger/popup mismatch for {name}");
+        }
+        popup.unparent();
+        root.set_child(gtk::Widget::NONE);
+        gtk::style_context_remove_provider_for_display(&display, &provider);
+
     }
 
     #[test]

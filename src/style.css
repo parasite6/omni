@@ -15,6 +15,7 @@
 @define-color omni_black #07090b;
 @define-color omni_silver #7aa2f7;
 @define-color omni_on_silver #121416;
+@define-color omni_control_accent #35c8dc;
 
 window.omni {
   background: transparent;
@@ -82,14 +83,19 @@ window.omni {
   box-shadow: none;
 }
 
+/* A small optical inset gives the header breathing room above its visual weight.
+ * All controls, including the gear, move together inside the header overlay. */
+.omni-launcher-surface {
+  padding-top: 4px;
+}
+
 /* ---------- search header ---------- */
 
 .omni-bar {
   min-height: 56px;
-  height: 56px;
   border-spacing: 8px;
   margin: 0;
-  padding: 0 40px 0 18px;
+  padding: 0 40px 0 6px;
   border-bottom: 1px solid alpha(@omni_divider, 0.06);
 }
 
@@ -169,27 +175,40 @@ window.omni {
 }
 
 .omni-settings-button {
-  min-width: 36px;
-  min-height: 36px;
+  min-width: 30px;
+  min-height: 30px;
   padding: 0;
   margin: 0;
-  color: alpha(white, 0.82);
-  background-color: transparent;
+  border-radius: 9px;
+  color: #a9b9c2;
+  background-color: alpha(white, 0.025);
   background-image: none;
-  border: none;
+  border: 1px solid alpha(white, 0.07);
   box-shadow: none;
   outline: none;
   opacity: 0;
-  transform: scale(0.9);
-  transition: opacity 200ms ease, transform 200ms cubic-bezier(0.22, 1, 0.36, 1);
+  transform: translateY(4px) scale(0.98);
+  transition: opacity 150ms ease, transform 150ms ease, border-color 150ms ease, color 150ms ease;
 }
 
 .omni-settings-slip:hover .omni-settings-button,
 .omni-settings-button:focus-visible {
-  color: white;
-  background-color: transparent;
+  color: #b8c4cb;
+  background-color: alpha(white, 0.045);
+  border-color: alpha(white, 0.13);
   opacity: 1;
-  transform: scale(1);
+  transform: translateY(4px) scale(1);
+}
+
+.omni-settings-button:active {
+  background-color: alpha(white, 0.025);
+  box-shadow: none;
+  transform: translateY(5px) scale(0.98);
+}
+
+.omni-settings-button:focus-visible {
+  outline: 1px solid alpha(@omni_control_accent, 0.65);
+  outline-offset: 2px;
 }
 
 .omni-settings-button image {
@@ -268,7 +287,6 @@ list.omni-results > row:disabled {
   margin: 0;
   min-height: 52px;
   border-radius: 0;
-  overflow: hidden;
   background-color: transparent;
   background-image: none;
   background: none;
@@ -287,7 +305,6 @@ list.omni-results > row:disabled {
   padding: 0;
   margin: 0;
   transform-origin: top center;
-  will-change: transform;
   transition: none; /* enabled from Rust for moves; off while snapping */
 }
 
@@ -302,7 +319,6 @@ list.omni-results > row:disabled {
   border: none;
   box-shadow: none;
   transform-origin: top left;
-  will-change: transform;
   transition: none;
 }
 
@@ -576,7 +592,6 @@ list.omni-results > row.omni-calc.activatable:hover {
 
 .omni-path {
   min-height: 32px;
-  height: 32px;
   margin: 0 -8px 0 -8px;
   padding: 0 14px;
   border-radius: 0 0 10px 10px;
@@ -617,7 +632,6 @@ list.omni-results > row.omni-calc.activatable:hover {
 
 .omni-filter-menu .omni-menu-item {
   min-height: 30px;
-  max-height: 30px;
   padding: 0 14px;
   margin: 0;
   border-radius: 6px;
@@ -653,6 +667,148 @@ list.omni-results > row.omni-calc.activatable:hover {
   .omni-filter-menu .omni-menu-item {
     transition: none;
   }
+}
+
+/* The provider trigger and popup form one compact control. */
+.omni-dropdown-trigger {
+  transform: scale(1);
+  transition: background-color 130ms ease, border-color 130ms ease, color 130ms ease, transform 110ms ease;
+  padding: 0 10px;
+  border-radius: 6px;
+  background-color: #202126;
+  border: 1px solid alpha(white, 0.10);
+  color: @omni_text_secondary;
+}
+
+.omni-dropdown-trigger:hover,
+.omni-dropdown-trigger.omni-dropdown-open {
+  background-color: #202126;
+  border: 1px solid alpha(white, 0.18);
+  color: @omni_text;
+}
+
+.omni-dropdown-trigger:hover {
+  background-color: #25262b;
+}
+
+.omni-dropdown-trigger:active {
+  background-color: #2a2c31;
+  transform: scale(0.97);
+}
+
+.omni-dropdown-trigger > box > image {
+  -gtk-icon-size: 14px;
+  transform: rotate(0deg);
+  transition: transform 160ms ease;
+}
+
+.omni-dropdown-trigger.omni-dropdown-open > box > image {
+  transform: rotate(180deg);
+}
+
+@keyframes omni-dropdown-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.omni-dropdown-menu > contents {
+  animation: omni-dropdown-reveal 140ms ease-out;
+  padding: 0;
+  border-radius: 6px;
+  background-color: #202126;
+  border: 1px solid alpha(white, 0.10);
+  box-shadow: 0 4px 12px alpha(black, 0.24);
+}
+
+.omni-dropdown-menu .omni-menu-item {
+  transition: background-color 110ms ease;
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: 5px;
+}
+
+.omni-dropdown-menu .omni-menu-item.omni-filter-on {
+  color: @omni_text;
+  background-color: transparent;
+}
+
+.omni-dropdown-menu .omni-menu-item:hover,
+.omni-dropdown-menu .omni-menu-item:focus-visible {
+  color: @omni_text;
+  background-color: alpha(white, 0.055);
+}
+
+.omni-dropdown-menu .omni-menu-item:active {
+  background-color: alpha(white, 0.08);
+}
+
+.omni-dropdown-check {
+  color: #91b1b7;
+  -gtk-icon-size: 14px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .omni-dropdown-trigger,
+  .omni-dropdown-trigger > box > image,
+  .omni-dropdown-menu .omni-menu-item {
+    transition: none;
+  }
+  .omni-dropdown-trigger:active {
+    transform: none;
+  }
+  .omni-dropdown-menu > contents {
+    animation: none;
+  }
+}
+
+/* Contents shares the header controls' surface, with a distinct enabled state. */
+.omni-contents-toggle {
+  border-radius: 6px;
+  border: 1px solid alpha(white, 0.10);
+  background-color: #202126;
+  color: @omni_text_secondary;
+  transform: scale(1);
+  transition: background-color 170ms ease, border-color 170ms ease, color 170ms ease, transform 130ms ease;
+}
+
+.omni-contents-toggle:hover {
+  border: 1px solid alpha(white, 0.18);
+  background-color: #25262b;
+  color: @omni_text;
+}
+
+.omni-contents-toggle:checked {
+  border: 1px solid alpha(@omni_control_accent, 0.30);
+  background-color: #263136;
+  color: #a5c8ce;
+}
+
+.omni-contents-toggle:checked:hover {
+  border: 1px solid alpha(@omni_control_accent, 0.42);
+  background-color: #2b383d;
+  color: #bad7db;
+}
+
+.omni-contents-toggle:active {
+  transform: translateY(1px) scale(0.95);
+  box-shadow: inset 0 1px 3px alpha(black, 0.20);
+}
+
+.omni-contents-toggle:focus-visible,
+.omni-dropdown-trigger:focus-visible {
+  outline: 1px solid alpha(@omni_control_accent, 0.60);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .omni-contents-toggle { transition: none; }
+  .omni-contents-toggle:active { transform: none; }
 }
 
 /* ---------- confirm ---------- */
@@ -750,62 +906,115 @@ list.omni-results > row.omni-calc.activatable:hover {
   color: alpha(@omni_accent, 0.85);
 }
 
-/* Switches: a dark track that lights accent when on; no GTK on/off glyphs. */
-switch.omni-switch {
-  min-width: 36px;
+/* Quiet custom controls with a restrained cyan tint in the enabled state. */
+button.omni-switch {
+  min-width: 38px;
   min-height: 20px;
   padding: 2px;
   margin: 0;
-  border-radius: 999px;
-  border: none;
+  border-radius: 8px;
+  border: 1px solid alpha(white, 0.09);
   outline: none;
-  box-shadow: none;
+  box-shadow: inset 0 1px 2px alpha(black, 0.18);
   background-image: none;
-  background-color: alpha(@omni_hover, 0.10);
-  transition: background-color 150ms ease;
+  background-color: #202227;
+  transition: background-color 180ms ease, border-color 150ms ease, box-shadow 150ms ease;
 }
 
-switch.omni-switch:hover {
-  background-color: alpha(@omni_hover, 0.14);
+button.omni-switch:hover {
+  border-color: alpha(white, 0.17);
 }
 
-switch.omni-switch:checked {
-  background-color: alpha(@omni_accent, 0.40);
+button.omni-switch:checked {
+  background-image: none;
+  background-color: #263136;
+  border-color: alpha(@omni_control_accent, 0.22);
+  box-shadow: inset 0 1px 2px alpha(black, 0.18);
 }
 
-switch.omni-switch:checked:hover {
-  background-color: alpha(@omni_accent, 0.48);
+button.omni-switch:checked:hover {
+  border-color: alpha(@omni_control_accent, 0.35);
 }
 
-switch.omni-switch:focus-visible {
-  outline: 1px solid alpha(@omni_accent, 0.6);
-  outline-offset: 2px;
+button.omni-switch:focus-visible {
+  outline: 1px solid alpha(@omni_control_accent, 0.65);
+  outline-offset: 3px;
 }
 
-switch.omni-switch > image {
-  opacity: 0;
-  -gtk-icon-size: 0;
-}
-
-switch.omni-switch > slider {
+button.omni-switch > .omni-switch-thumb {
   min-width: 16px;
   min-height: 16px;
   margin: 0;
-  border-radius: 999px;
-  border: none;
+  border-radius: 5px;
+  border: 1px solid alpha(white, 0.10);
   outline: none;
   background-image: none;
-  background-color: @omni_text_secondary;
-  box-shadow: 0 1px 3px alpha(black, 0.45);
-  transition: background-color 150ms ease;
+  background-color: #7d8b96;
+  box-shadow: 0 1px 2px alpha(black, 0.25);
+  transform: translateX(0);
+  transition: background-color 180ms ease, box-shadow 150ms ease, border-color 150ms ease, transform 240ms cubic-bezier(0.2, 0.85, 0.25, 1.08);
 }
 
-switch.omni-switch:checked > slider {
-  background-color: @omni_accent;
+button.omni-switch:checked > .omni-switch-thumb {
+  transform: translateX(20px);
+  background-image: none;
+  background-color: #91b1b7;
+  border-color: alpha(white, 0.14);
+  box-shadow: 0 1px 2px alpha(black, 0.25);
 }
 
-switch.omni-switch:disabled {
-  opacity: 0.45;
+button.omni-switch:active > .omni-switch-thumb {
+  transform: translateX(0) scale(1.35, 0.72);
+  box-shadow: none;
+  transition-duration: 65ms;
+}
+
+button.omni-switch:checked:active > .omni-switch-thumb {
+  transform: translateX(20px) scale(1.35, 0.72);
+}
+
+@keyframes omni-switch-on {
+  0% { transform: translateX(0) scale(1.35, 0.72); }
+  68% { transform: translateX(21.5px) scale(0.94, 1.05); }
+  86% { transform: translateX(19.5px) scale(1.02, 0.98); }
+  100% { transform: translateX(20px) scale(1); }
+}
+
+@keyframes omni-switch-off {
+  0% { transform: translateX(20px) scale(1.35, 0.72); }
+  68% { transform: translateX(-1.5px) scale(0.94, 1.05); }
+  86% { transform: translateX(0.5px) scale(1.02, 0.98); }
+  100% { transform: translateX(0) scale(1); }
+}
+
+button.omni-switch.omni-switch-animated > .omni-switch-thumb {
+  animation: omni-switch-off 320ms cubic-bezier(0.2, 0.7, 0.3, 1);
+}
+
+button.omni-switch.omni-switch-animated:checked > .omni-switch-thumb {
+  animation-name: omni-switch-on;
+}
+
+button.omni-switch:disabled {
+  opacity: 0.40;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button.omni-switch,
+  button.omni-switch > .omni-switch-thumb {
+    transition: none;
+    animation: none;
+  }
+  button.omni-switch.omni-switch-animated > .omni-switch-thumb,
+  button.omni-switch.omni-switch-animated:checked > .omni-switch-thumb {
+    animation: none;
+  }
+  button.omni-switch:active > .omni-switch-thumb {
+    transform: translateX(0);
+  }
+  button.omni-switch:checked:active > .omni-switch-thumb {
+    transform: translateX(20px);
+  }
 }
 
 /* Inline text field (Image search → add a folder). */
@@ -856,5 +1065,10 @@ entry.omni-settings-entry text selection {
 .omni-web-loading {
   border-radius: 22px;
   background-color: #1b1b1f;
+  color: @omni_text_secondary;
+}
+
+/* Transparent glass search mark; inherits the header’s neutral icon color. */
+.omni-search-brand {
   color: @omni_text_secondary;
 }

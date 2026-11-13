@@ -25,4 +25,13 @@ mod tests {
             assert_eq!(byte_len(w, h), None);
         }
     }
+    #[test]
+    fn exact_copy_limit_is_accepted_but_one_column_over_is_not() {
+        assert_eq!(byte_len(4096, 4096), Some(64 * 1024 * 1024));
+        assert_eq!(byte_len(4097, 4096), None);
+        assert_eq!(byte_len(4096, 4097), None);
+        assert_eq!(byte_len(1, 1), Some(4));
+        assert_eq!(byte_len(1, -1), None);
+    }
+
 }

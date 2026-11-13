@@ -379,7 +379,20 @@ journalctl --user -t ensure-running | grep omni       # start and health-check l
 
 ```bash
 PKG_CONFIG=/usr/bin/pkg-config cargo test --release
+python3 -B scripts/check_embed.py
 ```
+
+The Python checks use temporary folders and the standard library; they do not download
+models, load the GPU runtime, or modify your image library. The regular Rust suite does
+not require a display. Run the GTK control/CSS and ripgrep integration checks explicitly
+from a desktop session with `rg` installed:
+
+```bash
+PKG_CONFIG=/usr/bin/pkg-config cargo test --release --bin omni -- --ignored --test-threads=1
+```
+
+These checks do not open a window or simulate pointer input. Visual feel, live Chromium
+navigation, and model inference still need separate runtime verification.
 
 ---
 

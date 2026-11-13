@@ -4,8 +4,6 @@ local*
 docs*
 .s*
 test*
-/isolated-mailcount/
-# Claude Code sandbox stubs: empty files it mounts /dev/null over while a command runs
 /.bash_profile
 /.bashrc
 /.profile
@@ -18,3 +16,4 @@ test*
 /.idea
 /.vscode
 /.claude/
+/docs/superpowers/
