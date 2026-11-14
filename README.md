@@ -78,7 +78,7 @@ Everything shares one list, so there is no mode to pick first.
 
 - Hyprland and LocalSearch (GNOME's file indexer).
 - Rust, and on Fedora: `gtk4-devel`, `gtk4-layer-shell-devel`, `tinysparql-devel`, `cef`.
-- An `ensure-running` supervisor at `/usr/local/bin/ensure-running`, which `omni-start` uses to keep one healthy instance.
+- Optional: an `ensure-running` supervisor on `PATH`. `omni-start` uses it when present (health checks, a limit on restarts); without it, `omni-start` checks and starts omni itself.
 - For image search: `uv` and an NVIDIA GPU with a recent driver.
 
 ```bash

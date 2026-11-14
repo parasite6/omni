@@ -1,45 +1,63 @@
 #!/usr/bin/env bash
-# Start the omni background process through ensure-running: one healthy instance,
-# never duplicated, no restart loops. Used by Hyprland autostart and install.sh.
-#
-# Healthy = has a Wayland display (GTK hangs without one at early login) and answers
-# a ping on its socket (omni-toggle --ping never opens the popup).
+# Start the omni daemon: one healthy instance, never duplicated. Used by Hyprland autostart,
+# omni-toggle (when omni stops answering) and install.sh.
+# Healthy = has a Wayland display and answers `omni-toggle --ping`.
 set -euo pipefail
 
 bin="$HOME/.local/share/omni/bin"
 runtime="${XDG_RUNTIME_DIR:-}"
 
-# A zombie omni still matches pgrep and can keep the GTK app-id / a half-dead
-# socket. ensure-running cannot reap zombies (kill is a no-op on them) and would
-# start a second instance that never becomes healthy. Refuse instead.
-omni_state() { awk '{print $3}' "/proc/$1/stat" 2>/dev/null || true; }
-
 zombies=()
 live=()
 for pid in $(pgrep -x omni 2>/dev/null || true); do
-    case "$(omni_state "$pid")" in
+    case "$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)" in
         Z) zombies+=("$pid") ;;
         ""|X) ;;
         *) live+=("$pid") ;;
     esac
 done
 
+# A zombie keeps the D-Bus name; a second instance next to it never becomes healthy.
 if ((${#zombies[@]} > 0)); then
     msg="zombie omni still present (${zombies[*]}); not starting a second instance"
-    logger -t ensure-running "[omni] $msg"
-    echo "omni-start: $msg" >&2
-    echo "omni-start: reap it (or restart the session) before starting omni again" >&2
+    logger -t omni-start "$msg" 2>/dev/null || true
+    echo "omni-start: $msg; restart the session first" >&2
     exit 1
 fi
 
-# Stale socket after a dead peer makes connect hang; drop it when nothing live is using it.
+# A stale socket makes connect hang.
 if ((${#live[@]} == 0)) && [ -n "$runtime" ]; then
     rm -f "$runtime/omni.sock"
 fi
 
-exec /usr/local/bin/ensure-running \
-    --name omni \
-    --comm omni \
-    --wait-wayland \
-    --health 'tr "\0" "\n" < /proc/$PID/environ | grep -q "^WAYLAND_DISPLAY=." && "$HOME/.local/share/omni/bin/omni-toggle" --ping' \
-    -- "$bin/omni" --daemon
+er=$(command -v ensure-running 2>/dev/null || true)
+[ -z "$er" ] && [ -x /usr/local/bin/ensure-running ] && er=/usr/local/bin/ensure-running
+if [ -n "$er" ]; then
+    exec "$er" \
+        --name omni \
+        --comm omni \
+        --wait-wayland \
+        --health 'tr "\0" "\n" < /proc/$PID/environ | grep -q "^WAYLAND_DISPLAY=." && "$HOME/.local/share/omni/bin/omni-toggle" --ping' \
+        -- "$bin/omni" --daemon
+fi
+
+# No ensure-running: do the same job simply.
+if ((${#live[@]} > 0)); then
+    timeout 2 "$bin/omni-toggle" --ping >/dev/null 2>&1 && exit 0
+    kill -TERM "${live[@]}" 2>/dev/null || true
+    for _ in $(seq 30); do
+        pgrep -x omni >/dev/null || break
+        sleep 0.1
+    done
+    pkill -KILL -x omni 2>/dev/null || true
+    [ -n "$runtime" ] && rm -f "$runtime/omni.sock"
+fi
+
+# GTK hangs without a display at early login: wait for the compositor.
+for _ in $(seq 100); do
+    [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "${runtime:-/nonexistent}/${WAYLAND_DISPLAY}" ] && break
+    [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "$WAYLAND_DISPLAY" ] && break
+    sleep 0.1
+done
+
+setsid -f "$bin/omni" --daemon </dev/null >/dev/null 2>&1

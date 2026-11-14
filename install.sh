@@ -1,38 +1,39 @@
 #!/usr/bin/env bash
-# Build omni and install it to ~/.local/share/omni, then restart the background process.
-# Safe to re-run: files are replaced atomically and installed read-only.
+# Build omni, install it to ~/.local/share/omni and restart it. Safe to re-run.
 set -euo pipefail
 
 src="$(cd "$(dirname "$0")" && pwd)"
 dest="$HOME/.local/share/omni"
 runtime="${XDG_RUNTIME_DIR:-}"
 
-# linuxbrew's pkg-config shadows Fedora's and can't see the system GTK .pc files.
-# Build from the source root so both blaze and its cargo fallback use $src/target
-# (a CARGO_TARGET_DIR from the environment must not leave the copied binaries stale).
-if command -v blaze >/dev/null 2>&1; then
-    (cd "$src" && PKG_CONFIG=/usr/bin/pkg-config blaze build --release)
-else
-    PKG_CONFIG=/usr/bin/pkg-config cargo build --release --manifest-path "$src/Cargo.toml" --target-dir "$src/target"
+die() { echo "install: $*" >&2; exit 1; }
+
+command -v cargo >/dev/null 2>&1 || die "cargo not found; install Rust from https://rustup.rs"
+
+# A pkg-config from Homebrew/linuxbrew can't see the system GTK .pc files: prefer the system one.
+if [ -z "${PKG_CONFIG:-}" ] && [ -x /usr/bin/pkg-config ]; then
+    export PKG_CONFIG=/usr/bin/pkg-config
 fi
+
+# --target-dir: a CARGO_TARGET_DIR from the environment would leave the copied binaries stale.
+cargo build --release --manifest-path "$src/Cargo.toml" --target-dir "$src/target" \
+    || die "build failed; see Requirements in README.md for the system packages"
 
 mkdir -p "$dest/bin" "$dest/hypr"
 
-# Install to a temp name then rename: never a half-written binary, and the running
-# daemon keeps its old (unlinked) file until it restarts.
+# Temp name then rename: never a half-written file, and the running daemon keeps its old one.
 put() { # put SRC DEST MODE
     install -m "$3" "$1" "$2.new"
     mv -f "$2.new" "$2"
 }
-put "$src/target/release/omni"        "$dest/bin/omni"        0555
-put "$src/target/release/omni-browser" "$dest/bin/omni-browser" 0555
-put "$src/target/release/omni-toggle" "$dest/bin/omni-toggle" 0555
-put "$src/scripts/omni-start"         "$dest/bin/omni-start"  0555
-put "$src/hypr/omni.lua"              "$dest/hypr/omni.lua"   0444
-put "$src/scripts/omni-embed.py"      "$dest/bin/omni-embed.py" 0444
+put "$src/target/release/omni"         "$dest/bin/omni"          0555
+put "$src/target/release/omni-browser" "$dest/bin/omni-browser"  0555
+put "$src/target/release/omni-toggle"  "$dest/bin/omni-toggle"   0555
+put "$src/scripts/omni-start"          "$dest/bin/omni-start"    0555
+put "$src/hypr/omni.lua"               "$dest/hypr/omni.lua"     0444
+put "$src/scripts/omni-embed.py"       "$dest/bin/omni-embed.py" 0444
 
-# Image search's Python venv (onnxruntime-gpu + its CUDA/cuDNN wheels, ~2.6 GB). Rebuilt only
-# when the pinned requirements change; the model itself downloads on the first crawl.
+# Image search venv (~2.6 GB), rebuilt only when the pinned requirements change.
 venv="$dest/embed-venv"
 reqs="$src/scripts/omni-embed.requirements.txt"
 if ! cmp -s "$reqs" "$venv/omni-requirements.txt" 2>/dev/null; then
@@ -52,55 +53,39 @@ if ! cmp -s "$reqs" "$venv/omni-requirements.txt" 2>/dev/null; then
     fi
 fi
 
-# The identity-guarded installer manages shutdown/startup itself.
 if [ "${OMNI_INSTALL_NO_RESTART:-0}" = 1 ]; then
     echo "omni installed to $dest (restart managed by caller)"
     exit 0
 fi
 
-omni_state() { awk '{print $3}' "/proc/$1/stat" 2>/dev/null || true; }
-
-# Live (non-zombie) omni PIDs. pgrep alone also matches zombies — those must not
-# be treated as "still shutting down" or as a successful wait.
-omni_live_pids() {
+omni_pids() { # omni_pids live|zombie
     local pid state
     for pid in $(pgrep -x omni 2>/dev/null || true); do
-        state=$(omni_state "$pid")
-        case "$state" in
-            ""|Z|X) ;;
-            *) printf '%s\n' "$pid" ;;
+        state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null || true)
+        case "$1:$state" in
+            zombie:Z) echo "$pid" ;;
+            live:Z | live:X | live:) ;;
+            live:*) echo "$pid" ;;
         esac
     done
 }
 
-omni_zombie_pids() {
-    local pid
-    for pid in $(pgrep -x omni 2>/dev/null || true); do
-        case "$(omni_state "$pid")" in
-            Z) printf '%s\n' "$pid" ;;
-        esac
-    done
-}
-
-# Stop the resident daemon without leaving a zombie + wedged D-Bus name.
-# Prefer a clean GApplication quit, then TERM, then KILL. Never start a
-# replacement if a zombie remains — that is what broke the last install.
+# Quit cleanly, then TERM, then KILL. Never start a second instance next to a zombie:
+# it can't get the D-Bus name and wedges.
 stop_omni() {
-    # Ask GTK to quit cleanly so the app-id and socket are released.
     if command -v gapplication >/dev/null 2>&1; then
         gapplication quit dev.omni.Launcher 2>/dev/null || true
     fi
-
     local pids
-    pids=$(omni_live_pids | tr '\n' ' ')
+    pids=$(omni_pids live | tr '\n' ' ')
     if [ -n "${pids// /}" ]; then
         # shellcheck disable=SC2086
         kill -TERM $pids 2>/dev/null || true
         for _ in $(seq 50); do
-            [ -z "$(omni_live_pids)" ] && break
+            [ -z "$(omni_pids live)" ] && break
             sleep 0.1
         done
-        pids=$(omni_live_pids | tr '\n' ' ')
+        pids=$(omni_pids live | tr '\n' ' ')
         if [ -n "${pids// /}" ]; then
             echo "install: omni still alive after TERM, sending KILL" >&2
             # shellcheck disable=SC2086
@@ -108,46 +93,43 @@ stop_omni() {
             sleep 0.2
         fi
     fi
-
-    # Drop a stale control socket so the next ping cannot hang on a dead peer.
-    if [ -n "$runtime" ]; then
-        rm -f "$runtime/omni.sock"
-    fi
+    [ -n "$runtime" ] && rm -f "$runtime/omni.sock"
 
     local zombies
-    zombies=$(omni_zombie_pids | tr '\n' ' ')
+    zombies=$(omni_pids zombie | tr '\n' ' ')
     if [ -n "${zombies// /}" ]; then
-        echo "install: binaries updated at $dest, but zombie omni still present (${zombies})." >&2
-        echo "install: not starting a second instance (that wedges D-Bus). Reap or restart the session, then run: $dest/bin/omni-start" >&2
-        exit 1
+        die "binaries updated, but a zombie omni is still present (${zombies}). Restart the session, then run: $dest/bin/omni-start"
     fi
-
-    if [ -n "$(omni_live_pids)" ]; then
-        echo "install: omni still running after SIGKILL; aborting restart" >&2
-        exit 1
-    fi
+    [ -z "$(omni_pids live)" ] || die "omni still running after SIGKILL; not restarting"
 }
 
-# Restart: stop the old instance, start the new one through ensure-running.
-# A deliberate install isn't a crash loop, so it doesn't count toward ensure-running's
-# "3 starts in 5 minutes" guard (which stays in force for login/reload/keypress starts).
+wait_for_ping() { # wait_for_ping TRIES
+    for _ in $(seq "$1"); do
+        timeout 2 "$dest/bin/omni-toggle" --ping >/dev/null 2>&1 && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
+# A deliberate install isn't a crash loop: don't count it against ensure-running's start limit.
 rm -f "${runtime:-/tmp}/ensure-running/omni.starts"
 stop_omni
 
-# Started by Hyprland, so omni gets the desktop's environment rather than this shell's
-# (run from a Claude Code session, that would include its tokens). omni also scrubs
-# secret-looking variables itself. Without Hyprland, start it directly.
-if ! hyprctl dispatch "hl.dsp.exec_cmd(\"$dest/bin/omni-start\")" >/dev/null 2>&1; then
-    "$dest/bin/omni-start"
+# Start through Hyprland so omni gets the desktop's environment, not this shell's (which may
+# hold tokens from wherever install.sh was run). hyprctl can exit 0 on a dispatcher it doesn't
+# know, so fall back to starting directly if omni doesn't answer.
+started=0
+if command -v hyprctl >/dev/null 2>&1 \
+    && hyprctl dispatch "hl.dsp.exec_cmd(\"$dest/bin/omni-start\")" >/dev/null 2>&1 \
+    && wait_for_ping 15; then
+    started=1
+fi
+if [ "$started" = 0 ]; then
+    "$dest/bin/omni-start" && wait_for_ping 30 && started=1
 fi
 
-for _ in $(seq 30); do
-    # Belt and suspenders: even with connect timeouts in omni-toggle, cap the wait.
-    if timeout 2 "$dest/bin/omni-toggle" --ping >/dev/null 2>&1; then
-        echo "omni installed to $dest and running"
-        exit 0
-    fi
-    sleep 0.2
-done
-echo "omni installed to $dest but is not answering; see: journalctl --user -t ensure-running" >&2
-exit 1
+if [ "$started" = 1 ]; then
+    echo "omni installed to $dest and running"
+    exit 0
+fi
+die "omni installed to $dest but is not answering; run $dest/bin/omni --daemon to see why"
