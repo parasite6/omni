@@ -1643,6 +1643,9 @@ fn file_has_all(path: &std::path::Path, needles: &[Vec<u8>], case_sensitive: boo
     if needles.is_empty() {
         return true;
     }
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return false;
+    }
     let Ok(file) = std::fs::File::open(path) else { return false };
     let mut buf = Vec::new();
     if file.take(1024 * 1024).read_to_end(&mut buf).is_err() {
@@ -1820,36 +1823,64 @@ pub fn content_search_rg_stream(
     count
 }
 
-/// Read a short snippet for a content hit (lazy, off the search hot path). Caps at 1 MB.
-pub fn content_snippet_for(path: &std::path::Path, query: &str) -> Option<String> {
+/// What one read of a content hit shows: the first matching line and how often the query occurs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContentPeek {
+    pub snippet: Option<String>,
+    /// Occurrences of every query word, summed (non-overlapping, same case rule as the search).
+    pub count: usize,
+    /// Only the first 1 MB was read, so `count` is a lower bound.
+    pub truncated: bool,
+}
+
+const PEEK_BYTES: usize = 1024 * 1024;
+
+/// Snippet and match count for a content hit (lazy, off the search hot path). Reads at most 1 MB.
+/// Binary formats LocalSearch extracts text from (PDF, office files) give no snippet and 0.
+pub fn content_peek(path: &std::path::Path, query: &str) -> Option<ContentPeek> {
     use std::io::Read;
-    let needles: Vec<String> = parse_query_tokens(query)
-        .into_iter()
-        .map(|t| match t {
-            QueryToken::Word(s) | QueryToken::Phrase(s) => s.to_ascii_lowercase(),
-        })
-        .collect();
-    if needles.is_empty() {
+    let tokens = parse_query_tokens(query);
+    if tokens.is_empty() {
         return None;
     }
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0u8; 1024 * 1024];
-    let n = file.read(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf[..n]);
-    for line in text.lines() {
-        let lower = line.to_ascii_lowercase();
-        if needles.iter().any(|n| lower.contains(n.as_str())) {
-            let trimmed = collapse_ws(line.trim());
-            if trimmed.is_empty() {
-                continue;
-            }
-            if trimmed.chars().count() > 120 {
-                return Some(trimmed.chars().take(120).collect::<String>() + "\u{2026}");
-            }
-            return Some(trimmed);
-        }
+    let case_sensitive = query_case_sensitive(&tokens);
+    let needles: Vec<Vec<u8>> = tokens
+        .iter()
+        .map(|t| {
+            let t = token_text(t);
+            if case_sensitive { t.as_bytes().to_vec() } else { t.to_lowercase().into_bytes() }
+        })
+        .collect();
+    // Opening a FIFO or device for reading can block forever: regular files only.
+    if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return None;
     }
-    None
+    let file = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    file.take(PEEK_BYTES as u64 + 1).read_to_end(&mut buf).ok()?;
+    let truncated = buf.len() > PEEK_BYTES;
+    buf.truncate(PEEK_BYTES);
+    let mut folded = buf.clone();
+    if !case_sensitive {
+        folded.make_ascii_lowercase();
+    }
+    let count = needles.iter().map(|n| memchr::memmem::find_iter(&folded, n).count()).sum();
+
+    // First line holding any needle; `folded` has the same byte offsets as `buf`.
+    let first = needles.iter().filter_map(|n| memchr::memmem::find(&folded, n)).min();
+    let snippet = first.and_then(|at| {
+        let start = folded[..at].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let end = folded[at..].iter().position(|&b| b == b'\n').map_or(buf.len(), |i| at + i);
+        let line = collapse_ws(String::from_utf8_lossy(&buf[start..end]).trim());
+        if line.is_empty() {
+            None
+        } else if line.chars().count() > 120 {
+            Some(line.chars().take(120).collect::<String>() + "\u{2026}")
+        } else {
+            Some(line)
+        }
+    });
+    Some(ContentPeek { snippet, count, truncated })
 }
 
 /// Paths for LocalSearch resource URNs (from its change events).
@@ -1964,6 +1995,20 @@ mod tests {
         assert_eq!(rg_driver_index(&t), 2);
         assert!(!query_case_sensitive(&t));
         assert!(query_case_sensitive(&parse_query_tokens("fn Main")));
+    }
+
+    #[test]
+    fn content_peek_counts_matches_with_the_search_case_rule() {
+        let dir = std::env::temp_dir().join(format!("omni-peek-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.txt");
+        std::fs::write(&path, b"intro\nFoo bar foo\nbar FOO\n").unwrap();
+        let p = content_peek(&path, "foo").unwrap();
+        assert_eq!((p.count, p.snippet.as_deref(), p.truncated), (3, Some("Foo bar foo"), false));
+        assert_eq!(content_peek(&path, "Foo").unwrap().count, 1);
+        assert_eq!(content_peek(&path, "foo bar").unwrap().count, 5);
+        assert_eq!(content_peek(&path, "zzz").unwrap(), ContentPeek::default());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

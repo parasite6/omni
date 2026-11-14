@@ -157,6 +157,8 @@ struct Hit {
     match_type: Option<MatchType>,
     /// Image search rows (`img …`): the cached thumbnail shown large in place of the icon.
     thumb: Option<PathBuf>,
+    /// Contents rows: how many times the query occurs in the file ("12", "40+").
+    match_count: Option<String>,
 }
 
 /// Cache identity: search text + optional directory scope (Contents on).
@@ -188,6 +190,8 @@ struct ContentHit {
     /// arrive sooner but come from the whole home index (package caches and all), so
     /// arrival order must not decide rank.
     from_rg: bool,
+    /// Matches in the file, once read for its snippet (count, only the first 1 MB was read).
+    count: Option<(usize, bool)>,
 }
 
 /// In-memory Contents results. Old hits stay visible until the new request's first batch.
@@ -2146,14 +2150,19 @@ fn refresh_row_contents(row: &gtk::ListBoxRow, hit: &Hit, query: &str) -> bool {
     let Some(hbox) = row.child().and_downcast::<gtk::Box>() else {
         return false;
     };
-    // Expect: icon | text-vbox [| badge]
+    // Expect: icon | text-vbox [| count] [| badge]
     let Some(vbox) = hbox.first_child().and_then(|c| c.next_sibling()).and_downcast::<gtk::Box>() else {
         return false;
     };
+    let count = vbox.next_sibling().and_downcast::<gtk::Label>().filter(|w| w.has_css_class("omni-match-count"));
+    match (&count, &hit.match_count) {
+        (Some(label), Some(n)) => label.set_text(n),
+        (None, None) => {}
+        _ => return false,
+    }
+    let after = count.map_or_else(|| vbox.next_sibling(), |c| c.next_sibling());
     let wants_badge = matches!(hit.match_type, Some(MatchType::Content | MatchType::Both));
-    let has_badge = vbox
-        .next_sibling()
-        .is_some_and(|w| w.has_css_class("omni-content-badge"));
+    let has_badge = after.is_some_and(|w| w.has_css_class("omni-content-badge"));
     if wants_badge != has_badge {
         return false;
     }
@@ -2208,6 +2217,7 @@ fn file_hit(
         file_menu: !is_dir,
         match_type: Some(match_type),
         thumb: None,
+        match_count: None,
     }
 }
 
@@ -2251,6 +2261,7 @@ fn info_hit(text: &str) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        match_count: None,
     }
 }
 
@@ -2389,6 +2400,16 @@ fn hit_path(hit: &Hit) -> Option<PathBuf> {
     }
 }
 
+/// Badge text for a file's match count; nothing when it wasn't counted or had no text matches.
+fn match_count_label(count: Option<(usize, bool)>) -> Option<String> {
+    match count? {
+        (0, _) => None,
+        (n, _) if n > 999 => Some("999+".into()),
+        (n, true) => Some(format!("{n}+")),
+        (n, false) => Some(n.to_string()),
+    }
+}
+
 fn apply_content_hits_to_list(query: &str, content_hits: &[ContentHit], hits: &mut Vec<Hit>) -> (usize, usize) {
     let mut both = 0usize;
     let mut content_only = 0usize;
@@ -2397,6 +2418,7 @@ fn apply_content_hits_to_list(query: &str, content_hits: &[ContentHit], hits: &m
         for hit in hits.iter_mut() {
             if hit_path(hit).as_ref() == Some(&ch.path) {
                 hit.match_type = Some(MatchType::Both);
+                hit.match_count = match_count_label(ch.count);
                 if let Some(ref snip) = ch.snippet {
                     hit.subtitle = highlight_snippet(snip, query);
                     hit.subtitle_markup = true;
@@ -2407,13 +2429,9 @@ fn apply_content_hits_to_list(query: &str, content_hits: &[ContentHit], hits: &m
             }
         }
         if !upgraded {
-            hits.push(file_hit(
-                &ch.path,
-                false,
-                MatchType::Content,
-                ch.snippet.as_deref(),
-                query,
-            ));
+            let mut hit = file_hit(&ch.path, false, MatchType::Content, ch.snippet.as_deref(), query);
+            hit.match_count = match_count_label(ch.count);
+            hits.push(hit);
             content_only += 1;
         }
     }
@@ -2504,6 +2522,7 @@ fn content_empty_hit(scoped: bool) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        match_count: None,
     }
 }
 
@@ -2517,6 +2536,7 @@ fn content_failed_hit(message: &str) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        match_count: None,
     }
 }
 
@@ -2532,6 +2552,7 @@ fn calc_hit(query: &str) -> Option<Hit> {
         file_menu: false,
         match_type: None,
         thumb: None,
+        match_count: None,
     })
 }
 
@@ -2805,7 +2826,6 @@ fn schedule_visible_snippets(ui: &Ui) {
         hits[start..end]
             .iter()
             .filter(|h| matches!(h.match_type, Some(MatchType::Content | MatchType::Both)))
-            .filter(|h| !h.subtitle_markup || h.subtitle.is_empty())
             .filter_map(hit_path)
             .collect()
     };
@@ -2822,7 +2842,7 @@ fn schedule_visible_snippets(ui: &Ui) {
             .filter(|p| {
                 hits.iter()
                     .find(|h| &h.path == p)
-                    .is_some_and(|h| h.snippet.is_none())
+                    .is_some_and(|h| h.count.is_none())
             })
             .collect()
     };
@@ -2834,8 +2854,8 @@ fn schedule_visible_snippets(ui: &Ui) {
         let filled = gio::spawn_blocking(move || {
             need.into_iter()
                 .filter_map(|path| {
-                    let snip = files::content_snippet_for(&path, &q)?;
-                    Some((path, snip))
+                    let peek = files::content_peek(&path, &q)?;
+                    Some((path, peek))
                 })
                 .collect::<Vec<_>>()
         })
@@ -2852,9 +2872,10 @@ fn schedule_visible_snippets(ui: &Ui) {
             if key.query != query {
                 return;
             }
-            for (path, snip) in &filled {
-                if let Some(h) = hits.iter_mut().find(|h| &h.path == path) {
-                    h.snippet = Some(snip.clone());
+            for (path, peek) in filled {
+                if let Some(h) = hits.iter_mut().find(|h| h.path == path) {
+                    h.snippet = peek.snippet;
+                    h.count = Some((peek.count, peek.truncated));
                 }
             }
         }
@@ -3012,7 +3033,7 @@ fn start_content_search(ui: &Ui, query: &str, scope: Option<&std::path::Path>, t
                 let (hits, _sparql, err) =
                     files::content_search_localsearch(&conn, &q, MAX_CONTENT, scope.as_deref(), Some(&ls_cancel));
                 if !cancel.load(Ordering::Relaxed) {
-                    sink.send(hits.into_iter().map(|h| ContentHit { path: h.path, snippet: None, from_rg: false }).collect());
+                    sink.send(hits.into_iter().map(|h| ContentHit { path: h.path, snippet: None, from_rg: false, count: None }).collect());
                 }
                 sink.finish("ls", err);
             })
@@ -3027,7 +3048,7 @@ fn start_content_search(ui: &Ui, query: &str, scope: Option<&std::path::Path>, t
             let mut total = 0usize;
             files::content_search_rg_stream(&q, MAX_CONTENT, scope_path.as_deref(), &cancel, &rg_slot, |hit| {
                 total += 1;
-                batch.push(ContentHit { path: hit.path, snippet: None, from_rg: true });
+                batch.push(ContentHit { path: hit.path, snippet: None, from_rg: true, count: None });
                 if total == 1 || last_flush.elapsed() >= CONTENT_BATCH {
                     sink.send(std::mem::take(&mut batch));
                     last_flush = Instant::now();
@@ -4149,6 +4170,7 @@ fn app_hit(info: &gio::AppInfo, name: &str) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        match_count: None,
     }
 }
 
@@ -4162,6 +4184,7 @@ fn action_hit(app: &apps::App, action: &apps::AppAction) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        match_count: None,
     }
 }
 
@@ -4191,6 +4214,7 @@ fn recent_hits(ui: &Ui) -> Vec<Hit> {
                 file_menu: !f.is_dir,
                 match_type: Some(MatchType::Name),
                 thumb: None,
+                match_count: None,
             },
         ));
     }
@@ -4208,6 +4232,7 @@ fn web_hit(ui: &Ui, query: &str) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        match_count: None,
     }
 }
 
@@ -4224,6 +4249,7 @@ fn service_hit(s: &services::Service) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        match_count: None,
     }
 }
 
@@ -4240,6 +4266,7 @@ fn claude_hit(ui: &Ui, query: &str) -> Option<Hit> {
         file_menu: false,
         match_type: None,
         thumb: None,
+        match_count: None,
     })
 }
 
@@ -4304,6 +4331,13 @@ fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
     row_box.set_valign(gtk::Align::Center);
     row_box.append(&icon);
     row_box.append(&text);
+    if let Some(n) = &hit.match_count {
+        let count = gtk::Label::new(Some(n));
+        count.add_css_class("omni-match-count");
+        count.set_valign(gtk::Align::Center);
+        count.set_tooltip_text(Some("Matches in this file"));
+        row_box.append(&count);
+    }
     if matches!(hit.match_type, Some(MatchType::Content | MatchType::Both)) {
         let badge = gtk::Label::new(Some("content"));
         badge.add_css_class("omni-content-badge");
