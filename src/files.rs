@@ -1585,21 +1585,41 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Roots to scan with ripgrep: the scope folder, or configured trees when unscoped
-/// (`~/Documents/github`, `~/Projects`, `~/Documents` — never `$HOME`). A root inside
-/// another root is dropped: ripgrep would scan it twice and print every hit twice.
+/// Roots to scan with ripgrep: the scope folder, or the folders in
+/// `~/.config/omni/content-folders` when unscoped (one per line, `~` allowed, `#` comments;
+/// no file = the Documents folder and `~/Projects`). A root inside another root is dropped:
+/// ripgrep would scan it twice and print every hit twice.
 fn content_rg_roots(scope: Option<&std::path::Path>) -> Vec<PathBuf> {
     if let Some(dir) = scope {
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         return if dir.is_dir() { vec![dir] } else { Vec::new() };
     }
     let home = glib::home_dir();
-    let candidates = ["Documents/github", "Projects", "Documents"]
-        .iter()
-        .filter_map(|rel| std::fs::canonicalize(home.join(rel)).ok())
+    let listed = match std::fs::read_to_string(glib::user_config_dir().join("omni/content-folders")) {
+        Ok(s) => parse_folder_list(&s, &home),
+        Err(_) => glib::user_special_dir(glib::UserDirectory::Documents)
+            .into_iter()
+            .chain([home.join("Projects")])
+            .collect(),
+    };
+    let candidates = listed
+        .into_iter()
+        .filter_map(|p| std::fs::canonicalize(p).ok())
         .filter(|p| p.is_dir())
         .collect();
     outermost_roots(candidates)
+}
+
+/// One folder per line; blank lines and `#` comments skipped, a leading `~` is home.
+fn parse_folder_list(text: &str, home: &std::path::Path) -> Vec<PathBuf> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| match l.strip_prefix('~') {
+            Some(rest) => home.join(rest.trim_start_matches('/')),
+            None => PathBuf::from(l),
+        })
+        .collect()
 }
 
 /// Keep only roots that are not inside (or equal to) another kept root.
@@ -1972,6 +1992,13 @@ mod tests {
         assert!(wrong_case.is_empty(), "{wrong_case:?}");
         let miss = content_search_rg("zebrafluxcapacitor nowhere", 4, Some(&dir));
         assert!(miss.is_empty(), "{miss:?}");
+    }
+
+    #[test]
+    fn folder_list_expands_home_and_skips_comments() {
+        let home = std::path::Path::new("/home/u");
+        let got = super::parse_folder_list("# mine\n~/code\n\n  /srv/notes  \n~\n", home);
+        assert_eq!(got, vec![PathBuf::from("/home/u/code"), PathBuf::from("/srv/notes"), PathBuf::from("/home/u")]);
     }
 
     #[test]

@@ -223,7 +223,7 @@ One- and two-letter queries match name starts only. Every shown path is checked,
 - It is matched case-insensitively (`~/music` works), and symlinked folders resolve to their real location.
 - Scoped searches show files and folders only, and respect the filter.
 
-**Contents search** (<kbd>Ctrl</kbd> + <kbd>T</kbd>) also lists files whose text matches. It is off by default and remembered in `~/.local/state/omni/contents`. Two sources run side by side, off the UI thread: LocalSearch's full-text index, and ripgrep over `~/Documents` and `~/Projects` (LocalSearch skips git repositories by default; ripgrep honours `.gitignore`). Every word must appear somewhere in the file, the last word also matches as a prefix, and any capital letter makes the search case-sensitive. It waits for a short pause in typing, results slot in as each source answers, and ripgrep's matches are listed above LocalSearch's. A selection you moved with the arrow keys stays where you put it.
+**Contents search** (<kbd>Ctrl</kbd> + <kbd>T</kbd>) also lists files whose text matches. It is off by default and remembered in `~/.local/state/omni/contents`. Two sources run side by side, off the UI thread: LocalSearch's full-text index, and ripgrep over the folders in `~/.config/omni/content-folders` (default: your Documents folder and `~/Projects`; LocalSearch skips git repositories by default; ripgrep honours `.gitignore`). Every word must appear somewhere in the file, the last word also matches as a prefix, and any capital letter makes the search case-sensitive. It waits for a short pause in typing, results slot in as each source answers, and ripgrep's matches are listed above LocalSearch's. A selection you moved with the arrow keys stays where you put it.
 
 **Right-click a file** for **Open** or **Open with**. The file type is guessed from the name, so opening the menu never touches the disk.
 
@@ -304,7 +304,7 @@ Press <kbd>Shift</kbd> + <kbd>Enter</kbd> on anything you typed. omni runs the C
 | Switch  | The chip in the answer header; remembered in `~/.local/state/omni/claude`                              |
 | Timeout | 90 to 360 s of silence depending on effort, 20 minutes at most; paused while a permission prompt waits |
 
-Your own agent instructions live in `src/agent_prompt.md`; run `./install.sh` after editing them.
+Your own agent instructions go in `~/.config/omni/agent_prompt.md`, read fresh for every question; without it omni uses the default in `src/agent_prompt.md`.
 
 Details: [Claude: permissions and sandbox](#claude-permissions-and-sandbox).
 
@@ -334,6 +334,8 @@ Hover the top-right corner of the search bar and click the gear.
 | `~/.config/omni/search-engine`         | The web search engine                                                    |
 | `~/.config/omni/image-crawl`           | Hourly image indexing on or off                                          |
 | `~/.config/omni/image-folders`         | Image search folders, one per line; a trailing `/**` includes subfolders |
+| `~/.config/omni/content-folders`       | Folders ripgrep searches for Contents, one per line                      |
+| `~/.config/omni/agent_prompt.md`       | Your agent instructions, replacing the default                           |
 | `~/.config/omni/style.css`             | Your style overrides                                                     |
 | `~/.local/share/omni/images/index.npz` | The image index                                                          |
 | `~/.cache/omni/thumbs-160`             | Image thumbnails                                                         |
@@ -347,7 +349,7 @@ Hover the top-right corner of the search bar and click the gear.
 | Folders walked for file names                    | `name_roots` in `files.rs`                                                                      |
 | Folders whose contents are not indexed           | `SKIP_INSIDE` in `files.rs`                                                                     |
 | How long the browser stays after the last search | `IDLE_EXIT` in `web_client.rs` (10 s)                                                           |
-| Claude's agent instructions                      | `src/agent_prompt.md`                                                                           |
+| Claude's agent instructions                      | `~/.config/omni/agent_prompt.md` (default: `src/agent_prompt.md`)                                |
 
 Rebuild with `./install.sh` after changing source files.
 
@@ -429,7 +431,7 @@ Installed files are read-only. The keybind helper is a separate program so a key
 | `src/images.rs`           | Image search: helper process, crawl scheduling, results                        |
 | `scripts/omni-embed.py`   | Image search helper: model, index, thumbnails                                  |
 | `src/answer.rs`           | Ask Claude: conversation process, permission prompts, model chip, Markdown     |
-| `src/agent_prompt.md`     | Your agent instructions, appended to Claude's system prompt                    |
+| `src/agent_prompt.md`     | Default agent instructions; `~/.config/omni/agent_prompt.md` replaces them      |
 | `src/web.rs`              | Default browser and search engine detection                                    |
 | `src/search_view.rs`      | The web search panel                                                           |
 | `src/search_provider.rs`  | Built-in search engines                                                        |

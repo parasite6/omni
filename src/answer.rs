@@ -43,9 +43,14 @@ pub const MODELS: [(&str, &str); 4] = [
     ("claude-fable-5-1", "Fable 5.1"),
 ];
 pub const EFFORTS: [(&str, &str); 5] = [("low", "Low"), ("medium", "Medium"), ("high", "High"), ("xhigh", "Extra"), ("max", "Max")];
-/// The user's own agent instructions,
-/// appended after the launcher instructions above. Edit src/agent_prompt.md and reinstall.
+/// Default agent instructions, appended after the launcher instructions above.
+/// `~/.config/omni/agent_prompt.md` replaces them, read fresh for every question.
 const AGENT_PROMPT: &str = include_str!("agent_prompt.md");
+
+fn agent_prompt() -> String {
+    std::fs::read_to_string(glib::user_config_dir().join("omni/agent_prompt.md"))
+        .unwrap_or_else(|_| AGENT_PROMPT.to_string())
+}
 
 /// Tools Claude may use. WebSearch alone is pre-approved (it only sends a query); the rest
 /// go through Claude Code's permission checks and omni's prompt.
@@ -1176,7 +1181,7 @@ fn spawn(model: &str, effort: &str) -> Result<(gio::Subprocess, Option<String>),
         .flat_map(|p| [format!("Read({p})"), format!("Read({p}/**)"), format!("Edit({p})"), format!("Edit({p}/**)")])
         .collect::<Vec<_>>()
         .join(",");
-    let system = format!("{SYSTEM}\n\n{AGENT_PROMPT}");
+    let system = format!("{SYSTEM}\n\n{}", agent_prompt());
     // Shell commands run in Claude Code's bubblewrap sandbox: the secrets don't exist for
     // them, network access asks, and they never fall back to running unsandboxed (or start
     // at all if the sandbox can't). The sandbox doesn't approve commands by itself
