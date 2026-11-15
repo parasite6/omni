@@ -278,8 +278,8 @@ Details: [Web search internals](#web-search-internals).
 
 Type `img`, a space and a description of the picture, for example `img a dog on a beach`. Your pictures are ranked by what is in them, with thumbnails; <kbd>Enter</kbd> and the right-click menu work as for any file.
 
-- **Folders:** `~/Pictures` and its subfolders by default. Add more in Settings, **Image search**: type a path, turn on **Subdirectories** to include everything under it, then **Add**. Adding a folder again checks it for new images; adding it again with **Subdirectories** on widens it.
-- **Indexing** runs quietly 10 seconds after omni starts, then hourly, and only processes new or changed images. Turn it off in Settings, or run it at full speed with **Index now**.
+- **Folders:** `~/Pictures` and its subfolders by default. Add more in Settings, **Image search**: type a path, turn on **Include subfolders** to take everything inside it, then **Add**. Adding a folder again checks it for new pictures; adding it again with **Include subfolders** on takes its subfolders too.
+- **Indexing** runs quietly 10 seconds after omni starts, then hourly, and only processes new or changed images. Turn it off in Settings, or run it at full speed with **Scan now**.
 - **Formats:** PNG, JPEG, WebP, GIF (first frame), BMP. Hidden folders are skipped.
 - **Resources:** everything runs on the GPU. The search model loads when you type `img` and unloads 10 seconds after your last query.
 
@@ -320,7 +320,7 @@ Hover the top-right corner of the search bar and click the gear.
 | ----------------- | -------------------------------------------------------------------------------------------- |
 | **Search engine** | The built-in web search engine (currently Brave)                                             |
 | **Run programs**  | Whether opening an executable runs it (after confirmation) or opens it in its default app    |
-| **Image search**  | Hourly indexing on or off, a folder field with **Subdirectories**, **Add** and **Index now** |
+| **Image search**  | Hourly indexing on or off, a folder field with **Include subfolders**, **Add** and **Scan now** |
 
 ### Files omni keeps
 
@@ -528,7 +528,7 @@ The image search helper is the exception: it uses CUDA on the NVIDIA GPU, and om
 - **Model:** [embeddinggemma-2](https://huggingface.co/google/embeddinggemma-2) in ONNX form (about 1.05 GB), downloaded on the first crawl to `~/.local/share/omni/models`. It runs in `omni-embed.py` from its own virtual environment, built by `install.sh` with `uv`; onnxruntime-gpu brings its own CUDA and cuDNN.
 - **Indexing** uses the fp16 vision and text models on the GPU, embeds only new or changed images, then exits. A crawl with nothing new never loads the model.
   - The hourly crawl runs at low priority, one image at a time (about 0.23 s each).
-  - **Index now** and adding a folder run at full speed, decoding on worker threads while the GPU encodes (about 0.13 s each), when at least 1.8 GB of VRAM and 3 GB of RAM are free. Otherwise they use the gentle pace.
+  - **Scan now** and adding a folder run at full speed, decoding on worker threads while the GPU encodes (about 0.13 s each), when at least 1.8 GB of VRAM and 3 GB of RAM are free. Otherwise they use the gentle pace.
 - **Querying** uses the 4-bit text model (174 MB on disk) on the GPU. It returned the same top results as fp16 in testing. Typing `img` starts the helper (about 2 to 3 s); each query then takes about 7 ms; it exits 10 s after the last query.
 - **Memory while querying:** about 290 MB of VRAM and about 960 MB of RAM. Most of that RAM is CUDA's own runtime (cuBLAS loads its GPU kernels into memory on the first query), not the model, and about 340 MB of it is shared library pages the kernel can reclaim under pressure. A CPU version would need about 250 MB but would cost CPU time on every keystroke.
 - **Storage:** the index is `~/.local/share/omni/images/index.npz` (paths, modification times and vectors), written atomically. Thumbnails are 160 px PNGs in `~/.cache/omni/thumbs-160`. A corrupt index is set aside and rebuilt, and vectors for an unmounted folder are kept until it returns.

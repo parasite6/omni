@@ -8,7 +8,7 @@
                                added first; --recursive takes its subdirectories too). Loads the
                                vision encoder only when there is something to embed, and exits
                                when done. Progress on stdout. Without --fast it stays out of the
-                               way (low priority, one image at a time); --fast (Index now) runs
+                               way (low priority, one image at a time); --fast (Scan now) runs
                                at full speed when the machine has the room.
 
 Runs in its own venv (onnxruntime-gpu brings its own CUDA and cuDNN), started by omni.
@@ -327,7 +327,7 @@ def fill_thumbs(paths):
 
 
 def room_to_go_fast():
-    """Index now: full speed only with free VRAM (vision + text ~1.2 GB) and RAM to spare.
+    """Scan now: full speed only with free VRAM (vision + text ~1.2 GB) and RAM to spare.
     Returns worker threads for decoding/preprocessing, or 0 to stay gentle."""
     try:
         import subprocess

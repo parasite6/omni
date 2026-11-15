@@ -1042,7 +1042,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     img_title.add_css_class("omni-settings-title");
     img_text.append(&img_title);
     let img_hint = gtk::Label::builder()
-        .label("Type img and a description. New pictures are indexed quietly every hour on the GPU.")
+        .label("Type img and describe a picture to find it. New pictures in these folders are picked up every hour.")
         .xalign(0.0)
         .wrap(true)
         .max_width_chars(1)
@@ -1070,13 +1070,13 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .build();
     // Off: just the folder itself. On: everything under it too.
     let img_subdirs = gtk::ToggleButton::builder()
-        .label("Subdirectories")
-        .tooltip_text("Also index every folder inside it")
+        .label("Include subfolders")
+        .tooltip_text("Also scan every folder inside it")
         .css_classes(["omni-toggle"])
         .valign(gtk::Align::Center)
         .build();
     let img_add = gtk::Button::builder().label("Add").css_classes(["omni-toggle", "omni-settings-action"]).build();
-    let img_index_now = gtk::Button::builder().label("Index now").css_classes(["omni-toggle", "omni-settings-action"]).build();
+    let img_index_now = gtk::Button::builder().label("Scan now").css_classes(["omni-toggle", "omni-settings-action"]).build();
     img_index_now.set_sensitive(images::installed() && !images.crawling());
     img_add.set_sensitive(images::installed());
     img_folder.set_sensitive(images::installed());
@@ -2234,7 +2234,7 @@ fn image_hits(ui: &Ui, query: &str) -> Vec<Hit> {
         images::Results::Searching(h) if h.is_empty() => return vec![info_hit("Searching images\u{2026}")],
         images::Results::Searching(h) => h,
         images::Results::Empty => {
-            let msg = if images.crawling() { "Indexing images\u{2026} try again in a moment" } else { "No images indexed yet: Settings \u{2192} Image search \u{2192} Index now" };
+            let msg = if images.crawling() { "Scanning pictures\u{2026} try again in a moment" } else { "No pictures searchable yet: Settings \u{2192} Image search \u{2192} Scan now" };
             return vec![info_hit(msg)];
         }
         images::Results::Unavailable => {

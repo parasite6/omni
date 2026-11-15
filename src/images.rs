@@ -5,7 +5,7 @@
 //!   line per query, and exits by itself 10 s after the last one.
 //! - `crawl`: embeds new or changed images in the configured folders (~/Pictures by default,
 //!   ~/.config/omni/image-folders), then exits. Runs 10 s after start and hourly unless
-//!   Settings → Image search is off; Index now / Add folder… run it right away.
+//!   Settings → Image search is off; Scan now / Add run it right away.
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
@@ -330,12 +330,12 @@ impl Images {
         let count = v.as_ref().and_then(|v| v.get("count")?.as_u64());
         let folders = folders()
             .iter()
-            .map(|(f, rec)| format!("{}{}", label(f), if *rec { " (with subdirectories)" } else { "" }))
+            .map(|(f, rec)| format!("{}{}", label(f), if *rec { " and its subfolders" } else { "" }))
             .collect::<Vec<_>>()
             .join(", ");
         match count {
-            Some(n) => format!("{n} image{} indexed from {folders}.", if n == 1 { "" } else { "s" }),
-            None => format!("Nothing indexed yet. Indexes {folders}."),
+            Some(n) => format!("{n} picture{} searchable, from {folders}.", if n == 1 { "" } else { "s" }),
+            None => format!("No pictures searchable yet. Will scan {folders}."),
         }
     }
 
@@ -354,7 +354,7 @@ impl Images {
         if self.crawling.get() {
             if let Some((dir, rec)) = add {
                 self.pending_add.borrow_mut().push((dir.to_path_buf(), rec));
-                self.set_crawl_status(format!("{} is next, after this crawl.", label(dir)));
+                self.set_crawl_status(format!("{} will be scanned after the current scan.", label(dir)));
             }
             return;
         }
@@ -377,12 +377,12 @@ impl Images {
         let proc = match spawn(&args) {
             Ok(p) => p,
             Err(e) => {
-                self.set_crawl_status(format!("Couldn't start indexing: {e}"));
+                self.set_crawl_status(format!("Couldn't start the scan: {e}"));
                 return;
             }
         };
         self.crawling.set(true);
-        self.set_crawl_status("Looking for new images…".into());
+        self.set_crawl_status("Looking for new pictures…".into());
         let me = Rc::downgrade(self);
         let me_eof = me.clone();
         let (fs, ac) = (folder_state.clone(), added_count.clone());
@@ -401,9 +401,9 @@ impl Images {
                     Some("progress") => {
                         let done = v.get("done").and_then(|d| d.as_u64()).unwrap_or(0);
                         let total = v.get("total").and_then(|d| d.as_u64()).unwrap_or(0);
-                        me.set_crawl_status(format!("Indexing images… {done} of {total}"));
+                        me.set_crawl_status(format!("Scanning pictures… {done} of {total}"));
                     }
-                    Some("busy") => me.set_crawl_status("Already indexing.".into()),
+                    Some("busy") => me.set_crawl_status("Already scanning.".into()),
                     _ => {}
                 }
             },
@@ -418,18 +418,18 @@ impl Images {
                 // New vectors: answers cached for the old index are stale.
                 *me.answer.borrow_mut() = None;
                 let n = added_count.get();
-                let images = |n: u64| format!("{n} new image{}", if n == 1 { "" } else { "s" });
+                let images = |n: u64| format!("{n} new picture{}", if n == 1 { "" } else { "s" });
                 let lead = match (added_label, folder_state.borrow().as_deref()) {
                     (Some((name, _)), Some("queued")) => {
-                        format!("{name} is listed; another crawl was running, so the next one indexes it.")
+                        format!("Added {name}. It will be scanned after the current scan.")
                     }
                     (Some((name, _)), Some("same")) if n == 0 => {
-                        format!("{name} is already indexed: no new images. Add it again with Subdirectories on to take those too.")
+                        format!("{name} was already added, nothing new. To include its subfolders, turn on Include subfolders and add it again.")
                     }
-                    (Some((name, _)), Some("same")) => format!("{name} is already indexed: {} added.", images(n)),
-                    (Some((name, _)), Some("deeper")) => format!("{name} now includes its subdirectories: {}.", images(n)),
+                    (Some((name, _)), Some("same")) => format!("{name} was already added: {}.", images(n)),
+                    (Some((name, _)), Some("deeper")) => format!("{name} now includes its subfolders: {}.", images(n)),
                     (Some((name, rec)), _) => {
-                        format!("Added {name}{}: {}.", if rec { " with subdirectories" } else { "" }, images(n))
+                        format!("Added {name}{}: {}.", if rec { " and its subfolders" } else { "" }, images(n))
                     }
                     (None, _) if fast => format!("Done: {}.", images(n)),
                     (None, _) => String::new(),
