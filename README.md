@@ -55,18 +55,18 @@
 
 ## At a glance
 
-| You want to | Do this |
-|---|---|
-| Open an app | Type part of its name, press <kbd>Enter</kbd>. Typos are forgiven. |
-| Open a file or folder | Type part of its name. |
-| Search inside one folder | `<folder>: <name>`, for example `~/Documents: report` |
-| Search inside files | Turn on **Contents** with <kbd>Ctrl</kbd> + <kbd>T</kbd> |
-| Find a picture by what is in it | `img <description>` |
-| Do quick maths | `200*15%` (<kbd>Enter</kbd> copies the result) |
-| Search the web | Type, then <kbd>Ctrl</kbd> + <kbd>Enter</kbd> |
-| Ask Claude | Type, then <kbd>Shift</kbd> + <kbd>Enter</kbd> |
-| Manage a systemd service | Type its name, right-click it |
-| Close the popup | <kbd>Esc</kbd>, or click outside the card |
+| You want to                     | Do this                                                            |
+| ------------------------------- | ------------------------------------------------------------------ |
+| Open an app                     | Type part of its name, press <kbd>Enter</kbd>. Typos are forgiven. |
+| Open a file or folder           | Type part of its name.                                             |
+| Search inside one folder        | `<folder>: <name>`, for example `~/Documents: report`              |
+| Search inside files             | Turn on **Contents** with <kbd>Ctrl</kbd> + <kbd>T</kbd>           |
+| Find a picture by what is in it | `img <description>`                                                |
+| Do quick maths                  | `200*15%` (<kbd>Enter</kbd> copies the result)                     |
+| Search the web                  | Type, then <kbd>Ctrl</kbd> + <kbd>Enter</kbd>                      |
+| Ask Claude                      | Type, then <kbd>Shift</kbd> + <kbd>Enter</kbd>                     |
+| Manage a systemd service        | Type its name, right-click it                                      |
+| Close the popup                 | <kbd>Esc</kbd>, or click outside the card                          |
 
 Everything shares one list, so there is no mode to pick first.
 
@@ -99,17 +99,17 @@ Run the same script again to update. It builds a release into the repository's `
 
 ## Keyboard shortcuts
 
-| Key | Action |
-|---|---|
-| Type | Search apps, files, folders, commands and services |
-| <kbd>↑</kbd> / <kbd>↓</kbd>, scroll wheel | Move through results (the wheel scrolls the text while a Claude answer is showing) |
-| <kbd>Enter</kbd> | Open the selected result |
-| <kbd>Ctrl</kbd> + <kbd>Enter</kbd> | Search the web for what you typed |
-| <kbd>Shift</kbd> + <kbd>Enter</kbd> | Ask Claude; afterwards <kbd>Enter</kbd> sends follow-ups |
-| <kbd>Ctrl</kbd> + <kbd>T</kbd> | Toggle **Contents** (also match text inside files) |
-| <kbd>Ctrl</kbd> + <kbd>F</kbd> | Open the result filter |
-| <kbd>Menu</kbd> or <kbd>Shift</kbd> + <kbd>F10</kbd> | Right-click menu for the selected result |
-| <kbd>Esc</kbd> | Back out one level, then close |
+| Key                                                  | Action                                                                             |
+| ---------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Type                                                 | Search apps, files, folders, commands and services                                 |
+| <kbd>↑</kbd> / <kbd>↓</kbd>, scroll wheel            | Move through results (the wheel scrolls the text while a Claude answer is showing) |
+| <kbd>Enter</kbd>                                     | Open the selected result                                                           |
+| <kbd>Ctrl</kbd> + <kbd>Enter</kbd>                   | Search the web for what you typed                                                  |
+| <kbd>Shift</kbd> + <kbd>Enter</kbd>                  | Ask Claude; afterwards <kbd>Enter</kbd> sends follow-ups                           |
+| <kbd>Ctrl</kbd> + <kbd>T</kbd>                       | Toggle **Contents** (also match text inside files)                                 |
+| <kbd>Ctrl</kbd> + <kbd>F</kbd>                       | Open the result filter                                                             |
+| <kbd>Menu</kbd> or <kbd>Shift</kbd> + <kbd>F10</kbd> | Right-click menu for the selected result                                           |
+| <kbd>Esc</kbd>                                       | Back out one level, then close                                                     |
 
 <kbd>Esc</kbd> steps back in this order: menu, prompt, status panel, conversation, search, close.
 
@@ -117,20 +117,20 @@ Run the same script again to update. It builds a release into the repository's `
 
 ## What you can type
 
-| Input | Result | Example |
-|---|---|---|
-| *(nothing)* | Your 5 most recent apps, files and folders | |
-| `<app name>` | Apps; typos are forgiven | `firefox`, `frfox` |
-| `<app name> <action>` | That app action as its own row | `firefox private` |
-| `<program>` | Programs in your `$PATH` | `python` |
-| `<service name>` (3 or more letters) | Matching systemd services, with their state | `network` |
-| `<file or folder name>` | Files and folders anywhere | `report` |
-| `<folder>: <name>` | Files and folders inside that folder only | `~/Documents: report` |
-| `<folder>:` | The folder itself | `~/Documents:` |
-| `<calculation>` | The calculator | `6x5`, `200*15%` |
-| `img <description>` | Pictures ranked by what is in them | `img a dog on a beach` |
-| `<anything>`, then <kbd>Ctrl</kbd> + <kbd>Enter</kbd> | Web search | |
-| `<anything>`, then <kbd>Shift</kbd> + <kbd>Enter</kbd> | Ask Claude | |
+| Input                                                  | Result                                      | Example                |
+| ------------------------------------------------------ | ------------------------------------------- | ---------------------- |
+| _(nothing)_                                            | Your 5 most recent apps, files and folders  |                        |
+| `<app name>`                                           | Apps; typos are forgiven                    | `firefox`, `frfox`     |
+| `<app name> <action>`                                  | That app action as its own row              | `firefox private`      |
+| `<program>`                                            | Programs in your `$PATH`                    | `python`               |
+| `<service name>` (3 or more letters)                   | Matching systemd services, with their state | `network`              |
+| `<file or folder name>`                                | Files and folders anywhere                  | `report`               |
+| `<folder>: <name>`                                     | Files and folders inside that folder only   | `~/Documents: report`  |
+| `<folder>:`                                            | The folder itself                           | `~/Documents:`         |
+| `<calculation>`                                        | The calculator                              | `6x5`, `200*15%`       |
+| `img <description>`                                    | Pictures ranked by what is in them          | `img a dog on a beach` |
+| `<anything>`, then <kbd>Ctrl</kbd> + <kbd>Enter</kbd>  | Web search                                  |                        |
+| `<anything>`, then <kbd>Shift</kbd> + <kbd>Enter</kbd> | Ask Claude                                  |                        |
 
 ---
 
@@ -138,12 +138,12 @@ Run the same script again to update. It builds a release into the repository's `
 
 Right-click a row, or press <kbd>Menu</kbd> or <kbd>Shift</kbd> + <kbd>F10</kbd> on the selected one.
 
-| Row | Menu |
-|---|---|
-| File | **Open**, **Open with** (up to 10 apps registered for the type, recommended first) |
-| App | **Open** and the app's own actions (New window, New private window, ...) |
-| Search the web | **Search**, **New private window**, and for Brave **New private window with Tor** |
-| Service | **Status**, then Start, Stop, Restart, Enable and Disable as they apply |
+| Row            | Menu                                                                               |
+| -------------- | ---------------------------------------------------------------------------------- |
+| File           | **Open**, **Open with** (up to 10 apps registered for the type, recommended first) |
+| App            | **Open** and the app's own actions (New window, New private window, ...)           |
+| Search the web | **Search**, **New private window**, and for Brave **New private window with Tor**  |
+| Service        | **Status**, then Start, Stop, Restart, Enable and Disable as they apply            |
 
 ---
 
@@ -155,17 +155,17 @@ Right-click a row, or press <kbd>Menu</kbd> or <kbd>Shift</kbd> + <kbd>F10</kbd>
 
 **Result order is fixed:**
 
-| Order | Kind | Up to |
-|---|---|---|
-| 1 | App actions | 3 |
-| 2 | Apps | 6 |
-| 3 | Services | 3 |
-| 4 | Commands (programs in `$PATH`) | 3 |
-| 5 | Files | 5 |
-| 6 | Folders | 3 |
-| 7 | File contents | 4 |
-| 8 | Search the web | 1 |
-| 9 | Ask Claude | 1 |
+| Order | Kind                           | Up to |
+| ----- | ------------------------------ | ----- |
+| 1     | App actions                    | 3     |
+| 2     | Apps                           | 6     |
+| 3     | Services                       | 3     |
+| 4     | Commands (programs in `$PATH`) | 3     |
+| 5     | Files                          | 5     |
+| 6     | Folders                        | 3     |
+| 7     | File contents                  | 4     |
+| 8     | Search the web                 | 1     |
+| 9     | Ask Claude                     | 1     |
 
 - The web row is first only when nothing above it matches.
 - Apps you launch often rank higher among apps.
@@ -184,13 +184,13 @@ Apps are matched like GNOME does: word starts first, then substrings.
 
 **Loose matching** applies to apps only, and only when nothing matches by name as typed. Each typed word may then be loosely similar to a word in an app's name (or, more strictly, its keywords and program name). There is no list of known typos.
 
-| You type | You get |
-|---|---|
-| `frfox` | Firefox |
-| `brvae` | Brave |
-| `obsidain` | Obsidian |
+| You type     | You get     |
+| ------------ | ----------- |
+| `frfox`      | Firefox     |
+| `brvae`      | Brave       |
+| `obsidain`   | Obsidian    |
 | `libreofice` | LibreOffice |
-| `nautlus` | Files |
+| `nautlus`    | Files       |
 
 A word counts as close when it is a few edits away (about a third of its letters, at least one; swapped neighbours count as one edit), or when its letters appear in order in the name word without being scattered. Weak guesses, and guesses under half the best guess's score, are dropped, so queries like `invoices` show no apps.
 
@@ -250,8 +250,8 @@ Typing a service name (3 or more letters) lists matching system and user systemd
 
 When the whole query is a complete calculation, the result replaces the list: the expression small on top, the result large underneath. <kbd>Enter</kbd> copies the result.
 
-| Works | Notes |
-|---|---|
+| Works                                                          | Notes                                                                               |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `6x5`, `3 × 4`, `10÷4`, `2^10`, `(3+3)*2`, `2(3+4)`, `200*15%` | `x`, `×` and `*` multiply; `÷` and `/` divide; `%` after a number divides it by 100 |
 
 Unfinished input (`4x`), a bare number, words (`15% of 80`) and division by zero produce no calculator row. Results show up to 10 significant digits.
@@ -265,10 +265,10 @@ Unfinished input (`4x`), a bare number, words (`15% of 80`) and division by zero
 
 **Private windows in your own browser:** right-click the web row.
 
-| Option | For | Flag |
-|---|---|---|
-| **New private window** | Chromium-based browsers | `--incognito` |
-| **New private window with Tor** | Brave | `--tor` |
+| Option                          | For                     | Flag          |
+| ------------------------------- | ----------------------- | ------------- |
+| **New private window**          | Chromium-based browsers | `--incognito` |
+| **New private window with Tor** | Brave                   | `--tor`       |
 
 These use Brave's private-window search engine. Firefox gets no private items, because its search engine cannot be pointed at a private window.
 
@@ -296,12 +296,12 @@ Press <kbd>Shift</kbd> + <kbd>Enter</kbd> on anything you typed. omni runs the C
 - **Tools:** web search and fetch, reading and searching files, shell commands in a sandbox, edits and writes, and your claude.ai connectors. Anything that changes something asks first.
 - **Secrets are unreadable** to Claude: SSH and GPG keys, cloud credentials, keyrings, browser profiles, shell histories and similar.
 
-| Setting | Value |
-|---|---|
-| Models | Haiku 5.5, Sonnet 5.5, Opus 5.5, Fable 5.1 |
-| Effort | Low, Medium, High, Extra (`xhigh`), Max |
-| Default | Haiku 5.5, Medium |
-| Switch | The chip in the answer header; remembered in `~/.local/state/omni/claude` |
+| Setting | Value                                                                                                  |
+| ------- | ------------------------------------------------------------------------------------------------------ |
+| Models  | Haiku 5.5, Sonnet 5.5, Opus 5.5, Fable 5.1                                                             |
+| Effort  | Low, Medium, High, Extra (`xhigh`), Max                                                                |
+| Default | Haiku 5.5, Medium                                                                                      |
+| Switch  | The chip in the answer header; remembered in `~/.local/state/omni/claude`                              |
 | Timeout | 90 to 360 s of silence depending on effort, 20 minutes at most; paused while a permission prompt waits |
 
 Your own agent instructions live in `src/agent_prompt.md`; run `./install.sh` after editing them.
@@ -316,38 +316,38 @@ Details: [Claude: permissions and sandbox](#claude-permissions-and-sandbox).
 
 Hover the top-right corner of the search bar and click the gear.
 
-| Setting | What it does |
-|---|---|
-| **Search engine** | The built-in web search engine (currently Brave) |
-| **Run programs** | Whether opening an executable runs it (after confirmation) or opens it in its default app |
-| **Image search** | Hourly indexing on or off, a folder field with **Subdirectories**, **Add** and **Index now** |
+| Setting           | What it does                                                                                 |
+| ----------------- | -------------------------------------------------------------------------------------------- |
+| **Search engine** | The built-in web search engine (currently Brave)                                             |
+| **Run programs**  | Whether opening an executable runs it (after confirmation) or opens it in its default app    |
+| **Image search**  | Hourly indexing on or off, a folder field with **Subdirectories**, **Add** and **Index now** |
 
 ### Files omni keeps
 
-| File | Holds |
-|---|---|
-| `~/.local/state/omni/contents` | The **Contents** toggle |
-| `~/.local/state/omni/filter` | The result filter |
-| `~/.local/state/omni/claude` | Claude model and effort |
-| `~/.local/state/omni/usage.tsv` | App launch counts and times |
-| `~/.config/omni/run-programs` | **Run programs** on or off |
-| `~/.config/omni/search-engine` | The web search engine |
-| `~/.config/omni/image-crawl` | Hourly image indexing on or off |
-| `~/.config/omni/image-folders` | Image search folders, one per line; a trailing `/**` includes subfolders |
-| `~/.config/omni/style.css` | Your style overrides |
-| `~/.local/share/omni/images/index.npz` | The image index |
-| `~/.cache/omni/thumbs-160` | Image thumbnails |
+| File                                   | Holds                                                                    |
+| -------------------------------------- | ------------------------------------------------------------------------ |
+| `~/.local/state/omni/contents`         | The **Contents** toggle                                                  |
+| `~/.local/state/omni/filter`           | The result filter                                                        |
+| `~/.local/state/omni/claude`           | Claude model and effort                                                  |
+| `~/.local/state/omni/usage.tsv`        | App launch counts and times                                              |
+| `~/.config/omni/run-programs`          | **Run programs** on or off                                               |
+| `~/.config/omni/search-engine`         | The web search engine                                                    |
+| `~/.config/omni/image-crawl`           | Hourly image indexing on or off                                          |
+| `~/.config/omni/image-folders`         | Image search folders, one per line; a trailing `/**` includes subfolders |
+| `~/.config/omni/style.css`             | Your style overrides                                                     |
+| `~/.local/share/omni/images/index.npz` | The image index                                                          |
+| `~/.cache/omni/thumbs-160`             | Image thumbnails                                                         |
 
 ### Source-level settings
 
-| What | Where |
-|---|---|
-| Any style | `~/.config/omni/style.css` overrides `src/style.css` (colours: `@omni_bg`, `@omni_accent`, ...) |
-| Launcher corrections (Brave actions) | `TWEAKS` in `apps.rs` |
-| Folders walked for file names | `name_roots` in `files.rs` |
-| Folders whose contents are not indexed | `SKIP_INSIDE` in `files.rs` |
-| How long the browser stays after the last search | `IDLE_EXIT` in `web_client.rs` (10 s) |
-| Claude's agent instructions | `src/agent_prompt.md` |
+| What                                             | Where                                                                                           |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| Any style                                        | `~/.config/omni/style.css` overrides `src/style.css` (colours: `@omni_bg`, `@omni_accent`, ...) |
+| Launcher corrections (Brave actions)             | `TWEAKS` in `apps.rs`                                                                           |
+| Folders walked for file names                    | `name_roots` in `files.rs`                                                                      |
+| Folders whose contents are not indexed           | `SKIP_INSIDE` in `files.rs`                                                                     |
+| How long the browser stays after the last search | `IDLE_EXIT` in `web_client.rs` (10 s)                                                           |
+| Claude's agent instructions                      | `src/agent_prompt.md`                                                                           |
 
 Rebuild with `./install.sh` after changing source files.
 
@@ -369,11 +369,11 @@ Point your keybind back at your previous launcher. On ML4W dotfiles, put `rofi` 
 journalctl --user -t ensure-running | grep omni       # start and health-check log
 ```
 
-| Variable | Effect |
-|---|---|
-| `OMNI_SEARCH_TIMING=1` | Log web search startup and page-load timings (no queries) |
+| Variable                    | Effect                                                                        |
+| --------------------------- | ----------------------------------------------------------------------------- |
+| `OMNI_SEARCH_TIMING=1`      | Log web search startup and page-load timings (no queries)                     |
 | `OMNI_SEARCH_DIAGNOSTICS=1` | Log web search endpoint status and streaming metadata (no queries or answers) |
-| `OMNI_CEF_DIR` (build time) | Use another CEF installation |
+| `OMNI_CEF_DIR` (build time) | Use another CEF installation                                                  |
 
 **Tests**
 
@@ -402,61 +402,61 @@ This section covers how omni works and why. You do not need it to use omni.
 
 ### Installed files
 
-| Path | Purpose |
-|---|---|
-| `~/.local/share/omni/bin/omni` | The background program: window, search, Claude |
-| `~/.local/share/omni/bin/omni-toggle` | What the keybind runs. No GTK; opens or closes the popup in about 1 ms |
-| `~/.local/share/omni/bin/omni-browser` | The browser process for web search, and its helpers |
-| `~/.local/share/omni/bin/omni-start` | Starts omni through `ensure-running` |
-| `~/.local/share/omni/bin/omni-embed.py` | The image search helper |
-| `~/.local/share/omni/embed-venv` | Its Python environment |
-| `~/.local/share/omni/models` | The image search model |
-| `~/.local/share/omni/hypr/omni.lua` | Hyprland layer rule for the popup |
+| Path                                    | Purpose                                                                |
+| --------------------------------------- | ---------------------------------------------------------------------- |
+| `~/.local/share/omni/bin/omni`          | The background program: window, search, Claude                         |
+| `~/.local/share/omni/bin/omni-toggle`   | What the keybind runs. No GTK; opens or closes the popup in about 1 ms |
+| `~/.local/share/omni/bin/omni-browser`  | The browser process for web search, and its helpers                    |
+| `~/.local/share/omni/bin/omni-start`    | Starts omni through `ensure-running`                                   |
+| `~/.local/share/omni/bin/omni-embed.py` | The image search helper                                                |
+| `~/.local/share/omni/embed-venv`        | Its Python environment                                                 |
+| `~/.local/share/omni/models`            | The image search model                                                 |
+| `~/.local/share/omni/hypr/omni.lua`     | Hyprland layer rule for the popup                                      |
 
 Installed files are read-only. The keybind helper is a separate program so a keypress costs about 1 ms instead of the roughly 60 ms it takes to load GTK.
 
 ### Source files
 
-| File | Purpose |
-|---|---|
-| `src/main.rs` | Window, results list, keys, menus, settings, control socket, monitor placement |
-| `src/apps.rs` | App list, matching, app actions and `TWEAKS`, launch history |
-| `src/recent.rs` | Recent files and folders |
-| `src/files.rs` | The file-name index (walk, search, ranking) and contents search |
-| `src/sparql.rs` | Minimal LocalSearch bindings (queries, change events) |
-| `src/services.rs` | systemd services: list, search, actions, status |
-| `src/calc.rs` | The calculator (strict parser; complete expressions only) |
-| `src/images.rs` | Image search: helper process, crawl scheduling, results |
-| `scripts/omni-embed.py` | Image search helper: model, index, thumbnails |
-| `src/answer.rs` | Ask Claude: conversation process, permission prompts, model chip, Markdown |
-| `src/agent_prompt.md` | Your agent instructions, appended to Claude's system prompt |
-| `src/web.rs` | Default browser and search engine detection |
-| `src/search_view.rs` | The web search panel |
-| `src/search_provider.rs` | Built-in search engines |
-| `src/search_filters/` | Brave's page style and preference script |
-| `src/web_client.rs` | omni's side of the browser: starts and stops it, shows frames, sends input |
-| `src/web_protocol.rs` | Messages between omni and the browser process |
-| `src/chromium.rs` | The browser process itself (CEF, private sessions, Brave preferences) |
-| `src/browser_frame.rs` | Frame size checks |
-| `src/glass.rs` | The card shell |
-| `src/ring.rs` | Search bar overlay (currently draws nothing) |
-| `src/style.css` | The look |
-| `src/dock.rs` | Pin or unpin apps on the quickshell dock |
-| `src/util.rs` | Running helper programs with a time limit |
-| `src/probe.rs` | Opt-in responsiveness diagnostics |
-| `src/bin/omni-toggle.rs` | The keybind helper |
-| `src/bin/omni-browser.rs` | The browser process and its helpers |
-| `scripts/omni-start` | Starts omni through `ensure-running` |
+| File                      | Purpose                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------ |
+| `src/main.rs`             | Window, results list, keys, menus, settings, control socket, monitor placement |
+| `src/apps.rs`             | App list, matching, app actions and `TWEAKS`, launch history                   |
+| `src/recent.rs`           | Recent files and folders                                                       |
+| `src/files.rs`            | The file-name index (walk, search, ranking) and contents search                |
+| `src/sparql.rs`           | Minimal LocalSearch bindings (queries, change events)                          |
+| `src/services.rs`         | systemd services: list, search, actions, status                                |
+| `src/calc.rs`             | The calculator (strict parser; complete expressions only)                      |
+| `src/images.rs`           | Image search: helper process, crawl scheduling, results                        |
+| `scripts/omni-embed.py`   | Image search helper: model, index, thumbnails                                  |
+| `src/answer.rs`           | Ask Claude: conversation process, permission prompts, model chip, Markdown     |
+| `src/agent_prompt.md`     | Your agent instructions, appended to Claude's system prompt                    |
+| `src/web.rs`              | Default browser and search engine detection                                    |
+| `src/search_view.rs`      | The web search panel                                                           |
+| `src/search_provider.rs`  | Built-in search engines                                                        |
+| `src/search_filters/`     | Brave's page style and preference script                                       |
+| `src/web_client.rs`       | omni's side of the browser: starts and stops it, shows frames, sends input     |
+| `src/web_protocol.rs`     | Messages between omni and the browser process                                  |
+| `src/chromium.rs`         | The browser process itself (CEF, private sessions, Brave preferences)          |
+| `src/browser_frame.rs`    | Frame size checks                                                              |
+| `src/glass.rs`            | The card shell                                                                 |
+| `src/ring.rs`             | Search bar overlay (currently draws nothing)                                   |
+| `src/style.css`           | The look                                                                       |
+| `src/dock.rs`             | Pin or unpin apps on the quickshell dock                                       |
+| `src/util.rs`             | Running helper programs with a time limit                                      |
+| `src/probe.rs`            | Opt-in responsiveness diagnostics                                              |
+| `src/bin/omni-toggle.rs`  | The keybind helper                                                             |
+| `src/bin/omni-browser.rs` | The browser process and its helpers                                            |
+| `scripts/omni-start`      | Starts omni through `ensure-running`                                           |
 
 ### Desktop integration
 
 omni needs three things from your Hyprland configuration (Lua config shown; adapt to your setup):
 
-| What | How |
-|---|---|
-| **Keybind** | Bind a key of your choice to run `~/.local/share/omni/bin/omni-toggle`. |
-| **Autostart** | Run `omni-start` at login: `hl.exec_cmd(os.getenv("HOME") .. "/.local/share/omni/bin/omni-start")` |
-| **Layer rule** | Load the installed rule: `dofile(os.getenv("HOME") .. "/.local/share/omni/hypr/omni.lua")` |
+| What           | How                                                                                                |
+| -------------- | -------------------------------------------------------------------------------------------------- |
+| **Keybind**    | Bind a key of your choice to run `~/.local/share/omni/bin/omni-toggle`.                            |
+| **Autostart**  | Run `omni-start` at login: `hl.exec_cmd(os.getenv("HOME") .. "/.local/share/omni/bin/omni-start")` |
+| **Layer rule** | Load the installed rule: `dofile(os.getenv("HOME") .. "/.local/share/omni/hypr/omni.lua")`         |
 
 Starting omni from the autostart file also restarts it on every `hyprctl reload`, which `ensure-running` turns into a no-op while it is healthy.
 
@@ -486,12 +486,12 @@ File names come from omni's own in-memory index, similar to Everything or FSearc
 
 **What it walks:** home, `/usr`, `/etc`, `/opt`, `/var`, `/srv`, `/mnt`, `/run/media/$USER`, and anything LocalSearch covers (`name_roots` in `files.rs`). Cache folders and the contents of `SKIP_INSIDE` folders are skipped. Hidden files are included but ranked low.
 
-| | |
-|---|---|
-| Walk | Parallel, at `nice 10`: about 2.9 million entries in about 2.7 s |
-| Refresh | Every 30 minutes, plus live updates from LocalSearch |
-| Search | SIMD substring scan over all distinct names, split across cores: about 1.5 to 4 ms per keystroke |
-| Memory | About 42 MB for 2.9 million entries |
+|         |                                                                                                  |
+| ------- | ------------------------------------------------------------------------------------------------ |
+| Walk    | Parallel, at `nice 10`: about 2.9 million entries in about 2.7 s                                 |
+| Refresh | Every 30 minutes, plus live updates from LocalSearch                                             |
+| Search  | SIMD substring scan over all distinct names, split across cores: about 1.5 to 4 ms per keystroke |
+| Memory  | About 42 MB for 2.9 million entries                                                              |
 
 - Each distinct name is stored once, in lowercase (only 29% of names are distinct). Entries are grouped by name, so each is a parent link and a flags byte.
 - The real capitalisation of the few results shown is read back from disk, which also confirms the file still exists. This runs on a background thread and gives up after 200 ms.

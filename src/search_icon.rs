@@ -1,10 +1,10 @@
-//! Cyan Omni artwork beneath a softly tethered, optically magnifying glass.
+//! The omni logo beneath a softly tethered, optically magnifying glass.
 use std::cell::RefCell;
 use std::f64::consts::{PI, TAU};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gtk::cairo::{Context, LinearGradient, RadialGradient};
+use gtk::cairo::{Context, Format, ImageSurface, LinearGradient, RadialGradient};
 use gtk::glib;
 use gtk::prelude::*;
 
@@ -20,6 +20,8 @@ struct Motion {
     last_frame: Option<Instant>,
     clicked: Option<Instant>,
     spin_base: f64,
+    // Total angle of the current click spin: one turn plus a random rest angle.
+    click_turn: f64,
     pull_entered: Option<Instant>,
     pending_pull: Option<(f64, f64, f64)>,
 }
@@ -166,6 +168,8 @@ pub fn new(search: &gtk::Overlay, strip: &gtk::Overlay, host: &gtk::Overlay) -> 
     area.connect_map(move |area| {
         *motion.borrow_mut() = Motion {
             opened: Some(Instant::now()),
+            // Each open settles at a random angle.
+            spin_base: glib::random_double_range(0.0, TAU),
             ..Default::default()
         };
         wake(area, &motion, &clock);
@@ -268,8 +272,9 @@ pub fn new(search: &gtk::Overlay, strip: &gtk::Overlay, host: &gtk::Overlay) -> 
                     let mut s = motion.borrow_mut();
                     let previous = s
                         .clicked
-                        .map_or(0.0, |t| click_rotation(t.elapsed().as_secs_f64()));
+                        .map_or(0.0, |t| click_rotation(t.elapsed().as_secs_f64()) / TAU * s.click_turn);
                     s.spin_base = (s.spin_base + previous) % TAU;
+                    s.click_turn = TAU + glib::random_double_range(0.0, TAU);
                     s.clicked = Some(Instant::now());
                     drop(s);
                     wake(&area, &motion, &clock);
@@ -295,58 +300,53 @@ pub fn new(search: &gtk::Overlay, strip: &gtk::Overlay, host: &gtk::Overlay) -> 
     area
 }
 
-// A curved blade traced from logo.png, repeated around the common center.
-fn blades(cr: &Context) {
-    for _ in 0..3 {
-        cr.move_to(0.0, 1.7);
-        cr.curve_to(-8.0, 1.5, -12.0, -5.7, -7.6, -11.4);
-        cr.curve_to(-9.6, -5.5, -4.4, -1.9, -1.25, -0.8);
-        cr.close_path();
-        let _ = cr.fill();
-        cr.rotate(TAU / 3.0);
-    }
+const LOGO_PNG: &[u8] = include_bytes!("../assets/logo-mark.png");
+
+thread_local! {
+    static LOGO: Option<ImageSurface> = decode_logo();
 }
 
-fn rounded_tile(cr: &Context) {
-    cr.new_sub_path();
-    for (x, y, start) in [
-        (26.0, 11.0, -PI / 2.0),
-        (26.0, 26.0, 0.0),
-        (11.0, 26.0, PI / 2.0),
-        (11.0, 11.0, PI),
-    ] {
-        cr.arc(x, y, 7.0, start, start + PI / 2.0);
-    }
-    cr.close_path();
+/// Decode the bundled logo into a Cairo surface (GDK downloads in ARGB32 order).
+fn decode_logo() -> Option<ImageSurface> {
+    use glib::translate::{from_glib_full, ToGlibPtr};
+    let bytes = glib::Bytes::from_static(LOGO_PNG);
+    // SAFETY: builds an in-memory texture only; no display or main thread needed.
+    let texture: gtk::gdk::Texture = unsafe {
+        let mut error = std::ptr::null_mut();
+        let texture = gtk::gdk::ffi::gdk_texture_new_from_bytes(bytes.to_glib_none().0, &mut error);
+        if texture.is_null() {
+            if !error.is_null() {
+                let error: glib::Error = from_glib_full(error);
+                crate::probe::log(format!("logo decode failed: {error}"));
+            }
+            return None;
+        }
+        from_glib_full(texture)
+    };
+    let mut surface = ImageSurface::create(Format::ARgb32, texture.width(), texture.height()).ok()?;
+    let stride = surface.stride() as usize;
+    texture.download(&mut surface.data().ok()?, stride);
+    surface.mark_dirty();
+    Some(surface)
 }
 
 fn draw_mark(cr: &Context, progress: f64, hover: f64, spin: f64) {
-    let _ = cr.save();
-    // Increase the whole logo from 29px to 34px, keeping its center fixed.
-    cr.translate(18.5, 18.5);
-    cr.scale(34.0 / 29.0, 34.0 / 29.0);
-    cr.translate(-18.5, -18.5);
-    // The backing stays stationary while the blades turn.
-    rounded_tile(cr);
-    let backing = LinearGradient::new(5.0, 4.0, 30.0, 33.0);
-    backing.add_color_stop_rgb(0.0, 0.15, 0.18, 0.21);
-    backing.add_color_stop_rgb(1.0, 0.075, 0.095, 0.12);
-    let _ = cr.set_source(&backing);
-    let _ = cr.fill_preserve();
-    cr.set_source_rgba(0.06, 0.73, 0.83, 0.48 + 0.16 * hover);
-    cr.set_line_width(0.8);
-    let _ = cr.stroke();
-
-    cr.translate(18.5, 18.5);
-    cr.rotate(TAU * (1.0 - (1.0 - progress).powi(3)) + spin);
-    cr.scale(0.92, 0.92);
-    let cyan = LinearGradient::new(-9.0, -12.0, 10.0, 12.0);
-    cyan.add_color_stop_rgb(0.0, 0.15 + 0.1 * hover, 0.87, 0.95);
-    cyan.add_color_stop_rgb(0.55, 0.04, 0.73, 0.85);
-    cyan.add_color_stop_rgb(1.0, 0.02, 0.53, 0.69);
-    let _ = cr.set_source(&cyan);
-    blades(cr);
-    let _ = cr.restore();
+    LOGO.with(|logo| {
+        let Some(logo) = logo else {
+            return;
+        };
+        let _ = cr.save();
+        cr.translate(18.5, 18.5);
+        cr.rotate(TAU * (1.0 - (1.0 - progress).powi(3)) + spin);
+        // 34px across, growing slightly while the pointer is near.
+        let size = 34.0 * (1.0 + 0.04 * hover);
+        let (w, h) = (f64::from(logo.width()), f64::from(logo.height()));
+        cr.scale(size / w, size / h);
+        let _ = cr.set_source_surface(logo, -w / 2.0, -h / 2.0);
+        cr.source().set_filter(gtk::cairo::Filter::Good);
+        let _ = cr.paint();
+        let _ = cr.restore();
+    });
 }
 
 // Inverse radial mapping: 1.65x at the optical center, smoothly joining 1x at
@@ -381,7 +381,6 @@ fn fisheye_artwork(
     boost: f64,
     spin: f64,
 ) -> Result<gtk::cairo::ImageSurface, gtk::cairo::Error> {
-    use gtk::cairo::{Format, ImageSurface};
     const SCALE: f64 = 4.0;
     const SIZE: i32 = 192;
     let mut source = ImageSurface::create(Format::ARgb32, SIZE, SIZE)?;
@@ -449,7 +448,7 @@ fn fisheye_artwork(
 
 fn draw(cr: &Context, s: &Motion, progress: f64, (r, g, b): (f64, f64, f64)) {
     let elapsed = s.clicked.map(|t| t.elapsed().as_secs_f64());
-    let spin = s.spin_base + elapsed.map_or(0.0, click_rotation);
+    let spin = s.spin_base + elapsed.map_or(0.0, |e| click_rotation(e) / TAU * s.click_turn);
     draw_mark(cr, progress, s.hover, spin);
 
     let cx = 18.5 + s.x;
@@ -489,6 +488,15 @@ fn draw(cr: &Context, s: &Motion, progress: f64, (r, g, b): (f64, f64, f64)) {
     cr.arc(0.0, 0.0, 17.0, 0.0, TAU);
     let _ = cr.set_source(&glass);
     let _ = cr.fill();
+    // Dark outline under the metal so the glass stands out against the colorful logo.
+    cr.set_source_rgba(0.02, 0.03, 0.05, 0.75);
+    cr.set_line_width(4.2);
+    cr.move_to(13.9, 9.8);
+    cr.line_to(22.0, 15.5);
+    let _ = cr.stroke();
+    cr.set_line_width(3.0);
+    cr.arc(0.0, 0.0, 17.0, 0.0, TAU);
+    let _ = cr.stroke();
     let metal = LinearGradient::new(-8.0 + s.x, -10.0 + s.y, 8.0, 10.0);
     metal.add_color_stop_rgba(0.0, 0.94, 0.98, 1.0, 0.96);
     metal.add_color_stop_rgba(0.4, r, g, b, 0.75);
@@ -499,7 +507,7 @@ fn draw(cr: &Context, s: &Motion, progress: f64, (r, g, b): (f64, f64, f64)) {
     cr.move_to(13.9, 9.8);
     cr.line_to(22.0, 15.5);
     let _ = cr.stroke();
-    cr.set_line_width(1.0);
+    cr.set_line_width(1.5);
     cr.arc(0.0, 0.0, 17.0, 0.0, TAU);
     let _ = cr.stroke();
     cr.set_source_rgba(0.95, 0.99, 1.0, 0.45 + 0.3 * s.hover + 0.22 * pulse);
@@ -546,7 +554,8 @@ mod tests {
 
     #[test]
     fn fisheye_renders_opaque_artwork_and_keeps_surroundings_transparent() {
-        for (cx, cy) in [(11.5, 18.5), (18.5, 18.5), (25.5, 18.5), (18.5, 25.5)] {
+        // The centers of the logo's four tiles.
+        for (cx, cy) in [(9.0, 8.0), (28.0, 8.0), (9.0, 29.0), (28.0, 29.0)] {
             let mut lens = fisheye_artwork(cx, cy, 1.0, 0.5, 0.0, 0.0).unwrap();
             let stride = lens.stride() as usize;
             let bytes = lens.data().unwrap();
