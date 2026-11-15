@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" width="140" alt="omni logo">
+  <img src="https://raw.githubusercontent.com/parasite6/omni/refs/heads/sanctuary/logo.png" width="140" alt="omni logo">
 </p>
 
 <h1 align="center">omni</h1>
