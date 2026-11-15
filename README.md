@@ -304,7 +304,7 @@ Press <kbd>Shift</kbd> + <kbd>Enter</kbd> on anything you typed. omni runs the C
 | Switch  | The chip in the answer header; remembered in `~/.local/state/omni/claude`                              |
 | Timeout | 90 to 360 s of silence depending on effort, 20 minutes at most; paused while a permission prompt waits |
 
-Your own agent instructions go in `~/.config/omni/agent_prompt.md`, read fresh for every question; without it omni uses the default in `src/agent_prompt.md`.
+Your own agent instructions go in `~/.config/omni/agent_prompt.md`. They are read when a conversation starts and sent once, as part of its system prompt; follow-ups don't repeat them. Without the file omni uses the default in `src/agent_prompt.md`.
 
 Details: [Claude: permissions and sandbox](#claude-permissions-and-sandbox).
 
@@ -368,7 +368,7 @@ Point your keybind back at your previous launcher. On ML4W dotfiles, put `rofi` 
 ~/.local/share/omni/bin/omni --recent                 # what shows with nothing typed
 ~/.local/share/omni/bin/omni --files plan readme      # build the file index here and time searches
 ~/.local/share/omni/bin/omni --check-env              # display and Hyprland environment, focused monitor
-journalctl --user -t ensure-running | grep omni       # start and health-check log
+journalctl --user -t ensure-running | grep omni       # start and health-check log (with ensure-running)
 ```
 
 | Variable                    | Effect                                                                        |
@@ -409,7 +409,7 @@ This section covers how omni works and why. You do not need it to use omni.
 | `~/.local/share/omni/bin/omni`          | The background program: window, search, Claude                         |
 | `~/.local/share/omni/bin/omni-toggle`   | What the keybind runs. No GTK; opens or closes the popup in about 1 ms |
 | `~/.local/share/omni/bin/omni-browser`  | The browser process for web search, and its helpers                    |
-| `~/.local/share/omni/bin/omni-start`    | Starts omni through `ensure-running`                                   |
+| `~/.local/share/omni/bin/omni-start`    | Starts omni, through `ensure-running` when installed                   |
 | `~/.local/share/omni/bin/omni-embed.py` | The image search helper                                                |
 | `~/.local/share/omni/embed-venv`        | Its Python environment                                                 |
 | `~/.local/share/omni/models`            | The image search model                                                 |
@@ -441,6 +441,8 @@ Installed files are read-only. The keybind helper is a separate program so a key
 | `src/chromium.rs`         | The browser process itself (CEF, private sessions, Brave preferences)          |
 | `src/browser_frame.rs`    | Frame size checks                                                              |
 | `src/glass.rs`            | The card shell                                                                 |
+| `src/search_icon.rs`      | The animated logo and magnifying glass in the search bar                       |
+| `assets/logo-mark.png`    | The logo drawn under the magnifying glass                                      |
 | `src/ring.rs`             | Search bar overlay (currently draws nothing)                                   |
 | `src/style.css`           | The look                                                                       |
 | `src/dock.rs`             | Pin or unpin apps on the quickshell dock                                       |
@@ -448,7 +450,7 @@ Installed files are read-only. The keybind helper is a separate program so a key
 | `src/probe.rs`            | Opt-in responsiveness diagnostics                                              |
 | `src/bin/omni-toggle.rs`  | The keybind helper                                                             |
 | `src/bin/omni-browser.rs` | The browser process and its helpers                                            |
-| `scripts/omni-start`      | Starts omni through `ensure-running`                                           |
+| `scripts/omni-start`      | Starts omni, through `ensure-running` when installed                           |
 
 ### Desktop integration
 
@@ -460,7 +462,7 @@ omni needs three things from your Hyprland configuration (Lua config shown; adap
 | **Autostart**  | Run `omni-start` at login: `hl.exec_cmd(os.getenv("HOME") .. "/.local/share/omni/bin/omni-start")` |
 | **Layer rule** | Load the installed rule: `dofile(os.getenv("HOME") .. "/.local/share/omni/hypr/omni.lua")`         |
 
-Starting omni from the autostart file also restarts it on every `hyprctl reload`, which `ensure-running` turns into a no-op while it is healthy.
+Starting omni from the autostart file also restarts it on every `hyprctl reload`, which `omni-start` turns into a no-op while it is healthy.
 
 **On ML4W dotfiles:** put `omni` in `~/.config/ml4w/settings/launcher`, and add an `omni` branch to `~/.config/hypr/scripts/launcher.sh` that runs `omni-toggle` (with rofi as the fallback). The launcher keybind then opens omni. These files belong to the ML4W dotfiles, so an ML4W update can overwrite them; re-add the changes if the old launcher returns.
 
@@ -470,7 +472,7 @@ The popup holds the keyboard exclusively while open, so a frozen omni would lock
 
 **Starting and health checks**
 
-- `ensure-running` starts omni with `--wait-wayland` and checks that it has a Wayland display and answers `omni-toggle --ping`. Unhealthy, zombie or duplicate instances are replaced, at most 3 starts in 5 minutes.
+- `omni-start` waits for Wayland and checks that omni has a Wayland display and answers `omni-toggle --ping`. Unhealthy instances are replaced; it never starts a second one next to a zombie. With `ensure-running` installed, duplicates are replaced too and starts are limited to 3 in 5 minutes.
 - At early login, Hyprland can start programs before `WAYLAND_DISPLAY` and `HYPRLAND_INSTANCE_SIGNATURE` exist. omni forces `GDK_BACKEND=wayland` and fills missing values from `hyprctl instances`, waiting up to 5 s, then exits with an error instead of hanging.
 - omni replies to each toggle before acting on it (about 1.2 ms round trip). No reply within 1 s makes `omni-toggle` run `omni-start`, which replaces a hung instance; a notification appears if that fails.
 - `hyprctl` calls are killed after 0.5 s.
