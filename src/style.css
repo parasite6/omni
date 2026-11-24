@@ -380,7 +380,7 @@ list.omni-results > row.omni-calc:hover,
 list.omni-results > row.omni-calc:active,
 list.omni-results > row.omni-calc:selected,
 list.omni-results > row.omni-calc.activatable:hover {
-  padding: 0 18px;
+  padding: 0;
   border-radius: 0;
   background-color: transparent;
   background-image: none;
@@ -390,25 +390,67 @@ list.omni-results > row.omni-calc.activatable:hover {
   outline: none;
 }
 
-.omni-calc-expression {
-  font-size: 12px;
-  font-weight: 400;
-  letter-spacing: 0;
-  color: @omni_text_secondary;
+/* Calculator card: expression → result, drawn by the row itself (no list highlight). */
+.omni-calc-card {
+  min-height: 104px;
+  margin: 2px 0;
+  padding: 14px 8px;
+  border-radius: 10px;
+  background-color: alpha(@omni_hover, 0.05);
+  border: 1px solid alpha(@omni_border, 0.06);
 }
 
-.omni-calc-hint {
-  font-size: 12px;
-  font-weight: 400;
-  color: @omni_placeholder;
+.omni-calc-left {
+  border-right: 1px solid alpha(@omni_divider, 0.08);
+}
+
+.omni-calc-expression,
+.omni-calc-result {
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: 0;
+  font-feature-settings: "tnum";
+  text-shadow: none;
+}
+
+.omni-calc-expression {
+  color: alpha(@omni_text, 0.72);
 }
 
 .omni-calc-result {
-  font-size: 22px;
-  font-weight: 500;
-  letter-spacing: 0;
   color: @omni_text;
-  text-shadow: none;
+}
+
+.omni-calc-caption {
+  padding: 2px 8px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 500;
+  color: @omni_text_secondary;
+  background-color: alpha(@omni_hover, 0.07);
+}
+
+.omni-calc-arrow {
+  margin: 0 14px;
+  color: @omni_text_secondary;
+  -gtk-icon-size: 14px;
+}
+
+/* Footer action hint ("Copy answer ⏎"). */
+.omni-path-hint {
+  font-size: 12px;
+  font-weight: 500;
+  color: @omni_text;
+}
+
+.omni-keycap {
+  min-width: 14px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: @omni_text_secondary;
+  background-color: alpha(@omni_hover, 0.08);
+  border: 1px solid alpha(@omni_border, 0.08);
 }
 
 /* ---------- Claude answer ---------- */

@@ -140,7 +140,7 @@ Right-click a row, or press <kbd>Menu</kbd> or <kbd>Shift</kbd> + <kbd>F10</kbd>
 
 | Row            | Menu                                                                               |
 | -------------- | ---------------------------------------------------------------------------------- |
-| File           | **Open**, **Open with** (up to 10 apps registered for the type, recommended first) |
+| File           | **Open**, **Copy image** for pictures, **Open with** (up to 10 apps for the type)  |
 | App            | **Open** and the app's own actions (New window, New private window, ...)           |
 | Search the web | **Search**, **New private window**, and for Brave **New private window with Tor**  |
 | Service        | **Status**, then Start, Stop, Restart, Enable and Disable as they apply            |
@@ -170,6 +170,7 @@ Right-click a row, or press <kbd>Menu</kbd> or <kbd>Shift</kbd> + <kbd>F10</kbd>
 - The web row is first only when nothing above it matches.
 - Apps you launch often rank higher among apps.
 - A matching home folder (`~/Documents`, ...) is listed above commands and files.
+- The strip under the list shows the selected file's or app's full path; the copy button at its right end copies it.
 
 **The filter** (<kbd>Ctrl</kbd> + <kbd>F</kbd>) offers All, Apps, Files, Folders and Services as independent checkmarks, so any combination works.
 
@@ -276,7 +277,7 @@ Details: [Web search internals](#web-search-internals).
 
 ### Image search
 
-Type `img`, a space and a description of the picture, for example `img a dog on a beach`. Your pictures are ranked by what is in them, with thumbnails; <kbd>Enter</kbd> and the right-click menu work as for any file.
+Type `img`, a space and a description of the picture, for example `img a dog on a beach`. Your pictures are ranked by what is in them, with thumbnails; <kbd>Enter</kbd> and the right-click menu work as for any file; **Copy image** in that menu puts the picture itself on the clipboard.
 
 - **Folders:** `~/Pictures` and its subfolders by default. Add more in Settings, **Image search**: type a path, turn on **Include subfolders** to take everything inside it, then **Add**. Adding a folder again checks it for new pictures; adding it again with **Include subfolders** on takes its subfolders too.
 - **Indexing** runs quietly 10 seconds after omni starts, then hourly, and only processes new or changed images. Turn it off in Settings, or run it at full speed with **Scan now**.

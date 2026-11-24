@@ -105,6 +105,9 @@ const SELECT_MOTION_MS: f64 = 120.0;
 const PATH_FOOTER_HEIGHT: i32 = 32;
 const PATH_FOOTER_PAD_X: f64 = 14.0;
 const PATH_ELLIPSIS: &str = "\u{2026}";
+/// Footer copy button (style.css .omni-copy min-width) + gap before it.
+const PATH_COPY_W: f64 = 28.0;
+const PATH_COPY_GAP: i32 = 6;
 
 /// What Enter does on a result row.
 #[derive(Clone)]
@@ -122,6 +125,8 @@ enum Action {
     Claude(String),
     /// Calculator result: copy to the clipboard.
     Copy(String),
+    /// An image file's pixels, from the right-click menu's "Copy image".
+    CopyImage(gio::File),
     /// A systemd service: activating it does nothing; its actions are on right-click.
     Service(services::Service),
     /// One of a service's actions, from that menu.
@@ -345,6 +350,10 @@ struct Ui {
     path_reveal: gtk::Revealer,
     path_box: gtk::Box,
     path_label: gtk::Label,
+    /// Copies the selected row's path; shown only when it has one.
+    path_copy: gtk::Button,
+    /// "Copy answer ⏎", shown while the calculator card is selected.
+    path_hint: gtk::Box,
     /// Full (untruncated) path for the selected row; display is derived + cached.
     path_full: RefCell<String>,
     /// Cache key (full path, footer content width) → displayed truncated string.
@@ -931,12 +940,31 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .halign(gtk::Align::Fill)
         .build();
     path_label.add_css_class("omni-path-text");
-    let path_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    // Not focusable: clicking it must not take the keyboard from the search bar.
+    let path_copy = gtk::Button::builder()
+        .icon_name("edit-copy-symbolic")
+        .tooltip_text("Copy path")
+        .valign(gtk::Align::Center)
+        .focusable(false)
+        .visible(false)
+        .css_classes(["flat", "omni-copy", "omni-path-copy"])
+        .build();
+    let path_box = gtk::Box::new(gtk::Orientation::Horizontal, PATH_COPY_GAP);
     path_box.add_css_class("omni-path");
     path_box.set_hexpand(true);
     path_box.set_valign(gtk::Align::Center);
     path_box.set_size_request(-1, PATH_FOOTER_HEIGHT);
+    let path_hint = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    path_hint.add_css_class("omni-path-hint");
+    path_hint.set_valign(gtk::Align::Center);
+    path_hint.set_visible(false);
+    path_hint.append(&gtk::Label::new(Some("Copy answer")));
+    let enter_key = gtk::Label::new(Some("\u{23ce}"));
+    enter_key.add_css_class("omni-keycap");
+    path_hint.append(&enter_key);
     path_box.append(&path_label);
+    path_box.append(&path_hint);
+    path_box.append(&path_copy);
     let path_reveal = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::None)
         .transition_duration(0)
@@ -1214,6 +1242,8 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         path_reveal: path_reveal.clone(),
         path_box: path_box.clone(),
         path_label: path_label.clone(),
+        path_copy: path_copy.clone(),
+        path_hint: path_hint.clone(),
         path_full: RefCell::default(),
         path_trunc_cache: RefCell::default(),
         hover_gen: Cell::new(0),
@@ -1301,6 +1331,18 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     img_add.connect_clicked(move |_| a());
     img_folder.connect_activate(move |_| add());
     images.schedule_crawls();
+
+    let u = ui.clone();
+    ui.path_copy.connect_clicked(move |b| {
+        let path = u.hits.borrow().get(u.selected_index.get()).map(footer_path_for).unwrap_or_default();
+        if path.is_empty() {
+            return;
+        }
+        b.clipboard().set_text(&path);
+        b.set_icon_name("object-select-symbolic");
+        let b = b.clone();
+        glib::timeout_add_local_once(Duration::from_millis(1200), move || b.set_icon_name("edit-copy-symbolic"));
+    });
 
     // Re-measure footer truncation whenever the strip's width changes.
     let u = ui.clone();
@@ -3193,6 +3235,16 @@ fn update_path_footer(ui: &Ui, index: Option<usize>) {
     let mut text = index
         .and_then(|i| ui.hits.borrow().get(i).map(footer_path_for))
         .unwrap_or_default();
+    let copyable = !text.is_empty();
+    if ui.path_copy.is_visible() != copyable {
+        ui.path_copy.set_visible(copyable);
+    }
+    let on_calc = index
+        .and_then(|i| ui.hits.borrow().get(i).map(|h| matches!(h.action, Action::Copy(_))))
+        .unwrap_or(false);
+    if ui.path_hint.is_visible() != on_calc {
+        ui.path_hint.set_visible(on_calc);
+    }
     if ui.contents.is_active() && ui.content.borrow().searching() {
         if text.is_empty() {
             text = "searching\u{2026}".into();
@@ -3343,8 +3395,9 @@ fn apply_path_display(ui: &Ui) {
         }
         return;
     }
+    let key_w = if ui.path_copy.is_visible() { -box_w } else { box_w };
     if let Some((ref p, w, ref d)) = *ui.path_trunc_cache.borrow() {
-        if p == &full && w == box_w {
+        if p == &full && w == key_w {
             // Already showing this truncation — do not set_text again (avoids redraw).
             if ui.path_label.text().as_str() != d.as_str() {
                 ui.path_label.set_text(d);
@@ -3352,13 +3405,16 @@ fn apply_path_display(ui: &Ui) {
             return;
         }
     }
-    let avail = (box_w as f64) - 2.0 * PATH_FOOTER_PAD_X;
+    let mut avail = (box_w as f64) - 2.0 * PATH_FOOTER_PAD_X;
+    if ui.path_copy.is_visible() {
+        avail -= PATH_COPY_W + PATH_COPY_GAP as f64;
+    }
     let display = middle_truncate_path(&ui.path_label, &full, avail);
     if ui.path_label.text().as_str() == display.as_str() {
-        *ui.path_trunc_cache.borrow_mut() = Some((full, box_w, display));
+        *ui.path_trunc_cache.borrow_mut() = Some((full, key_w, display));
         return;
     }
-    *ui.path_trunc_cache.borrow_mut() = Some((full, box_w, display.clone()));
+    *ui.path_trunc_cache.borrow_mut() = Some((full, key_w, display.clone()));
     ui.path_label.set_text(&display);
 }
 
@@ -3380,6 +3436,7 @@ fn hit_key(hit: &Hit) -> String {
         Action::WebIn(q, w) => format!("web-in:{q}:{w:?}"),
         Action::Claude(q) => format!("claude:{q}"),
         Action::Copy(t) => format!("copy:{t}"),
+        Action::CopyImage(f) => format!("copy-image:{}", f.uri()),
         Action::Service(s) => format!("svc:{}", s.unit),
         Action::ServiceStatus(s) => format!("svc-status:{}", s.unit),
         Action::ServiceVerb(s, verb) => format!("svc-verb:{}:{}", s.unit, verb.label()),
@@ -3477,11 +3534,12 @@ fn hide_selection_chrome(ui: &Ui) {
 
 fn show_selection_chrome(ui: &Ui) {
     // A message row (`img` placeholder, "Searching images…") can't be picked: no highlight.
+    // The calculator card draws its own frame, so it gets none either.
     let on_info = ui
         .hits
         .borrow()
         .get(ui.selected_index.get())
-        .is_some_and(|h| matches!(h.action, Action::Info));
+        .is_some_and(|h| matches!(h.action, Action::Info | Action::Copy(_)));
     if on_info {
         hide_selection_chrome(ui);
         return;
@@ -4455,46 +4513,40 @@ fn highlight_title(title: &str, query: &str) -> String {
 /// column (expression small on top, result large underneath), with the shortcut
 /// hint on the right. The result can wrap, so long numbers are never cut off.
 fn calc_row(hit: &Hit) -> gtk::ListBoxRow {
-    let icon = gtk::Image::from_icon_name("accessories-calculator-symbolic");
-    icon.set_pixel_size(28);
-    icon.set_halign(gtk::Align::Center);
-    icon.set_valign(gtk::Align::Center);
-
-    let expression = gtk::Label::builder()
-        .label(&hit.subtitle)
-        .xalign(0.0)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
-        .max_width_chars(1)
-        .hexpand(true)
-        .build();
-    expression.add_css_class("omni-calc-expression");
-
-    let result = gtk::Label::builder()
-        .label(&hit.title)
-        .xalign(0.0)
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::Char)
-        .max_width_chars(1)
-        .hexpand(true)
-        .build();
-    result.add_css_class("omni-calc-result");
-
-    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    text.set_valign(gtk::Align::Center);
-    text.set_hexpand(true);
-    text.append(&expression);
-    text.append(&result);
-
-    let hint = gtk::Label::new(Some("Enter to copy"));
-    hint.add_css_class("omni-calc-hint");
-    hint.set_valign(gtk::Align::Center);
-
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
-    content.set_valign(gtk::Align::Center);
-    content.append(&icon);
-    content.append(&text);
-    content.append(&hint);
-    let row = gtk::ListBoxRow::builder().child(&content).build();
+    // A card: expression on the left, result on the right, each with a small caption.
+    let half = |text: &str, value_class: &str, caption: &str| {
+        let value = gtk::Label::builder()
+            .label(text)
+            .justify(gtk::Justification::Center)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::Char)
+            .max_width_chars(1)
+            .hexpand(true)
+            .build();
+        value.add_css_class(value_class);
+        let cap = gtk::Label::new(Some(caption));
+        cap.add_css_class("omni-calc-caption");
+        cap.set_halign(gtk::Align::Center);
+        let b = gtk::Box::new(gtk::Orientation::Vertical, 10);
+        b.set_hexpand(true);
+        b.set_valign(gtk::Align::Center);
+        b.append(&value);
+        b.append(&cap);
+        b
+    };
+    let expression = hit.subtitle.strip_suffix(" =").unwrap_or(&hit.subtitle);
+    let left = half(expression, "omni-calc-expression", "Expression");
+    let right = half(&hit.title, "omni-calc-result", "Result");
+    left.add_css_class("omni-calc-left");
+    let arrow = gtk::Image::from_icon_name("go-next-symbolic");
+    arrow.add_css_class("omni-calc-arrow");
+    arrow.set_valign(gtk::Align::Center);
+    let card = gtk::CenterBox::new();
+    card.set_start_widget(Some(&left));
+    card.set_center_widget(Some(&arrow));
+    card.set_end_widget(Some(&right));
+    card.add_css_class("omni-calc-card");
+    let row = gtk::ListBoxRow::builder().child(&card).build();
     row.add_css_class("omni-calc");
     row
 }
@@ -4671,6 +4723,14 @@ fn file_menu_entries(file: &gio::File) -> Vec<MenuEntry> {
         icon: Some(gio::ThemedIcon::new("document-open-symbolic").upcast()),
         action: Action::Open(file.clone()),
     }];
+    if gio::content_type_is_a(&content_type, "image/*") {
+        entries.push(MenuEntry::Item {
+            label: "Copy image".into(),
+            detail: None,
+            icon: Some(gio::ThemedIcon::new("edit-copy-symbolic").upcast()),
+            action: Action::CopyImage(file.clone()),
+        });
+    }
     if !apps.is_empty() {
         entries.push(MenuEntry::Header("Open with"));
         for app in apps {
@@ -5020,6 +5080,16 @@ fn run_checked(ui: &Ui, action: Action, inspect_program: bool) {
     if let Action::Copy(text) = &action {
         display.clipboard().set_text(text);
     }
+    if let Action::CopyImage(file) = &action {
+        // GDK serves the decoded texture as PNG (and whatever else it can encode).
+        match gdk::Texture::from_file(file) {
+            Ok(texture) => display.clipboard().set_texture(&texture),
+            Err(e) => {
+                eprintln!("omni: couldn't copy image {}: {e}", file.uri());
+                notify_user("Couldn't copy image", &e.to_string());
+            }
+        }
+    }
     let ctx = display.app_launch_context();
     for (key, value) in util::missing_x11_env() {
         ctx.setenv(key, value);
@@ -5073,7 +5143,7 @@ fn run_checked(ui: &Ui, action: Action, inspect_program: bool) {
                 }
             }
         }
-        Action::Copy(_) => {}
+        Action::Copy(_) | Action::CopyImage(_) => {}
         Action::DockPin(id, pinned) => dock::set_pinned(&id, pinned),
         Action::Info => {}
         Action::Claude(_) | Action::Service(_) | Action::ServiceVerb(..) | Action::ServiceStatus(_) => unreachable!(),
