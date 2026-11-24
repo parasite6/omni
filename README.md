@@ -322,7 +322,7 @@ Hover the top-right corner of the search bar and click the gear.
 | ----------------- | -------------------------------------------------------------------------------------------- |
 | **Search engine** | The built-in web search engine (currently Brave)                                             |
 | **Classic look**  | Use the solid launcher card. Off by default, which shows the blurred, auto-darkened Glass card. |
-| **Opacity**       | Glass surface opacity, from 0% (clear blur) to 100% (solid). Bright backdrops still dim automatically for readability. Defaults to 85% for new settings. |
+| **Opacity**       | Glass surface opacity, from 0% (clear blur) to 100% (solid). Only the bright parts behind the card (clouds, a white window) are darkened automatically, with soft edges, so text stays readable. Defaults to 85% for new settings. |
 | **Blur**          | How strongly the backdrop behind the Glass card and its dropdowns is blurred, from 0 px (sharp) to 30 px. Defaults to 9 px. Right-click menus use a stronger blur and are nearly solid so busy results don't show through. |
 | **Run programs**  | Whether opening an executable runs it (after confirmation) or opens it in its default app    |
 | **Image search**  | Hourly indexing on or off, a folder field with **Include subfolders**, **Add** and **Scan now** |

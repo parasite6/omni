@@ -45,8 +45,11 @@ pub const MAX_BLUR: u8 = 30;
 pub const BLEED: i32 = 32;
 const MAX_LUMA: f32 = 0.19;
 const MAX_DIM: f32 = 0.85;
+#[cfg(test)]
 const BRIGHT_PERCENTILE: usize = 90;
 const BLOCK_SIZE: usize = 16;
+/// Blur on the local darkening map so block edges blend (logical px, about one block).
+const DIM_SOFTEN: f64 = 14.0;
 const SAMPLES_PER_AXIS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -130,7 +133,9 @@ pub(super) struct Backdrop {
     region: (i32, i32, i32, i32),
     texture: gdk::Texture,
     rect: graphene::Rect,
-    luma: f32,
+    /// Mean brightness of each BLOCK_SIZE patch, row-major, `blocks.0` wide.
+    means: Vec<f32>,
+    blocks: (usize, usize),
 }
 
 mod imp {
@@ -141,7 +146,8 @@ mod imp {
         pub(super) glass: Cell<bool>,
         pub(super) backdrop: RefCell<Option<Backdrop>>,
         pub(super) opacity: Cell<f32>,
-        pub(super) dim: Cell<f32>,
+        /// Local readability darkening: one texel per block, drawn scaled and softened.
+        pub(super) dim_map: RefCell<Option<gdk::Texture>>,
         pub(super) blur: Cell<f64>,
     }
 
@@ -205,9 +211,14 @@ impl GlassCard {
             Duration::from_millis(500),
         )
         .and_then(|png| gdk::Texture::from_bytes(&glib::Bytes::from_owned(png)).ok())
-        .map(|texture| Backdrop {
+        .map(|texture| {
+            let (means, blocks) = block_grid(&texture, w as usize, h as usize);
+            (texture, means, blocks)
+        })
+        .map(|(texture, means, blocks)| Backdrop {
             region: (x, y, w, h),
-            luma: bright_luma(&texture, w as usize, h as usize),
+            means,
+            blocks,
             texture,
             // grim scales the logical region to device pixels. Map it back to the
             // requested logical rectangle, including fractional-scale rounding.
@@ -285,21 +296,30 @@ impl GlassCard {
                 bounds,
             );
         }
-        let dim = imp.dim.get();
-        if dim > 0.0 {
-            snapshot.append_color(&gdk::RGBA::new(0.0, 0.0, 0.0, dim), bounds);
+        // Readability darkening, only where the backdrop is bright (clouds, a white window),
+        // in the card's own colour so lowering opacity never turns the card darker. One
+        // texel per block, scaled with linear filtering and blurred so its edges don't show.
+        if let (Some(map), Some(backdrop), Some((x, y))) =
+            (imp.dim_map.borrow().as_ref(), imp.backdrop.borrow().as_ref(), capture_origin)
+        {
+            let rect = backdrop.rect;
+            snapshot.push_blur(DIM_SOFTEN);
+            snapshot.append_scaled_texture(
+                map,
+                gsk::ScalingFilter::Linear,
+                &graphene::Rect::new(rect.x() + x, rect.y() + y, rect.width(), rect.height()),
+            );
+            snapshot.pop();
         }
         snapshot.pop();
     }
 
     fn update_dim(&self) {
         let imp = self.imp();
-        imp.dim.set(
-            imp.backdrop
-                .borrow()
-                .as_ref()
-                .map_or(0.0, |backdrop| dim_needed(backdrop.luma, imp.opacity.get())),
-        );
+        let map = imp.backdrop.borrow().as_ref().and_then(|backdrop| {
+            dim_map(&backdrop.means, backdrop.blocks, imp.opacity.get())
+        });
+        imp.dim_map.replace(map);
         self.queue_draw();
     }
 }
@@ -450,12 +470,13 @@ pub fn log_capture_failure(reason: &str) {
     LOGGED.call_once(|| eprintln!("omni: couldn't capture the Glass backdrop ({reason})"));
 }
 
-fn bright_luma(texture: &gdk::Texture, logical_w: usize, logical_h: usize) -> f32 {
+/// Per-block mean brightness of a capture (see `block_means`).
+fn block_grid(texture: &gdk::Texture, logical_w: usize, logical_h: usize) -> (Vec<f32>, (usize, usize)) {
     let (w, h) = (texture.width() as usize, texture.height() as usize);
     let stride = w * 4;
     let mut data = vec![0_u8; stride * h];
     texture.download(&mut data, stride);
-    block_brightness(w, h, logical_w, logical_h, |x, y| {
+    block_means(w, h, logical_w, logical_h, |x, y| {
         // Cairo ARGB32 stores pixels in native byte order. grim's capture is opaque.
         let offset = y * stride + x * 4;
         let [_, r, g, b] =
@@ -464,8 +485,32 @@ fn bright_luma(texture: &gdk::Texture, logical_w: usize, logical_h: usize) -> f3
     })
 }
 
-/// Average perceptual brightness over patches about as wide as the blur footprint.
-/// Place a fixed grid in each logical patch, mapping sample centres to device pixels.
+/// Darkening needed per block, as a premultiplied card-coloured texture (None if no block
+/// needs any, so a dark backdrop costs nothing to draw).
+fn dim_map(means: &[f32], (bx, by): (usize, usize), opacity: f32) -> Option<gdk::Texture> {
+    let alphas: Vec<f32> = means.iter().map(|&m| dim_needed(m, opacity)).collect();
+    if bx == 0 || by == 0 || alphas.iter().all(|&a| a <= 0.0) {
+        return None;
+    }
+    let mut pixels = Vec::with_capacity(alphas.len() * 4);
+    for a in alphas {
+        let fill = |c: f32| (c * a * 255.0).round() as u8;
+        pixels.extend([fill(CARD_FILL), fill(CARD_FILL), fill(CARD_FILL_BLUE), (a * 255.0).round() as u8]);
+    }
+    Some(
+        gdk::MemoryTexture::new(
+            bx as i32,
+            by as i32,
+            gdk::MemoryFormat::R8g8b8a8Premultiplied,
+            &glib::Bytes::from_owned(pixels),
+            bx * 4,
+        )
+        .upcast(),
+    )
+}
+
+/// The bright tail of the block means (used by tests to check the dim curve).
+#[cfg(test)]
 fn block_brightness(
     device_w: usize,
     device_h: usize,
@@ -473,6 +518,20 @@ fn block_brightness(
     logical_h: usize,
     luma: impl Fn(usize, usize) -> f32,
 ) -> f32 {
+    let (mut means, _) = block_means(device_w, device_h, logical_w, logical_h, luma);
+    let rank = (means.len() * BRIGHT_PERCENTILE).div_ceil(100) - 1;
+    *means.select_nth_unstable_by(rank, f32::total_cmp).1
+}
+
+/// Average perceptual brightness over patches about as wide as the blur footprint.
+/// Place a fixed grid in each logical patch, mapping sample centres to device pixels.
+fn block_means(
+    device_w: usize,
+    device_h: usize,
+    logical_w: usize,
+    logical_h: usize,
+    luma: impl Fn(usize, usize) -> f32,
+) -> (Vec<f32>, (usize, usize)) {
     let blocks_x = logical_w.div_ceil(BLOCK_SIZE);
     let blocks_y = logical_h.div_ceil(BLOCK_SIZE);
     let mut means = Vec::with_capacity(blocks_x * blocks_y);
@@ -493,8 +552,7 @@ fn block_brightness(
             means.push(sum / (SAMPLES_PER_AXIS * SAMPLES_PER_AXIS) as f32);
         }
     }
-    let rank = (means.len() * BRIGHT_PERCENTILE).div_ceil(100) - 1;
-    *means.select_nth_unstable_by(rank, f32::total_cmp).1
+    (means, (blocks_x, blocks_y))
 }
 
 fn tint_alpha(percent: u8) -> f32 {
@@ -772,6 +830,20 @@ mod tests {
         for percent in 1..=100 {
             assert!(tint_alpha(percent) > tint_alpha(percent - 1));
         }
+    }
+
+    #[test]
+    fn local_dim_only_where_bright() {
+        // A dark backdrop needs no map at all.
+        assert!(dim_map(&[0.05, 0.1, 0.15, 0.1], (2, 2), 0.0).is_none());
+        // Bright blocks get darkened, dark ones stay clear, so the map exists.
+        let map = dim_map(&[1.0, 0.05, 0.05, 0.05], (2, 2), 0.0).expect("bright block");
+        assert_eq!((map.width(), map.height()), (2, 2));
+        let mut data = vec![0_u8; 2 * 2 * 4];
+        map.download(&mut data, 2 * 4);
+        let alpha = |i: usize| data[i * 4 + 3];
+        assert!(alpha(0) > 150, "bright block dimmed: {}", alpha(0));
+        assert_eq!((alpha(1), alpha(2), alpha(3)), (0, 0, 0));
     }
 
     #[test]
