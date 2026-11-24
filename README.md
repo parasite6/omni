@@ -76,7 +76,7 @@ Everything shares one list, so there is no mode to pick first.
 
 **Requirements**
 
-- Hyprland and LocalSearch (GNOME's file indexer).
+- Hyprland and LocalSearch (GNOME's file indexer). Install `grim` for the Glass backdrop.
 - Rust, and on Fedora: `gtk4-devel`, `gtk4-layer-shell-devel`, `tinysparql-devel`, `cef`.
 - Optional: an `ensure-running` supervisor on `PATH`. `omni-start` uses it when present (health checks, a limit on restarts); without it, `omni-start` checks and starts omni itself.
 - For image search: `uv` and an NVIDIA GPU with a recent driver.
@@ -119,7 +119,7 @@ Run the same script again to update. It builds a release into the repository's `
 
 | Input                                                  | Result                                      | Example                |
 | ------------------------------------------------------ | ------------------------------------------- | ---------------------- |
-| _(nothing)_                                            | Your 5 most recent apps, files and folders  |                        |
+| _(nothing)_                                            | Your 6 most recent apps, files and folders  |                        |
 | `<app name>`                                           | Apps; typos are forgiven                    | `firefox`, `frfox`     |
 | `<app name> <action>`                                  | That app action as its own row              | `firefox private`      |
 | `<program>`                                            | Programs in your `$PATH`                    | `python`               |
@@ -140,7 +140,8 @@ Right-click a row, or press <kbd>Menu</kbd> or <kbd>Shift</kbd> + <kbd>F10</kbd>
 
 | Row            | Menu                                                                               |
 | -------------- | ---------------------------------------------------------------------------------- |
-| File           | **Open**, **Copy image** for pictures, **Open with** (up to 10 apps for the type)  |
+| File           | **Open**, **Copy image** for pictures, **Open with** (up to 10 apps for the type), then **Open with…**: every app, type to filter, <kbd>Esc</kbd> to go back |
+| Folder         | **Open**, **Open in** your default text editor, **Open containing folder**, **Copy path** |
 | App            | **Open** and the app's own actions (New window, New private window, ...)           |
 | Search the web | **Search**, **New private window**, and for Brave **New private window with Tor**  |
 | Service        | **Status**, then Start, Stop, Restart, Enable and Disable as they apply            |
@@ -151,7 +152,7 @@ Right-click a row, or press <kbd>Menu</kbd> or <kbd>Shift</kbd> + <kbd>F10</kbd>
 
 ### Results and the filter
 
-**With nothing typed**, omni shows the 5 most recent apps, files and folders, newest first. Apps come from omni's own launch history; files and folders come from GTK's shared recent list (`~/.local/share/recently-used.xbel`), skipping ones that no longer exist. Web queries, Claude prompts and file contents never appear there.
+**With nothing typed**, omni shows the 6 most recent apps, files and folders, newest first. Apps come from omni's own launch history; files and folders come from GTK's shared recent list (`~/.local/share/recently-used.xbel`), skipping ones that no longer exist. Web queries, Claude prompts and file contents never appear there.
 
 **Result order is fixed:**
 
@@ -320,6 +321,9 @@ Hover the top-right corner of the search bar and click the gear.
 | Setting           | What it does                                                                                 |
 | ----------------- | -------------------------------------------------------------------------------------------- |
 | **Search engine** | The built-in web search engine (currently Brave)                                             |
+| **Classic look**  | Use the solid launcher card. Off by default, which shows the blurred, auto-darkened Glass card. |
+| **Opacity**       | Glass surface opacity, from 0% (clear blur) to 100% (solid). Bright backdrops still dim automatically for readability. Defaults to 85% for new settings. |
+| **Blur**          | How strongly the backdrop behind the Glass card and its dropdowns is blurred, from 0 px (sharp) to 30 px. Defaults to 9 px. Right-click menus use a stronger blur and are nearly solid so busy results don't show through. |
 | **Run programs**  | Whether opening an executable runs it (after confirmation) or opens it in its default app    |
 | **Image search**  | Hourly indexing on or off, a folder field with **Include subfolders**, **Add** and **Scan now** |
 
@@ -328,6 +332,9 @@ Hover the top-right corner of the search bar and click the gear.
 | File                                   | Holds                                                                    |
 | -------------------------------------- | ------------------------------------------------------------------------ |
 | `~/.local/state/omni/contents`         | The **Contents** toggle                                                  |
+| `~/.local/state/omni/look`             | Glass or Classic look                                                    |
+| `~/.local/state/omni/opacity`          | Glass tint percentage                                                    |
+| `~/.local/state/omni/blur`             | Glass blur radius in px                                                  |
 | `~/.local/state/omni/filter`           | The result filter                                                        |
 | `~/.local/state/omni/claude`           | Claude model and effort                                                  |
 | `~/.local/state/omni/usage.tsv`        | App launch counts and times                                              |
@@ -441,7 +448,7 @@ Installed files are read-only. The keybind helper is a separate program so a key
 | `src/web_protocol.rs`     | Messages between omni and the browser process                                  |
 | `src/chromium.rs`         | The browser process itself (CEF, private sessions, Brave preferences)          |
 | `src/browser_frame.rs`    | Frame size checks                                                              |
-| `src/glass.rs`            | The card shell                                                                 |
+| `src/glass.rs`            | Glass backdrop capture, blur, automatic dimming, appearance settings, and list edge fade |
 | `src/search_icon.rs`      | The animated logo and magnifying glass in the search bar                       |
 | `assets/logo-mark.png`    | The logo drawn under the magnifying glass                                      |
 | `src/ring.rs`             | Search bar overlay (currently draws nothing)                                   |

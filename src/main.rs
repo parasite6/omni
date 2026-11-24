@@ -41,7 +41,7 @@ pub static LIVE_ADDED: AtomicUsize = AtomicUsize::new(0);
 const MAX_APPS: usize = 6;
 const MAX_ACTIONS: usize = 3;
 /// Recent apps/files/folders shown under the bar when nothing is typed.
-const MAX_RECENT: usize = 5;
+const MAX_RECENT: usize = 6;
 const MAX_FILES: usize = 5;
 const MAX_DIRS: usize = 3;
 /// How long after a confirmation appears before Yes / Always count (µs).
@@ -67,6 +67,8 @@ const OLD_SHOW_ALL: u8 = SHOW_APPS | SHOW_FILES | SHOW_FOLDERS;
 const MAX_SERVICES: usize = 3;
 const MAX_CONTENT: usize = 50;
 const MAX_OPEN_WITH: usize = 10;
+/// Most apps the "Open with…" picker lists for a typed filter.
+const OPEN_WITH_PICKER_MAX: usize = 40;
 /// File *contents* search debounce (names/apps stay immediate).
 const CONTENT_DELAY: Duration = Duration::from_millis(120);
 /// Reuse identical Contents results for this long.
@@ -80,13 +82,20 @@ const REWALK: Duration = Duration::from_secs(30 * 60);
 
 /// Card geometry on screen (logical px).
 const CARD_WIDTH: i32 = 720;
+/// Card top until the monitor is known; then CARD_TOP_FRACTION of its height, which puts
+/// the search bar a little above the middle (results grow downward from there).
 const CARD_TOP: i32 = 160;
+const CARD_TOP_FRACTION: f64 = 0.24;
 /// The card stops this far above the bottom of the screen; longer lists scroll inside it.
 const BOTTOM_GAP: i32 = 96;
 /// Non-list chrome: padding + header + path footer (must match style.css).
 const CARD_CHROME: i32 = 108;
 /// Result row height and how many fit before the list scrolls (style.css --row-height).
 const ROW_HEIGHT: i32 = 52;
+/// Keep grim clear of Hyprland's closing layer fade, even after GTK unmaps.
+const BACKDROP_REOPEN_GUARD: Duration = Duration::from_millis(700);
+const BACKDROP_RELEASE_DELAY: Duration = Duration::from_millis(1500);
+const OPACITY_SAVE_DELAY: Duration = Duration::from_millis(300);
 const MAX_VISIBLE_ROWS: i32 = 7;
 /// The list's top + bottom padding (style.css list.omni-results): part of its height cap, so
 /// the last visible row never sits under the path footer.
@@ -105,8 +114,7 @@ const SELECT_MOTION_MS: f64 = 120.0;
 const PATH_FOOTER_HEIGHT: i32 = 32;
 const PATH_FOOTER_PAD_X: f64 = 14.0;
 const PATH_ELLIPSIS: &str = "\u{2026}";
-/// Footer copy button (style.css .omni-copy min-width) + gap before it.
-const PATH_COPY_W: f64 = 28.0;
+/// Gap before the footer copy button; its width is measured (it differs per look).
 const PATH_COPY_GAP: i32 = 6;
 
 /// What Enter does on a result row.
@@ -119,6 +127,9 @@ enum Action {
     Open(gio::File),
     /// A file, from the right-click menu's "Open with".
     OpenWith(gio::AppInfo, gio::File),
+    /// "Open with…" at the bottom of a file's menu: turn the list into a picker of every
+    /// app (the search bar filters it); picking one opens the file with it.
+    PickOpenWith(gio::File),
     Web(String),
     /// From the web row's right-click menu: search in a private or Tor window.
     WebIn(String, web::Window),
@@ -162,6 +173,7 @@ struct Hit {
     match_type: Option<MatchType>,
     /// Image search rows (`img …`): the cached thumbnail shown large in place of the icon.
     thumb: Option<PathBuf>,
+    command: bool,
     /// Contents rows: how many times the query occurs in the file ("12", "40+").
     match_count: Option<String>,
 }
@@ -266,9 +278,20 @@ impl UiMode {
 struct Ui {
     window: gtk::ApplicationWindow,
     card: glass::GlassCard,
+    look: Cell<glass::Look>,
+    placed_monitor: RefCell<Option<Monitor>>,
+    hidden_at: Cell<Option<Instant>>,
+    backdrop_release: RefCell<Option<glib::SourceId>>,
+    list_fade: glass::ScrollFade,
+    glass_selected: glib::WeakRef<gtk::ListBoxRow>,
+    glass_selection: glass::Selection,
+    glass_footer: gtk::Box,
+    glass_primary: gtk::Stack,
+    glass_actions: gtk::Box,
     main_stack: gtk::Stack,
     mode: Cell<UiMode>,
     settings_back: gtk::Button,
+    settings_scroll: gtk::ScrolledWindow,
     search_provider: Cell<search_provider::SearchProvider>,
     /// Executable files run (after a confirmation) instead of opening in their default app.
     run_programs: Cell<bool>,
@@ -369,6 +392,9 @@ struct Ui {
     heartbeat: RefCell<Option<glib::SourceId>>,
     /// In a conversation with Claude: the search bar is the reply box, typing doesn't search.
     chatting: Cell<bool>,
+    /// The file being opened while the list is the "Open with…" app picker, and the query
+    /// that was in the bar before (restored on Esc).
+    open_with: RefCell<Option<(gio::File, String)>>,
     /// Confirmation layer over the card: its question, detail line, and what Yes does.
     confirm: gtk::Box,
     confirm_text: gtk::Label,
@@ -748,6 +774,7 @@ fn settings_switch(active: bool) -> gtk::ToggleButton {
 
 fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     load_css();
+    let appearance = glass::Appearance::load(&appearance_dir());
 
     // The surface covers the whole screen; everything outside the card is transparent
     // and closes the popup when clicked (like rofi).
@@ -853,6 +880,8 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     let list_overlay = gtk::Overlay::builder().child(&list).build();
     list_overlay.add_overlay(&selection_fill);
     list_overlay.add_overlay(&selection_pill);
+    let glass_selection = glass::Selection::new();
+    list_overlay.add_overlay(glass_selection.widget());
 
     // Results slide open below the search bar as soon as there is something to show.
     // Long lists scroll inside the card instead of running off the screen (height capped
@@ -865,10 +894,11 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         .max_content_height(LIST_CAP)
         .child(&list_overlay)
         .build();
+    let list_fade = glass::ScrollFade::new(&list_scroll);
     let reveal = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::SlideDown)
         .transition_duration(220)
-        .child(&list_scroll)
+        .child(&list_fade)
         .build();
 
     // Card = blurred backdrop (GlassCard) + metal frame + glass face + content.
@@ -964,6 +994,8 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     path_hint.append(&enter_key);
     path_box.append(&path_label);
     path_box.append(&path_hint);
+    let (glass_footer, glass_primary, glass_actions, actions_button) = glass_footer_widgets();
+    path_box.append(&glass_footer);
     path_box.append(&path_copy);
     let path_reveal = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::None)
@@ -1035,6 +1067,65 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     search_settings.append(&search_label);
     search_settings.append(&engine_button);
     settings_rows.append(&search_settings);
+
+    let classic_row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    classic_row.add_css_class("omni-settings-row");
+    let classic_label = gtk::Label::builder()
+        .label("Classic look").xalign(0.0).hexpand(true).build();
+    classic_label.add_css_class("omni-settings-title");
+    let classic_switch = settings_switch(appearance.look == glass::Look::Classic);
+    classic_switch.update_relation(&[
+        gtk::accessible::Relation::LabelledBy(&[classic_label.upcast_ref()]),
+    ]);
+    classic_row.append(&classic_label);
+    classic_row.append(&classic_switch);
+    settings_rows.append(&classic_row);
+
+    let opacity_row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    opacity_row.add_css_class("omni-settings-row");
+    let opacity_label = gtk::Label::builder()
+        .label("Opacity").xalign(0.0).hexpand(true).build();
+    opacity_label.add_css_class("omni-settings-title");
+    let opacity_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 1.0);
+    opacity_scale.set_width_request(200);
+    opacity_scale.set_draw_value(true);
+    const OPACITY_DESCRIPTION: &str =
+        "0% shows clear blur and 100% is solid. Bright backdrops still dim automatically for readability.";
+    opacity_scale.set_tooltip_text(Some(OPACITY_DESCRIPTION));
+    opacity_scale.update_property(&[gtk::accessible::Property::Description(OPACITY_DESCRIPTION)]);
+    opacity_scale.set_digits(0);
+    opacity_scale.set_format_value_func(|_, value| format!("{value:.0}%"));
+    opacity_scale.set_value(f64::from(appearance.opacity));
+    opacity_scale.set_sensitive(appearance.look == glass::Look::Glass);
+    opacity_scale.update_relation(&[
+        gtk::accessible::Relation::LabelledBy(&[opacity_label.upcast_ref()]),
+    ]);
+    opacity_row.append(&opacity_label);
+    opacity_row.append(&opacity_scale);
+    settings_rows.append(&opacity_row);
+
+    let blur_row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
+    blur_row.add_css_class("omni-settings-row");
+    let blur_label = gtk::Label::builder()
+        .label("Blur").xalign(0.0).hexpand(true).build();
+    blur_label.add_css_class("omni-settings-title");
+    let blur_scale =
+        gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, f64::from(glass::MAX_BLUR), 1.0);
+    blur_scale.set_width_request(200);
+    blur_scale.set_draw_value(true);
+    const BLUR_DESCRIPTION: &str = "How strongly the backdrop behind the card is blurred. 0 px is sharp.";
+    blur_scale.set_tooltip_text(Some(BLUR_DESCRIPTION));
+    blur_scale.update_property(&[gtk::accessible::Property::Description(BLUR_DESCRIPTION)]);
+    blur_scale.set_digits(0);
+    blur_scale.set_format_value_func(|_, value| format!("{value:.0} px"));
+    blur_scale.set_value(f64::from(appearance.blur));
+    blur_scale.set_sensitive(appearance.look == glass::Look::Glass);
+    blur_scale.update_relation(&[
+        gtk::accessible::Relation::LabelledBy(&[blur_label.upcast_ref()]),
+    ]);
+    blur_row.append(&blur_label);
+    blur_row.append(&blur_scale);
+    settings_rows.append(&blur_row);
     let run_programs = load_run_programs_setting();
     let run_row = gtk::Box::new(gtk::Orientation::Horizontal, 16);
     run_row.add_css_class("omni-settings-row");
@@ -1114,7 +1205,13 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     img_buttons.append(&img_index_now);
     img_section.append(&img_buttons);
     settings_rows.append(&img_section);
-    settings_plane.append(&settings_rows);
+    let settings_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .child(&settings_rows)
+        .build();
+    settings_plane.append(&settings_scroll);
     let search_view = search_view::SearchView::new();
 
     let main_stack = gtk::Stack::builder()
@@ -1134,6 +1231,8 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
 
     let card = glass::GlassCard::new();
     card.add_css_class("omni-card");
+    card.set_tint(appearance.opacity);
+    card.set_blur(appearance.blur);
     card.set_halign(gtk::Align::Center);
     card.set_valign(gtk::Align::Start);
     card.set_width_request(CARD_WIDTH);
@@ -1186,9 +1285,20 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     let ui = Rc::new(Ui {
         window: window.clone(),
         card: card.clone(),
+        look: Cell::new(appearance.look),
+        placed_monitor: RefCell::new(None),
+        hidden_at: Cell::new(None),
+        backdrop_release: RefCell::new(None),
+        list_fade,
+        glass_selected: glib::WeakRef::new(),
+        glass_selection,
+        glass_footer,
+        glass_primary,
+        glass_actions,
         main_stack: main_stack.clone(),
         mode: Cell::new(UiMode::default()),
         settings_back: settings_back.clone(),
+        settings_scroll,
         search_provider: Cell::new(provider),
         run_programs: Cell::new(run_programs),
         program_probe_pending: Cell::new(false),
@@ -1252,6 +1362,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         heartbeat: RefCell::default(),
         menu: RefCell::default(),
         chatting: Cell::new(false),
+        open_with: RefCell::new(None),
         confirm: confirm.clone(),
         confirm_text: confirm_text.clone(),
         confirm_link_label,
@@ -1392,6 +1503,65 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
                 notify_user("Couldn’t save setting", &error.to_string());
             }
         }
+    });
+    apply_look(&ui, appearance.look);
+    let u = ui.clone();
+    actions_button.connect_clicked(move |_| open_selected_menu(&u));
+    let u = ui.clone();
+    let pending_opacity_save = Rc::new(RefCell::new(None::<glib::SourceId>));
+    opacity_scale.connect_value_changed(move |scale| {
+        let opacity = scale.value().round() as u8;
+        u.card.set_tint(opacity);
+        if let Some(source) = pending_opacity_save.borrow_mut().take() {
+            source.remove();
+        }
+        let pending = pending_opacity_save.clone();
+        let source = glib::timeout_add_local_once(OPACITY_SAVE_DELAY, move || {
+            pending.borrow_mut().take();
+            if let Err(error) = glass::save_opacity(&appearance_dir(), opacity) {
+                eprintln!("omni: couldn't save opacity: {error}");
+            }
+        });
+        pending_opacity_save.replace(Some(source));
+    });
+    let u = ui.clone();
+    let pending_blur_save = Rc::new(RefCell::new(None::<glib::SourceId>));
+    blur_scale.connect_value_changed(move |scale| {
+        let blur = scale.value().round() as u8;
+        u.card.set_blur(blur);
+        if let Some(source) = pending_blur_save.borrow_mut().take() {
+            source.remove();
+        }
+        let pending = pending_blur_save.clone();
+        let source = glib::timeout_add_local_once(OPACITY_SAVE_DELAY, move || {
+            pending.borrow_mut().take();
+            if let Err(error) = glass::save_blur(&appearance_dir(), blur) {
+                eprintln!("omni: couldn't save blur: {error}");
+            }
+        });
+        pending_blur_save.replace(Some(source));
+    });
+    let u = ui.clone();
+    classic_switch.connect_active_notify(move |switch| {
+        let look = if switch.is_active() { glass::Look::Classic } else { glass::Look::Glass };
+        if look == u.look.get() {
+            return;
+        }
+        if let Err(error) = look.save(&appearance_dir()) {
+            switch.set_active(u.look.get() == glass::Look::Classic);
+            notify_user("Couldn’t save look", &error.to_string());
+            return;
+        }
+        opacity_scale.set_sensitive(look == glass::Look::Glass);
+        blur_scale.set_sensitive(look == glass::Look::Glass);
+        apply_look(&u, look);
+        // The compositor may still display an unmapped surface during its fade.
+        // An in-place switch uses the held capture or tint until a later open.
+        if look == glass::Look::Glass {
+            probe::log(format!("glass capture skipped on look switch; reused={}", u.card.has_backdrop()));
+        }
+        apply_hits(&u, &u.hits.borrow());
+        update_selection_visual(&u);
     });
     let u = ui.clone();
     settings_button.connect_clicked(move |_| show_settings(&u));
@@ -1711,6 +1881,10 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
                     }
                     return glib::Propagation::Stop;
                 }
+                key if glass_actions_shortcut(u.look.get(), key, mods) => {
+                    dismiss_menu(&u);
+                    return glib::Propagation::Stop;
+                }
                 gdk::Key::Menu => return glib::Propagation::Stop,
                 gdk::Key::F10 if mods.contains(gdk::ModifierType::SHIFT_MASK) => {
                     return glib::Propagation::Stop;
@@ -1750,9 +1924,14 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         match key {
             // In a conversation, Esc goes back to searching; otherwise it closes.
             gdk::Key::Escape if u.chatting.get() => end_chat(&u),
-            // Showing a service's status: back to the results.
+            gdk::Key::Escape if u.open_with.borrow().is_some() => end_open_with(&u),
             gdk::Key::Escape if u.status_reveal.reveals_child() => refresh(&u),
             gdk::Key::Escape => hide(&u),
+            key if glass_actions_shortcut(u.look.get(), key, mods) => {
+                if !u.reveal.reveals_child() || !open_row_menu(&u, u.selected_index.get(), None) {
+                    return glib::Propagation::Proceed;
+                }
+            }
             gdk::Key::Menu => open_selected_menu(&u),
             gdk::Key::F10 if mods.contains(gdk::ModifierType::SHIFT_MASK) => open_selected_menu(&u),
             // Shift+Enter: ask Claude, whatever is selected.
@@ -1811,7 +1990,7 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
         if last_unit.replace(unit) != unit {
             pending.set(0.0);
         }
-        let steps = selection_scroll_steps(&pending, dy, unit);
+        let steps = selection_scroll_steps(&pending, dy, unit, ROW_HEIGHT);
         // Jump straight to the event's final row: no intermediate CSS/layout work
         // or redundant idle callbacks, including when already at a list boundary.
         move_selection(&u, steps);
@@ -1856,7 +2035,10 @@ fn refresh(ui: &Ui) {
     let query = query.trim();
 
     let mut hits = Vec::new();
-    if query.is_empty() {
+    let picking = ui.open_with.borrow().as_ref().map(|(file, _)| file.clone());
+    if let Some(file) = picking {
+        hits = open_with_hits(ui, &file, query);
+    } else if query.is_empty() {
         hits = recent_hits(ui);
     } else if let Some(calc) = calc_hit(query) {
         // A complete calculation: the result is the only thing shown.
@@ -1924,7 +2106,9 @@ fn refresh(ui: &Ui) {
         // keep their place after them.
         let (home_dirs, other_dirs): (Vec<_>, Vec<_>) = dir_hits.into_iter().partition(|h| h.home_folder);
         for h in home_dirs.into_iter().chain(commands).chain(file_hits).chain(other_dirs) {
-            hits.push(file_hit(&h.path, h.is_dir, MatchType::Name, None, query));
+            let mut hit = file_hit(&h.path, h.is_dir, MatchType::Name, None, query);
+            hit.command = h.command;
+            hits.push(hit);
         }
         // File contents (LocalSearch FTS + ripgrep for git trees): merge with name hits.
         if ui.contents.is_active() && show & SHOW_FILES != 0 {
@@ -2111,7 +2295,7 @@ fn apply_hits(ui: &Ui, hits: &[Hit]) {
     if old_keys == new_keys {
         for (i, hit) in hits.iter().enumerate() {
             if let Some(row) = ui.list.row_at_index(i as i32) {
-                if !refresh_row_contents(&row, hit, query) {
+                if !refresh_row_contents(&row, hit, query, ui.look.get()) {
                     let fresh = make_row(ui, hit);
                     ui.list.remove(&row);
                     ui.list.insert(&fresh, i as i32);
@@ -2146,7 +2330,7 @@ fn apply_hits(ui: &Ui, hits: &[Hit]) {
                 ui.list.remove(&row);
                 ui.list.insert(&row, i as i32);
             }
-            if !refresh_row_contents(&row, hit, query) {
+            if !refresh_row_contents(&row, hit, query, ui.look.get()) {
                 let fresh = make_row(ui, hit);
                 ui.list.remove(&row);
                 ui.list.insert(&fresh, i as i32);
@@ -2164,7 +2348,7 @@ fn apply_hits(ui: &Ui, hits: &[Hit]) {
 }
 
 /// Update labels on a reused row. Returns false if structure must be rebuilt.
-fn refresh_row_contents(row: &gtk::ListBoxRow, hit: &Hit, query: &str) -> bool {
+fn refresh_row_contents(row: &gtk::ListBoxRow, hit: &Hit, query: &str, look: glass::Look) -> bool {
     if row.has_css_class("omni-calc") || matches!(hit.action, Action::Copy(_)) {
         return false;
     }
@@ -2192,10 +2376,23 @@ fn refresh_row_contents(row: &gtk::ListBoxRow, hit: &Hit, query: &str) -> bool {
     let Some(hbox) = row.child().and_downcast::<gtk::Box>() else {
         return false;
     };
-    // Expect: icon | text-vbox [| count] [| badge]
+    // Expect: icon | text-vbox [| count] [| badge] [| Glass kind].
+    let kind = hbox.last_child().and_downcast::<gtk::Label>()
+        .filter(|label| label.has_css_class("omni-kind"));
+    let expected_kind = (look == glass::Look::Glass).then(|| result_kind(hit)).filter(|kind| !kind.is_empty());
+    match (kind, expected_kind) {
+        (Some(label), Some(text)) => label.set_text(text),
+        (None, None) => {}
+        _ => return false,
+    }
     let Some(vbox) = hbox.first_child().and_then(|c| c.next_sibling()).and_downcast::<gtk::Box>() else {
         return false;
     };
+    if hit.thumb.is_some()
+        && let Some(thumbnail) = hbox.first_child().and_downcast::<gtk::DrawingArea>()
+    {
+        thumbnail.queue_draw();
+    }
     let count = vbox.next_sibling().and_downcast::<gtk::Label>().filter(|w| w.has_css_class("omni-match-count"));
     match (&count, &hit.match_count) {
         (Some(label), Some(n)) => label.set_text(n),
@@ -2209,7 +2406,7 @@ fn refresh_row_contents(row: &gtk::ListBoxRow, hit: &Hit, query: &str) -> bool {
         return false;
     }
     if let Some(title) = vbox.first_child().and_downcast::<gtk::Label>() {
-        title.set_markup(&highlight_title(&hit.title, query));
+        title.set_markup(&highlight_title(&hit.title, query, look));
     } else {
         return false;
     }
@@ -2220,7 +2417,7 @@ fn refresh_row_contents(row: &gtk::ListBoxRow, hit: &Hit, query: &str) -> bool {
             };
             if hit.subtitle_markup {
                 sub.set_use_markup(true);
-                sub.set_markup(&hit.subtitle);
+                set_result_subtitle(sub, &hit.subtitle, look);
             } else {
                 sub.set_use_markup(false);
                 sub.set_text(&hit.subtitle);
@@ -2259,6 +2456,7 @@ fn file_hit(
         file_menu: !is_dir,
         match_type: Some(match_type),
         thumb: None,
+        command: false,
         match_count: None,
     }
 }
@@ -2303,13 +2501,14 @@ fn info_hit(text: &str) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        command: false,
         match_count: None,
     }
 }
 
 /// Accent-color markup for matched terms in a snippet (weight unchanged).
 fn highlight_snippet(snippet: &str, query: &str) -> String {
-    highlight_title(snippet, query)
+    highlight_title(snippet, query, glass::Look::Classic)
 }
 
 /// `OMNI_LOG_CONTENTS` prints to stderr; the probe log (`omni-debug` marker) also gets
@@ -2564,6 +2763,7 @@ fn content_empty_hit(scoped: bool) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        command: false,
         match_count: None,
     }
 }
@@ -2578,6 +2778,7 @@ fn content_failed_hit(message: &str) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        command: false,
         match_count: None,
     }
 }
@@ -2594,6 +2795,7 @@ fn calc_hit(query: &str) -> Option<Hit> {
         file_menu: false,
         match_type: None,
         thumb: None,
+        command: false,
         match_count: None,
     })
 }
@@ -2644,7 +2846,11 @@ fn scoped_hits(ui: &Ui, dir: &std::path::Path, inner: &str) -> Vec<Hit> {
         .into_iter()
         .chain(files)
         .chain(dirs)
-        .map(|h| file_hit(&h.path, h.is_dir, MatchType::Name, None, inner))
+        .map(|h| {
+            let mut hit = file_hit(&h.path, h.is_dir, MatchType::Name, None, inner);
+            hit.command = h.command;
+            hit
+        })
         .collect()
 }
 
@@ -3239,9 +3445,26 @@ fn update_path_footer(ui: &Ui, index: Option<usize>) {
     if ui.path_copy.is_visible() != copyable {
         ui.path_copy.set_visible(copyable);
     }
-    let on_calc = index
-        .and_then(|i| ui.hits.borrow().get(i).map(|h| matches!(h.action, Action::Copy(_))))
-        .unwrap_or(false);
+    let look = ui.look.get();
+    let (label, menu) = index.and_then(|i| ui.hits.borrow().get(i).map(|hit| {
+        (primary_action(hit, ui.run_programs.get()), look == glass::Look::Glass && row_has_menu(hit))
+    })).unwrap_or((None, false));
+    let on_calc = look == glass::Look::Classic && label == Some("Copy answer");
+    let actions = look == glass::Look::Glass && (label.is_some() || menu);
+    if actions {
+        ui.glass_primary.set_visible(label.is_some());
+        if let Some(label) = label {
+            ui.glass_primary.set_transition_duration(if motion_enabled() && ui.glass_footer.is_mapped() { 100 } else { 0 });
+            if ui.glass_primary.visible_child_name().as_deref() != Some(label) {
+                ui.glass_primary.set_visible_child_name(label);
+            }
+        }
+        ui.glass_actions.set_visible(menu);
+        if let Some(divider) = ui.glass_actions.first_child() {
+            divider.set_visible(label.is_some());
+        }
+    }
+    ui.glass_footer.set_visible(actions);
     if ui.path_hint.is_visible() != on_calc {
         ui.path_hint.set_visible(on_calc);
     }
@@ -3395,7 +3618,13 @@ fn apply_path_display(ui: &Ui) {
         }
         return;
     }
-    let key_w = if ui.path_copy.is_visible() { -box_w } else { box_w };
+    let footer_width = if ui.glass_footer.is_visible() {
+        ui.glass_footer.measure(gtk::Orientation::Horizontal, -1).1 + PATH_COPY_GAP
+    } else {
+        0
+    };
+    let key_w = box_w - footer_width;
+    let key_w = if ui.path_copy.is_visible() { -key_w } else { key_w };
     if let Some((ref p, w, ref d)) = *ui.path_trunc_cache.borrow() {
         if p == &full && w == key_w {
             // Already showing this truncation — do not set_text again (avoids redraw).
@@ -3405,9 +3634,10 @@ fn apply_path_display(ui: &Ui) {
             return;
         }
     }
-    let mut avail = (box_w as f64) - 2.0 * PATH_FOOTER_PAD_X;
+    let mut avail = f64::from(box_w - footer_width) - 2.0 * PATH_FOOTER_PAD_X;
     if ui.path_copy.is_visible() {
-        avail -= PATH_COPY_W + PATH_COPY_GAP as f64;
+        let copy_w = ui.path_copy.measure(gtk::Orientation::Horizontal, -1).1;
+        avail -= f64::from(copy_w + PATH_COPY_GAP);
     }
     let display = middle_truncate_path(&ui.path_label, &full, avail);
     if ui.path_label.text().as_str() == display.as_str() {
@@ -3427,7 +3657,9 @@ fn hit_key(hit: &Hit) -> String {
     match &hit.action {
         // Image rows are built differently (big thumbnail), so never reuse a file row for one.
         Action::Open(file) if hit.thumb.is_some() => format!("img:{}", file.uri()),
-        Action::Open(file) | Action::OpenWith(_, file) => file.uri().to_string(),
+        Action::Open(file) => file.uri().to_string(),
+        Action::OpenWith(info, file) => format!("open-with:{}:{}", info.id().unwrap_or_default(), file.uri()),
+        Action::PickOpenWith(file) => format!("pick-open-with:{}", file.uri()),
         Action::App(info) => format!("app:{}", info.id().unwrap_or_default()),
         Action::AppAction(info, action) => {
             format!("app-action:{}:{}", info.id().unwrap_or_default(), action.name)
@@ -3486,8 +3718,9 @@ fn estimate_sel_geom(ui: &Ui) -> Option<(f64, f64)> {
     let index = ui.selected_index.get().min(ui.hits.borrow().len() - 1);
     ui.list.row_at_index(index as i32)?;
     const LIST_PAD_Y: f64 = 4.0;
-    let y = LIST_PAD_Y + (index as f64) * ROW_HEIGHT as f64;
-    Some((y, ROW_HEIGHT as f64))
+    let height = f64::from(ROW_HEIGHT);
+    let y = LIST_PAD_Y + (index as f64) * height;
+    Some((y, height))
 }
 
 /// Drive fill (translateY + scaleY) and pill (translateY only) — no layout properties.
@@ -3499,6 +3732,9 @@ fn apply_sel_transform(ui: &Ui, y: f64, h: f64) {
     }
     ui.sel_y.set(y);
     ui.sel_h.set(h);
+    if ui.look.get() == glass::Look::Glass {
+        return;
+    }
     let scale = h / SEL_BASE_H;
     let pill_y = y + (h - SEL_PILL_H) * 0.5;
     ui.sel_transform_css.load_from_string(&format!(
@@ -3525,7 +3761,16 @@ fn set_sel_transition_enabled(ui: &Ui, on: bool) {
     ui.sel_transition_css.load_from_string(&css);
 }
 
+fn clear_glass_selection(ui: &Ui) {
+    if let Some(row) = ui.glass_selected.upgrade() {
+        row.remove_css_class("omni-glass-selected");
+        ui.glass_selected.set(None);
+    }
+}
+
 fn hide_selection_chrome(ui: &Ui) {
+    clear_glass_selection(ui);
+    ui.glass_selection.clear();
     ui.selection_fill.set_opacity(0.0);
     ui.selection_pill.set_opacity(0.0);
     ui.selection_fill.set_visible(false);
@@ -3543,6 +3788,19 @@ fn show_selection_chrome(ui: &Ui) {
     if on_info {
         hide_selection_chrome(ui);
         return;
+    }
+    if ui.look.get() == glass::Look::Glass {
+        let index = ui.selected_index.get();
+        ui.glass_selection.place(ui.sel_y.get(), ui.sel_h.get(),
+            ui.sel_transition_on.get() && motion_enabled());
+        let row = ui.list.row_at_index(index as i32);
+        if ui.glass_selected.upgrade() != row {
+            clear_glass_selection(ui);
+            if let Some(row) = row {
+                row.add_css_class("omni-glass-selected");
+                ui.glass_selected.set(Some(&row));
+            }
+        }
     }
     ui.selection_fill.set_visible(true);
     ui.selection_pill.set_visible(true);
@@ -3637,7 +3895,9 @@ fn update_selection_visual_attempt(ui: &Ui, attempt: u8, place_gen: u64) {
     // Skip no-op place when transform already matches and chrome is shown.
     let same_geom =
         (ui.sel_y.get() - y).abs() < 0.05 && (ui.sel_h.get() - h).abs() < 0.05;
-    let chrome_ok = ui.selection_fill.is_visible() && ui.selection_fill.opacity() >= 1.0;
+    let chrome_ok = ui.selection_fill.is_visible() && ui.selection_fill.opacity() >= 1.0
+        && (ui.look.get() == glass::Look::Classic
+            || ui.glass_selected.upgrade() == ui.list.row_at_index(idx as i32));
     if same_geom && chrome_ok {
         sel_log(format!(
             "update_selection_visual: skip place (geom unchanged) attempt={attempt} y={y:.1}"
@@ -3937,11 +4197,7 @@ fn match_dropdown_width(menu: &gtk::Popover, items: &gtk::Box, anchor: &gtk::Wid
 /// kinds are picked, and the results update behind it on every click.
 fn show_filter_menu(ui: &Ui, keyboard: bool) {
     let Some(me) = ui.me.borrow().upgrade() else { return };
-    let menu = gtk::Popover::builder()
-        .has_arrow(false)
-        .autohide(false)
-        .position(gtk::PositionType::Bottom)
-        .build();
+    let menu = glass::menu_popover(&ui.card);
     menu.add_css_class("omni-menu");
     menu.add_css_class("omni-filter-menu");
     menu.add_css_class("omni-dropdown-menu");
@@ -4056,7 +4312,7 @@ fn show_filter_menu(ui: &Ui, keyboard: bool) {
 fn show_pick_menu(ui: &Ui, anchor: &gtk::Widget, names: &[&str], current: usize, on_pick: impl Fn(usize) + 'static) {
     let Some(me) = ui.me.borrow().upgrade() else { return };
     let keyboard = ui.window.gets_focus_visible();
-    let menu = gtk::Popover::builder().has_arrow(false).autohide(false).position(gtk::PositionType::Bottom).build();
+    let menu = glass::menu_popover(&ui.card);
     menu.add_css_class("omni-menu");
     menu.add_css_class("omni-filter-menu");
     menu.add_css_class("omni-dropdown-menu");
@@ -4129,11 +4385,7 @@ fn show_pick_menu(ui: &Ui, anchor: &gtk::Widget, names: &[&str], current: usize,
 /// message (mid-conversation the conversation carries on with the new model).
 fn show_model_menu(ui: &Ui) {
     let Some(me) = ui.me.borrow().upgrade() else { return };
-    let menu = gtk::Popover::builder()
-        .has_arrow(false)
-        .autohide(false)
-        .position(gtk::PositionType::Bottom)
-        .build();
+    let menu = glass::menu_popover(&ui.card);
     menu.add_css_class("omni-menu");
     menu.add_css_class("omni-filter-menu");
     menu.add_css_class("omni-model-menu");
@@ -4228,6 +4480,7 @@ fn app_hit(info: &gio::AppInfo, name: &str) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        command: false,
         match_count: None,
     }
 }
@@ -4242,6 +4495,7 @@ fn action_hit(app: &apps::App, action: &apps::AppAction) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        command: false,
         match_count: None,
     }
 }
@@ -4272,6 +4526,7 @@ fn recent_hits(ui: &Ui) -> Vec<Hit> {
                 file_menu: !f.is_dir,
                 match_type: Some(MatchType::Name),
                 thumb: None,
+                command: false,
                 match_count: None,
             },
         ));
@@ -4290,6 +4545,7 @@ fn web_hit(ui: &Ui, query: &str) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        command: false,
         match_count: None,
     }
 }
@@ -4307,6 +4563,7 @@ fn service_hit(s: &services::Service) -> Hit {
         file_menu: false,
         match_type: None,
         thumb: None,
+        command: false,
         match_count: None,
     }
 }
@@ -4324,8 +4581,87 @@ fn claude_hit(ui: &Ui, query: &str) -> Option<Hit> {
         file_menu: false,
         match_type: None,
         thumb: None,
+        command: false,
         match_count: None,
     })
+}
+
+fn result_kind(hit: &Hit) -> &'static str {
+    match &hit.action {
+        Action::App(_) | Action::OpenWith(..) => "App",
+        Action::AppAction(..) => "Action",
+        Action::Open(_) if hit.command => "Command",
+        Action::Open(_) if hit.file_menu => "File",
+        Action::Open(_) => "Folder",
+        Action::Service(_) => "Service",
+        Action::Web(_) => "Web",
+        Action::Claude(_) => "Claude",
+        _ => "",
+    }
+}
+
+const PRIMARY_ACTIONS: [&str; 6] = ["Open", "Launch", "Run", "Search", "Ask Claude", "Copy answer"];
+
+fn primary_action(hit: &Hit, run_programs: bool) -> Option<&'static str> {
+    match &hit.action {
+        Action::App(_) | Action::AppAction(..) => Some("Launch"),
+        Action::Open(_) if hit.command && run_programs => Some("Run"),
+        Action::Open(_) | Action::OpenWith(..) => Some("Open"),
+        Action::Web(_) => Some("Search"),
+        Action::Claude(_) => Some("Ask Claude"),
+        Action::Copy(_) => Some("Copy answer"),
+        _ => None,
+    }
+}
+
+fn row_has_menu(hit: &Hit) -> bool {
+    match &hit.action {
+        Action::Open(file) => file.path().is_some(),
+        Action::App(_) | Action::Service(_) | Action::Web(_) => true,
+        _ => false,
+    }
+}
+
+fn glass_actions_shortcut(look: glass::Look, key: gdk::Key, mods: gdk::ModifierType) -> bool {
+    let relevant = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK
+        | gdk::ModifierType::ALT_MASK | gdk::ModifierType::SUPER_MASK
+        | gdk::ModifierType::META_MASK | gdk::ModifierType::HYPER_MASK;
+    look == glass::Look::Glass && matches!(key, gdk::Key::k | gdk::Key::K)
+        && (mods & relevant) == gdk::ModifierType::CONTROL_MASK
+}
+
+fn glass_footer_widgets() -> (gtk::Box, gtk::Stack, gtk::Box, gtk::Button) {
+    let shortcut = |key: &str| {
+        let label = gtk::Label::new(Some(key));
+        label.add_css_class("omni-keycap");
+        label
+    };
+    let primary = gtk::Stack::builder().transition_type(gtk::StackTransitionType::Crossfade).build();
+    for name in PRIMARY_ACTIONS {
+        let item = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+        item.set_halign(gtk::Align::End);
+        item.append(&gtk::Label::new(Some(name)));
+        item.append(&shortcut("⏎"));
+        primary.add_named(&item, Some(name));
+    }
+    let button_content = gtk::Box::new(gtk::Orientation::Horizontal, 5);
+    button_content.append(&gtk::Label::new(Some("Actions")));
+    button_content.append(&shortcut("Ctrl K"));
+    let button = gtk::Button::builder().child(&button_content)
+        .accessible_role(gtk::AccessibleRole::Button).focus_on_click(false)
+        .css_classes(["flat", "omni-actions-button"]).build();
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let divider = gtk::Separator::new(gtk::Orientation::Vertical);
+    divider.add_css_class("omni-actions-divider");
+    actions.append(&divider);
+    actions.append(&button);
+    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    footer.set_valign(gtk::Align::Center);
+    footer.add_css_class("omni-action-bar");
+    footer.append(&primary);
+    footer.append(&actions);
+    footer.set_visible(false);
+    (footer, primary, actions, button)
 }
 
 fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
@@ -4350,6 +4686,10 @@ fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
     let query = ui.entry.text();
     // `img cat`: highlight "cat" in file names, not the "img" of img_0042.png.
     let query = images::parse(query.trim()).unwrap_or(query.as_str()).to_string();
+    result_row(hit, query.trim(), ui.look.get(), &icon)
+}
+
+fn result_row(hit: &Hit, query: &str, look: glass::Look, icon: &gtk::Widget) -> gtk::ListBoxRow {
     let title = gtk::Label::builder()
         .use_markup(true)
         .xalign(0.0)
@@ -4361,7 +4701,7 @@ fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
     if matches!(hit.action, Action::Info) {
         title.set_text(&hit.title);
     } else {
-        title.set_markup(&highlight_title(&hit.title, query.trim()));
+        title.set_markup(&highlight_title(&hit.title, query, look));
     }
 
     let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -4378,7 +4718,7 @@ fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
         sub.add_css_class("omni-subtitle");
         if hit.subtitle_markup {
             sub.set_use_markup(true);
-            sub.set_markup(&hit.subtitle);
+            set_result_subtitle(&sub, &hit.subtitle, look);
         } else {
             sub.set_text(&hit.subtitle);
         }
@@ -4387,7 +4727,7 @@ fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
 
     let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     row_box.set_valign(gtk::Align::Center);
-    row_box.append(&icon);
+    row_box.append(icon);
     row_box.append(&text);
     if let Some(n) = &hit.match_count {
         let count = gtk::Label::new(Some(n));
@@ -4404,6 +4744,15 @@ fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
         row_box.append(&badge);
     }
 
+    if look == glass::Look::Glass {
+        let kind = result_kind(hit);
+        if !kind.is_empty() {
+            let label = gtk::Label::builder().label(kind).xalign(1.0)
+                .valign(gtk::Align::Center).css_classes(["omni-kind"]).build();
+            row_box.append(&label);
+        }
+    }
+
     let row = gtk::ListBoxRow::builder().child(&row_box).build();
     if matches!(hit.action, Action::Info) {
         row.set_activatable(false);
@@ -4417,11 +4766,18 @@ fn make_row(ui: &Ui, hit: &Hit) -> gtk::ListBoxRow {
 fn thumb_tile(thumb: &std::path::Path) -> gtk::DrawingArea {
     let area = gtk::DrawingArea::builder().content_width(IMAGE_THUMB_W).content_height(IMAGE_THUMB_H).build();
     let pixbuf = (!thumb.as_os_str().is_empty()).then(|| gtk::gdk_pixbuf::Pixbuf::from_file(thumb).ok()).flatten();
-    area.set_draw_func(move |_, cr, w, h| {
+    area.set_draw_func(move |area, cr, w, h| {
         let (w, h) = (w as f64, h as f64);
-        let r = 7.0;
+        let glass = area.root().and_downcast::<gtk::ApplicationWindow>()
+            .is_some_and(|window| window.has_css_class("omni-look-glass"));
+        let r = if glass { glass::TILE_RADIUS } else { 7.0 };
         let rounded = |cr: &gtk::cairo::Context, inset: f64| {
             let (x0, y0, x1, y1) = (inset, inset, w - inset, h - inset);
+            let r = if glass { (r - inset).max(0.0) } else { r };
+            if r == 0.0 {
+                cr.rectangle(x0, y0, x1 - x0, y1 - y0);
+                return;
+            }
             cr.new_sub_path();
             cr.arc(x1 - r, y0 + r, r, -std::f64::consts::FRAC_PI_2, 0.0);
             cr.arc(x1 - r, y1 - r, r, 0.0, std::f64::consts::FRAC_PI_2);
@@ -4456,9 +4812,21 @@ fn thumb_tile(thumb: &std::path::Path) -> gtk::DrawingArea {
     area
 }
 
+fn set_result_subtitle(label: &gtk::Label, markup: &str, look: glass::Look) {
+    if look == glass::Look::Glass {
+        let classic = glass::Look::Classic.match_color();
+        label.set_markup(&markup.replace(
+            &format!("foreground=\"{classic}\""),
+            &format!("foreground=\"{}\"", look.match_color()),
+        ));
+    } else {
+        label.set_markup(markup);
+    }
+}
+
 /// Accent-color markup for query matches in a title (weight unchanged).
-fn highlight_title(title: &str, query: &str) -> String {
-    const ACCENT: &str = "#7aa2f7";
+fn highlight_title(title: &str, query: &str, look: glass::Look) -> String {
+    let accent = look.match_color();
     let words: Vec<Vec<char>> = query
         .split_whitespace()
         .filter(|w| !w.is_empty())
@@ -4500,7 +4868,7 @@ fn highlight_title(title: &str, query: &str) -> String {
         let chunk: String = title_chars[i..j].iter().collect();
         let esc = glib::markup_escape_text(&chunk);
         if on {
-            out.push_str(&format!("<span foreground=\"{ACCENT}\">{esc}</span>"));
+            out.push_str(&format!("<span foreground=\"{accent}\">{esc}</span>"));
         } else {
             out.push_str(&esc);
         }
@@ -4680,7 +5048,11 @@ fn row_menu_target(ui: &Ui, win_x: f64, win_y: f64) -> Option<(usize, gdk::Recta
 /// private (and Brave's Tor) window.
 /// Returns false when this row has no menu (caller should not swallow the click).
 fn open_row_menu(ui: &Ui, index: usize, at: Option<gdk::Rectangle>) -> bool {
-    let entries = match ui.hits.borrow().get(index) {
+    let hits = ui.hits.borrow();
+    if !hits.get(index).is_some_and(row_has_menu) {
+        return false;
+    }
+    let entries = match hits.get(index) {
         Some(Hit { action: Action::Open(file), file_menu: true, .. }) => file_menu_entries(file),
         Some(Hit { action: Action::Open(file), file_menu: false, .. }) => folder_menu_entries(file),
         Some(Hit { action: Action::App(info), .. }) => app_menu_entries(ui, info),
@@ -4688,6 +5060,7 @@ fn open_row_menu(ui: &Ui, index: usize, at: Option<gdk::Rectangle>) -> bool {
         Some(Hit { action: Action::Service(service), .. }) => service_menu_entries(service),
         _ => return false,
     };
+    drop(hits);
     if entries.is_empty() {
         return false;
     }
@@ -4742,20 +5115,37 @@ fn file_menu_entries(file: &gio::File) -> Vec<MenuEntry> {
             });
         }
     }
+    entries.push(MenuEntry::Item {
+        label: "Open with\u{2026}".into(),
+        detail: None,
+        icon: Some(gio::ThemedIcon::new("view-app-grid-symbolic").upcast()),
+        action: Action::PickOpenWith(file.clone()),
+    });
     entries
 }
 
-/// Folder right-click: Open, open the parent, copy the path (no "Open with" list).
+/// Folder right-click: Open, open in the default editor, open the parent, copy the path.
 fn folder_menu_entries(file: &gio::File) -> Vec<MenuEntry> {
     let icon = |name: &str| Some(gio::ThemedIcon::new(name).upcast::<gio::Icon>());
-    let default = gio::AppInfo::default_for_type("inode/directory", false)
-        .map(|a| a.display_name().to_string());
+    let folder_app = gio::AppInfo::default_for_type("inode/directory", false);
     let mut entries = vec![MenuEntry::Item {
         label: "Open".into(),
-        detail: default,
+        detail: folder_app.as_ref().map(|a| a.display_name().to_string()),
         icon: icon("document-open-symbolic"),
         action: Action::Open(file.clone()),
     }];
+    // The default text editor (the app registered for plain text), when it isn't the file
+    // manager already behind "Open". Editors such as VS Code or Zed open the folder as a project.
+    if let Some(editor) = gio::AppInfo::default_for_type("text/plain", false)
+        .filter(|e| e.should_show() && !folder_app.as_ref().is_some_and(|f| f.equal(e)))
+    {
+        entries.push(MenuEntry::Item {
+            label: format!("Open in {}", editor.display_name()),
+            detail: None,
+            icon: editor.icon(),
+            action: Action::OpenWith(editor, file.clone()),
+        });
+    }
     let Some(path) = file.path() else { return entries };
     if let Some(parent) = path.parent() {
         if parent != path {
@@ -4836,12 +5226,10 @@ fn web_menu_entries(ui: &Ui, query: &str) -> Vec<MenuEntry> {
 
 fn show_menu(ui: &Ui, entries: Vec<MenuEntry>, target: gdk::Rectangle) {
     let Some(me) = ui.me.borrow().upgrade() else { return };
-    let menu = gtk::Popover::builder()
-        .has_arrow(false)
-        .autohide(false) // we dismiss ourselves; autohide steals the pointer on Wayland
-        .position(gtk::PositionType::Bottom)
-        .build();
+    let menu = glass::menu_popover(&ui.card);
     menu.add_css_class("omni-menu");
+    // Right-click menus only: dense, near-solid Glass styling (glass.rs, style.css).
+    menu.add_css_class("omni-context-menu");
     let items = gtk::Box::new(gtk::Orientation::Vertical, 1);
     let fired = Rc::new(Cell::new(false));
     for entry in entries {
@@ -4856,6 +5244,7 @@ fn show_menu(ui: &Ui, entries: Vec<MenuEntry>, target: gdk::Rectangle) {
             MenuEntry::Item { label, detail, icon, action } => (label, detail, icon, action),
         };
         let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        content.add_css_class("omni-menu-content");
         if let Some(icon) = icon {
             let image = gtk::Image::from_gicon(&icon);
             image.set_pixel_size(16);
@@ -4927,8 +5316,8 @@ fn show_menu(ui: &Ui, entries: Vec<MenuEntry>, target: gdk::Rectangle) {
     menu.popup();
 }
 
-fn selection_scroll_steps(pending: &Cell<f64>, dy: f64, unit: gdk::ScrollUnit) -> i32 {
-    let dy = if unit == gdk::ScrollUnit::Surface { dy / ROW_HEIGHT as f64 } else { dy };
+fn selection_scroll_steps(pending: &Cell<f64>, dy: f64, unit: gdk::ScrollUnit, height: i32) -> i32 {
+    let dy = if unit == gdk::ScrollUnit::Surface { dy / f64::from(height) } else { dy };
     let total = pending.get() + dy;
     let steps = total.trunc() as i32;
     pending.set(total.fract());
@@ -4988,6 +5377,10 @@ fn run_checked(ui: &Ui, action: Action, inspect_program: bool) {
     if matches!(action, Action::Info) {
         return;
     }
+    if let Action::PickOpenWith(file) = action {
+        start_open_with(ui, file);
+        return;
+    }
     if let Action::Web(query) = &action {
         probe::log("web search: enter");
         set_ui_mode(ui, UiMode::WebSearch, true);
@@ -4995,6 +5388,8 @@ fn run_checked(ui: &Ui, action: Action, inspect_program: bool) {
         return;
     }
     if let Action::Claude(query) = action {
+        // Asking from the "Open with…" picker leaves it: Esc from the chat goes to search.
+        ui.open_with.borrow_mut().take();
         // Stays open: the answer streams into the popup.
         ui.reveal.set_reveal_child(false);
         ui.answer_reveal.set_reveal_child(true);
@@ -5143,7 +5538,7 @@ fn run_checked(ui: &Ui, action: Action, inspect_program: bool) {
                 }
             }
         }
-        Action::Copy(_) | Action::CopyImage(_) => {}
+        Action::Copy(_) | Action::CopyImage(_) | Action::PickOpenWith(_) => {}
         Action::DockPin(id, pinned) => dock::set_pinned(&id, pinned),
         Action::Info => {}
         Action::Claude(_) | Action::Service(_) | Action::ServiceVerb(..) | Action::ServiceStatus(_) => unreachable!(),
@@ -5179,11 +5574,38 @@ fn show_launcher(ui: &Ui) {
     ui.entry.grab_focus();
 }
 
+fn appearance_dir() -> PathBuf {
+    contents_setting_path().parent().expect("omni state directory").to_path_buf()
+}
+
+fn apply_look(ui: &Ui, look: glass::Look) {
+    let previous = ui.look.replace(look);
+    let glass = look == glass::Look::Glass;
+    if glass {
+        ui.window.add_css_class("omni-look-glass");
+    } else {
+        ui.window.remove_css_class("omni-look-glass");
+        ui.card.remove_css_class("omni-glass-opening");
+        ui.glass_selection.clear();
+        clear_glass_selection(ui);
+        if previous != look {
+            // The Classic overlay hasn't tracked geometry while Glass was active.
+            ui.sel_h.set(0.0);
+            set_sel_transition_enabled(ui, false);
+        }
+    }
+    ui.card.set_look(look);
+    ui.list_fade.set_enabled(glass);
+}
+
 fn toggle(ui: &Rc<Ui>) {
     if ui.window.is_visible() {
         hide(ui);
     } else {
         probe::log("toggle enter");
+        if let Some(source) = ui.backdrop_release.borrow_mut().take() {
+            source.remove();
+        }
         ui.open_t0.set(Some(Instant::now()));
         let apps_n = ui.apps.borrow().len();
         let sparql_ready = ui.sparql.borrow().is_some();
@@ -5249,6 +5671,10 @@ fn toggle(ui: &Rc<Ui>) {
         }
         // hide() drops the grab to None; take it back as the surface is shown.
         ui.window.set_keyboard_mode(KeyboardMode::Exclusive);
+        capture_backdrop(ui);
+        if ui.look.get() == glass::Look::Glass && motion_enabled() {
+            ui.card.add_css_class("omni-glass-opening");
+        }
         open_log(ui, "before_present");
         ui.window.present();
         ui.place_while_hidden.set(false);
@@ -5536,6 +5962,71 @@ fn send_reply(ui: &Ui) {
     if ui.answer.reply(&text) {
         ui.entry.set_text("");
     }
+}
+
+/// Turn the list into the "Open with…" picker for `file`: every app, filtered by the bar.
+fn start_open_with(ui: &Ui, file: gio::File) {
+    let name = file
+        .basename()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file.uri().to_string());
+    let previous = ui.entry.text().to_string();
+    *ui.open_with.borrow_mut() = Some((file, previous));
+    ui.entry.set_placeholder_text(Some(&format!("Open {name} with\u{2026}")));
+    ui.entry.set_text(""); // refreshes into the picker
+    refresh(ui);
+    ui.entry.grab_focus();
+}
+
+/// Leave the picker and put back the search it was opened from.
+fn end_open_with(ui: &Ui) {
+    let Some((_, previous)) = ui.open_with.borrow_mut().take() else { return };
+    ui.entry.set_placeholder_text(Some(SEARCH_PLACEHOLDER));
+    ui.entry.set_text(&previous);
+    ui.entry.set_position(-1);
+    refresh(ui);
+}
+
+/// Picker rows: with nothing typed, the apps registered for the file's type first, then
+/// every other app A–Z; typing filters with the normal app matching.
+fn open_with_hits(ui: &Ui, file: &gio::File, query: &str) -> Vec<Hit> {
+    let row = |info: &gio::AppInfo, subtitle: String| Hit {
+        title: info.display_name().to_string(),
+        subtitle,
+        subtitle_markup: false,
+        icon: info.icon(),
+        action: Action::OpenWith(info.clone(), file.clone()),
+        file_menu: false,
+        match_type: None,
+        thumb: None,
+        command: false,
+        match_count: None,
+    };
+    if !query.is_empty() {
+        return ui
+            .apps
+            .borrow_mut()
+            .search(query, OPEN_WITH_PICKER_MAX)
+            .into_iter()
+            .map(|(app, _, _)| row(&app.info, app.info.description().map(|d| d.to_string()).unwrap_or_default()))
+            .collect();
+    }
+    let content_type = file.path().map(|p| gio::content_type_guess(Some(&p), None).0);
+    let mut recommended: Vec<gio::AppInfo> = content_type
+        .as_ref()
+        .map(|t| gio::AppInfo::recommended_for_type(t))
+        .unwrap_or_default();
+    recommended.retain(|a| a.should_show());
+    let mut others: Vec<gio::AppInfo> = gio::AppInfo::all()
+        .into_iter()
+        .filter(|a| a.should_show() && !recommended.iter().any(|r| r.equal(a)))
+        .collect();
+    others.sort_by_cached_key(|a| a.display_name().to_lowercase());
+    recommended
+        .iter()
+        .map(|a| row(a, "Suggested for this file".into()))
+        .chain(others.iter().map(|a| row(a, a.description().map(|d| d.to_string()).unwrap_or_default())))
+        .collect()
 }
 
 /// Leave the conversation (it's forgotten) and go back to searching.
@@ -5835,6 +6326,7 @@ fn hide(ui: &Ui) {
     }
     close_answer(ui);
     ui.chatting.set(false);
+    ui.open_with.borrow_mut().take();
     ui.entry.set_placeholder_text(Some(SEARCH_PLACEHOLDER));
     // Cancel snaps/retries and reset selection chrome so reopen never animates from a lower row.
     cancel_selection_session(ui);
@@ -5858,6 +6350,24 @@ fn hide(ui: &Ui) {
     ui.path_reveal.set_reveal_child(false);
     set_ui_mode(ui, ui.mode.get().after(UiModeAction::Close), false);
     ui.window.set_visible(false);
+    gtk::prelude::WidgetExt::display(&ui.window).flush();
+    ui.hidden_at.set(Some(Instant::now()));
+    ui.card.remove_css_class("omni-glass-opening");
+    if let Some(source) = ui.backdrop_release.borrow_mut().take() {
+        source.remove();
+    }
+    if ui.card.has_backdrop() {
+        let weak = ui.me.borrow().clone();
+        let source = glib::timeout_add_local_once(BACKDROP_RELEASE_DELAY, move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.backdrop_release.borrow_mut().take();
+                if !ui.window.is_visible() {
+                    ui.card.clear();
+                }
+            }
+        });
+        ui.backdrop_release.replace(Some(source));
+    }
     ui.place_while_hidden.set(false);
     watchdog::set_open(false);
     if let Some(beat) = ui.heartbeat.take() {
@@ -5911,6 +6421,7 @@ mod watchdog {
 /// Put the popup on the focused monitor and fit its content to that monitor.
 fn place_on_focused_monitor(ui: &Ui) {
     let t_mon = Instant::now();
+    ui.placed_monitor.replace(None);
     let Some(mon) = focused_monitor() else {
         eprintln!("omni: couldn't find the focused monitor");
         open_log(ui, "focused_monitor FAILED");
@@ -5931,23 +6442,80 @@ fn place_on_focused_monitor(ui: &Ui) {
             let Some(m) = monitors.item(i).and_downcast::<gdk::Monitor>() else { continue };
             if m.connector().as_deref() == Some(mon.name.as_str()) {
                 ui.window.set_monitor(Some(&m));
+                fit_to_monitor(ui, mon.height);
+                ui.placed_monitor.replace(Some(mon));
+                return;
             }
         }
     }
-
     fit_to_monitor(ui, mon.height);
+}
+
+fn reuse_backdrop(hidden_for: Option<Duration>) -> bool {
+    hidden_for.is_some_and(|elapsed| elapsed < BACKDROP_REOPEN_GUARD)
+}
+
+fn capture_backdrop(ui: &Ui) {
+    let elapsed = ui.hidden_at.get().map(|hidden| hidden.elapsed());
+    let fading = reuse_backdrop(elapsed);
+    let monitor = ui.placed_monitor.borrow();
+    let region = monitor.as_ref().and_then(|mon| {
+        let card_x = (mon.width - CARD_WIDTH) / 2;
+        let top = card_top(mon.height);
+        let x0 = (card_x - glass::BLEED).max(0);
+        let y0 = (top - glass::BLEED).max(0);
+        let x1 = (card_x + CARD_WIDTH + glass::BLEED).min(mon.width);
+        let max_card_height = monitor_content_room(mon.height) + CARD_CHROME;
+        let y1 = (top + max_card_height + glass::BLEED).min(mon.height);
+        (x1 > x0 && y1 > y0).then_some((
+            (mon.x + x0, mon.y + y0, x1 - x0, y1 - y0),
+            ((x0 - card_x) as f32, (y0 - top) as f32),
+        ))
+    });
+    if fading || ui.look.get() == glass::Look::Classic {
+        let reused = fading && region.is_some_and(|(rect, _)| ui.card.has_backdrop_for(rect));
+        if !reused {
+            ui.card.clear();
+        }
+        if fading && ui.look.get() == glass::Look::Glass {
+            probe::log(format!(
+                "glass capture skipped during Hyprland fade; hidden_for_ms={} reused={reused}",
+                elapsed.map_or(0, |duration| duration.as_millis()),
+            ));
+        }
+        return;
+    }
+    if let Some(((x, y, w, h), offset)) = region {
+        ui.card.capture(x, y, w, h, offset);
+    } else {
+        ui.card.clear();
+        glass::log_capture_failure("focused output or capture region unavailable");
+    }
 }
 
 /// Cap the result list (and Claude's answer) so the card ends BOTTOM_GAP above the bottom
 /// of a screen `height` logical pixels tall.
 fn fit_to_monitor(ui: &Ui, height: i32) {
-    let room = (height - CARD_TOP - BOTTOM_GAP - CARD_CHROME).max(200);
+    let top = card_top(height);
+    if ui.card.margin_top() != top {
+        ui.card.set_margin_top(top);
+    }
+    let room = monitor_content_room(height);
     // List: at most 7 rows; shrinks with content below that.
-    let list_cap = LIST_CAP.min(room);
-    ui.list_scroll.set_max_content_height(list_cap);
+    ui.list_scroll.set_max_content_height(LIST_CAP.min(room));
     ui.answer.set_max_height(room);
     ui.search_view.set_height(room.saturating_sub(60));
     ui.status_scroll.set_max_content_height(room);
+    ui.settings_scroll.set_max_content_height(room);
+}
+
+fn monitor_content_room(height: i32) -> i32 {
+    (height - card_top(height) - BOTTOM_GAP - CARD_CHROME).max(200)
+}
+
+/// Card top for a screen `height` logical px tall, never above the old fixed spot.
+fn card_top(height: i32) -> i32 {
+    ((height as f64 * CARD_TOP_FRACTION) as i32).max(CARD_TOP)
 }
 
 struct Monitor {
@@ -6165,19 +6733,19 @@ mod filter_tests {
     #[test]
     fn selection_scroll_surface_pixels_are_converted_to_rows() {
         let pending = Cell::new(0.0);
-        assert_eq!(selection_scroll_steps(&pending, 52.0, gdk::ScrollUnit::Surface), 1);
-        assert_eq!(selection_scroll_steps(&pending, -104.0, gdk::ScrollUnit::Surface), -2);
+        assert_eq!(selection_scroll_steps(&pending, 52.0, gdk::ScrollUnit::Surface, ROW_HEIGHT), 1);
+        assert_eq!(selection_scroll_steps(&pending, -104.0, gdk::ScrollUnit::Surface, ROW_HEIGHT), -2);
     }
 
     #[test]
     fn selection_scroll_accumulates_fractional_motion_in_both_units() {
         let pending = Cell::new(0.0);
-        assert_eq!(selection_scroll_steps(&pending, 0.5, gdk::ScrollUnit::Wheel), 0);
-        assert_eq!(selection_scroll_steps(&pending, 0.5, gdk::ScrollUnit::Wheel), 1);
-        assert_eq!(selection_scroll_steps(&pending, 26.0, gdk::ScrollUnit::Surface), 0);
-        assert_eq!(selection_scroll_steps(&pending, 26.0, gdk::ScrollUnit::Surface), 1);
-        assert_eq!(selection_scroll_steps(&pending, -26.0, gdk::ScrollUnit::Surface), 0);
-        assert_eq!(selection_scroll_steps(&pending, -26.0, gdk::ScrollUnit::Surface), -1);
+        assert_eq!(selection_scroll_steps(&pending, 0.5, gdk::ScrollUnit::Wheel, ROW_HEIGHT), 0);
+        assert_eq!(selection_scroll_steps(&pending, 0.5, gdk::ScrollUnit::Wheel, ROW_HEIGHT), 1);
+        assert_eq!(selection_scroll_steps(&pending, 26.0, gdk::ScrollUnit::Surface, ROW_HEIGHT), 0);
+        assert_eq!(selection_scroll_steps(&pending, 26.0, gdk::ScrollUnit::Surface, ROW_HEIGHT), 1);
+        assert_eq!(selection_scroll_steps(&pending, -26.0, gdk::ScrollUnit::Surface, ROW_HEIGHT), 0);
+        assert_eq!(selection_scroll_steps(&pending, -26.0, gdk::ScrollUnit::Surface, ROW_HEIGHT), -1);
     }
 
     #[test]
@@ -6214,6 +6782,238 @@ mod filter_tests {
     #[test]
     fn settings_navigation_close_resets_to_launcher() {
         assert_eq!(UiMode::Settings.after(UiModeAction::Close), UiMode::Launcher);
+    }
+
+    #[test]
+    fn glass_result_kinds_and_actions_follow_activation() {
+        let path = std::path::Path::new("/tmp/example");
+        let mut hit = file_hit(path, false, MatchType::Name, None, "");
+        assert_eq!((result_kind(&hit), primary_action(&hit, true)), ("File", Some("Open")));
+        assert!(row_has_menu(&hit));
+        hit.command = true;
+        assert_eq!((result_kind(&hit), primary_action(&hit, true)), ("Command", Some("Run")));
+        assert_eq!(primary_action(&hit, false), Some("Open"));
+        hit = file_hit(path, true, MatchType::Name, None, "");
+        assert_eq!((result_kind(&hit), primary_action(&hit, true)), ("Folder", Some("Open")));
+        hit.action = Action::Web("search".into());
+        assert_eq!((result_kind(&hit), primary_action(&hit, true)), ("Web", Some("Search")));
+        hit.action = Action::Claude("ask".into());
+        assert_eq!((result_kind(&hit), primary_action(&hit, true)), ("Claude", Some("Ask Claude")));
+        assert!(!row_has_menu(&hit));
+        hit.action = Action::Copy("42".into());
+        assert_eq!(primary_action(&hit, true), Some("Copy answer"));
+        assert!(!row_has_menu(&hit));
+        let info = info_hit("No results");
+        assert_eq!((result_kind(&info), primary_action(&info, true)), ("", None));
+        assert!(!row_has_menu(&info));
+    }
+
+    #[test]
+    fn quick_reopen_reuses_backdrop_while_the_layer_fades() {
+        assert!(reuse_backdrop(Some(Duration::from_millis(200))));
+        assert!(!reuse_backdrop(Some(Duration::from_secs(2))));
+        assert!(!reuse_backdrop(None));
+    }
+
+    #[test]
+    fn ctrl_k_is_a_glass_only_action_shortcut() {
+        let ctrl = gdk::ModifierType::CONTROL_MASK;
+        assert!(glass_actions_shortcut(glass::Look::Glass, gdk::Key::k, ctrl));
+        assert!(!glass_actions_shortcut(glass::Look::Classic, gdk::Key::k, ctrl));
+        assert!(!glass_actions_shortcut(glass::Look::Glass, gdk::Key::k, ctrl | gdk::ModifierType::SHIFT_MASK));
+        assert!(!glass_actions_shortcut(glass::Look::Glass, gdk::Key::k, gdk::ModifierType::empty()));
+    }
+
+    #[test]
+    fn glass_css_allows_only_approved_layout_properties() {
+        // Strip comments before scanning declaration blocks. The stylesheet uses flat
+        // GTK selectors, with a few rules nested in media blocks and keyframes.
+        let mut css = String::new();
+        let mut rest = DEFAULT_CSS;
+        while let Some((before, comment)) = rest.split_once("/*") {
+            css.push_str(before);
+            rest = comment.split_once("*/").expect("unterminated CSS comment").1;
+        }
+        css.push_str(rest);
+        let mut checked = 0;
+        for block in css.split('}') {
+            let Some((selector, declarations)) = block.rsplit_once('{') else {
+                continue;
+            };
+            if !selector.contains(".omni-look-glass") {
+                continue;
+            }
+            for declaration in declarations.split(';').map(str::trim).filter(|d| !d.is_empty()) {
+                let (property, value) = declaration.split_once(':').expect("CSS declaration");
+                let allowed = match property.trim() {
+                    "background" | "background-color" | "background-image" | "color"
+                    | "border-color" | "border-bottom-color" | "border-top-color"
+                    | "border-radius" | "box-shadow" | "outline-color"
+                    | "opacity" | "caret-color" => true,
+                    "animation" => match selector.trim() {
+                        ".omni-look-glass .omni-glass-opening" => value.trim() == "omni-glass-open 160ms ease-out",
+                        ".omni-look-glass .omni-menu > contents" => value.trim() == "none",
+                        _ => false,
+                    },
+                    "transition" => matches!(value.trim(),
+                        "none" | "background-color 90ms ease-out" | "background-color 90ms ease-out, color 90ms ease-out"),
+                    "transform" => value.trim() == "none"
+                        && selector.trim() == ".omni-look-glass .omni-dropdown-trigger:active,\n.omni-look-glass .omni-contents-toggle:active",
+                    "font-family" => matches!(selector.trim(),
+                        ".omni-look-glass .omni-search,\n.omni-look-glass .omni-search:focus-within" | ".omni-look-glass .omni-action-bar"),
+                    // Footer copy button sized like the action bar's key-caps (approved action bar).
+                    "min-width" | "min-height" | "-gtk-icon-size" if selector.trim().starts_with(".omni-look-glass .omni-path-copy") => true,
+                    // Right-click menus were restyled as a whole (user: "they look like the old UI").
+                    "min-width" | "min-height" | "padding" | "margin" | "font-size" | "font-weight"
+                        | "border-spacing" if selector.trim().starts_with(".omni-look-glass .omni-context-menu") => true,
+                    "min-height" | "padding" => selector.trim() == ".omni-look-glass .omni-actions-button",
+                    "margin" => selector.trim() == ".omni-look-glass .omni-actions-divider",
+                    "text-shadow" => value.trim() == "none",
+                    "font-size" => matches!(selector.trim(), ".omni-look-glass .omni-actions-button"
+                        | ".omni-look-glass .omni-kind,\n.omni-look-glass .omni-action-bar"
+                        | ".omni-look-glass .omni-action-bar .omni-keycap"),
+                    "font-weight" => selector.trim() == ".omni-look-glass .omni-action-bar .omni-keycap",
+                    token => token.starts_with("--glass-"),
+                };
+                assert!(allowed, "Glass property {property} changes more than paint in {selector}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no Glass declarations checked");
+
+        let frames = css.split_once("@keyframes omni-glass-open {")
+            .expect("open animation").1;
+        let frames: Vec<_> = frames.split('}').take_while(|frame| !frame.trim().is_empty()).collect();
+        assert_eq!(frames.len(), 2);
+        for (frame, expected) in frames.into_iter().zip(["translateY(-4px) scale(0.98)", "translateY(0) scale(1)"]) {
+            let (_, declarations) = frame.split_once('{').expect("open animation frame");
+            for declaration in declarations.split(';').map(str::trim).filter(|d| !d.is_empty()) {
+                let (property, value) = declaration.split_once(':').expect("frame declaration");
+                assert!(property == "opacity" || (property == "transform" && value.trim() == expected));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a GTK display, without mapping the launcher"]
+    fn classic_and_glass_use_the_same_row_height() {
+        gtk::init().expect("GTK display required for offscreen measurement");
+        let display = gdk::Display::default().unwrap();
+        let provider = gtk::CssProvider::new();
+        let diagnostics = Rc::new(RefCell::new(Vec::new()));
+        let errors = diagnostics.clone();
+        provider.connect_parsing_error(move |_, _, error| errors.borrow_mut().push(error.to_string()));
+        provider.load_from_string(DEFAULT_CSS);
+        gtk::style_context_add_provider_for_display(&display, &provider, gtk::STYLE_PROVIDER_PRIORITY_APPLICATION);
+
+        let root = gtk::Window::builder().css_classes(["omni"]).build();
+        let card = glass::GlassCard::new();
+        card.add_css_class("omni-card");
+        card.set_width_request(CARD_WIDTH);
+        root.set_child(Some(&card));
+        let surface = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        surface.add_css_class("omni-glass");
+        surface.add_css_class("omni-launcher-surface");
+        card.append(&surface);
+
+        let bar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        bar.add_css_class("omni-bar");
+        let entry = gtk::SearchEntry::builder().placeholder_text(SEARCH_PLACEHOLDER)
+            .hexpand(true).css_classes(["omni-search"]).build();
+        let search = gtk::Overlay::builder().child(&entry).hexpand(true).build();
+        let filter = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        filter.append(&gtk::Label::new(Some("All")));
+        filter.append(&gtk::Image::from_icon_name("pan-down-symbolic"));
+        let filter = gtk::Button::builder().child(&filter).valign(gtk::Align::Center)
+            .css_classes(["omni-toggle", "omni-filter", "omni-dropdown-trigger"]).build();
+        let contents = gtk::ToggleButton::builder().label("Contents").valign(gtk::Align::Center)
+            .css_classes(["omni-toggle", "omni-contents-toggle"]).build();
+        bar.append(&search);
+        bar.append(&filter);
+        bar.append(&contents);
+        surface.append(&bar);
+
+        let list = gtk::ListBox::new();
+        list.add_css_class("omni-results");
+        let title = gtk::Label::builder().label("Result").css_classes(["omni-title"]).build();
+        let row = gtk::ListBoxRow::builder().child(&title).build();
+        list.append(&row);
+        surface.append(&list);
+
+        let footer = gtk::Box::new(gtk::Orientation::Horizontal, PATH_COPY_GAP);
+        footer.add_css_class("omni-path");
+        footer.set_size_request(-1, PATH_FOOTER_HEIGHT);
+        let path = gtk::Label::builder().label("/example").hexpand(true).css_classes(["omni-path-text"]).build();
+        footer.append(&path);
+        let copy = gtk::Button::builder().icon_name("edit-copy-symbolic")
+            .valign(gtk::Align::Center).css_classes(["flat", "omni-copy", "omni-path-copy"]).build();
+        footer.append(&copy);
+        surface.append(&footer);
+
+        let widgets: [(&str, &gtk::Widget); 7] = [
+            ("card", card.upcast_ref()), ("entry", entry.upcast_ref()),
+            ("filter", filter.upcast_ref()), ("contents", contents.upcast_ref()),
+            ("row", row.upcast_ref()), ("footer", footer.upcast_ref()),
+            ("copy", copy.upcast_ref()),
+        ];
+        let geometry = || {
+            let (_, height, _, _) = card.measure(gtk::Orientation::Vertical, CARD_WIDTH);
+            card.allocate(CARD_WIDTH, height, -1, None);
+            widgets.map(|(_, widget)| {
+                let bounds = widget.compute_bounds(&card).expect("widget in card subtree");
+                (
+                    widget.measure(gtk::Orientation::Horizontal, -1),
+                    widget.measure(gtk::Orientation::Vertical, -1),
+                    (bounds.x(), bounds.y(), bounds.width(), bounds.height()),
+                )
+            })
+        };
+        let classic = geometry();
+        assert_eq!(row.measure(gtk::Orientation::Vertical, -1).0, 52);
+        assert_eq!(bar.measure(gtk::Orientation::Vertical, -1).0, 57);
+        assert_eq!(footer.measure(gtk::Orientation::Vertical, -1).0, 33);
+        assert_eq!(LIST_CAP, 374);
+        root.add_css_class("omni-look-glass");
+        card.set_look(glass::Look::Glass);
+        row.add_css_class("omni-glass-selected");
+        let example = file_hit(std::path::Path::new("/tmp/example"), false, MatchType::Name, None, "");
+        let icon = gtk::Image::from_icon_name("text-x-generic-symbolic");
+        icon.set_pixel_size(28);
+        let glass_row = result_row(&example, "", glass::Look::Glass, icon.upcast_ref());
+        list.append(&glass_row);
+        assert_eq!(glass_row.measure(gtk::Orientation::Vertical, -1).0, 52);
+        let glass_content = glass_row.child().unwrap();
+        let text = glass_content.first_child().and_then(|i| i.next_sibling()).unwrap();
+        let subtitle = text.first_child().and_then(|title| title.next_sibling()).unwrap();
+        assert!(subtitle.has_css_class("omni-subtitle"));
+        let kind = glass_content.last_child().and_downcast::<gtk::Label>().unwrap();
+        assert_eq!(kind.text(), "File");
+        assert_eq!(kind.valign(), gtk::Align::Center);
+        let (action_bar, _, _, _) = glass_footer_widgets();
+        footer.append(&action_bar);
+        action_bar.set_visible(true);
+        assert_eq!(footer.measure(gtk::Orientation::Vertical, -1).0, 33);
+        footer.remove(&action_bar);
+        list.remove(&glass_row);
+        root.remove_css_class("omni-look-glass");
+        card.set_look(glass::Look::Classic);
+        row.remove_css_class("omni-glass-selected");
+        let restored = geometry();
+        for (index, (name, _)) in widgets.iter().enumerate() {
+            assert_eq!(classic[index], restored[index], "{name} geometry changed in Classic");
+        }
+
+        let popup = glass::menu_popover(&card);
+        popup.set_parent(&filter);
+        let items = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        popup.set_child(Some(&items));
+        let wrapper = items.parent().expect("GTK internal popover contents node");
+        assert_eq!(wrapper.css_name(), "contents");
+        assert_eq!(wrapper.parent().as_ref(), Some(popup.upcast_ref()));
+        assert!(diagnostics.borrow().is_empty(), "GTK CSS errors: {:?}", diagnostics.borrow());
+        popup.unparent();
+        root.set_child(gtk::Widget::NONE);
+        gtk::style_context_remove_provider_for_display(&display, &provider);
     }
 
     #[test]

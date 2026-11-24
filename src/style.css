@@ -1,6 +1,6 @@
-/* omni — dense opaque launcher chrome.
+/* omni — Classic and Glass launcher chrome.
  * Tokens live here. Override in ~/.config/omni/style.css if needed.
- * Keep --radius-panel in sync with glass::RADIUS.
+ * Keep Glass card and popover radii in sync with src/glass.rs.
  */
 
 @define-color omni_bg #1b1b1f;
@@ -56,7 +56,7 @@ window.omni {
   --shadow-menu: 0 8px 24px alpha(black, 0.40);
 }
 
-/* ---------- panel (fully opaque; no blur) ---------- */
+/* ---------- Classic panel (opaque CSS fill) ---------- */
 
 .omni-card {
   border-radius: 10px;
@@ -1183,4 +1183,446 @@ entry.omni-settings-entry text selection {
 
 @media (prefers-reduced-motion: reduce) {
   .omni-run-confirm .omni-answer-button { transition: none; }
+}
+
+/* ---------- Glass ---------- */
+
+.omni-look-glass {
+  /* Glass palette. The capture painter and match markup mirror the two RGB tokens. */
+  --glass-card-fill: #1c1c1e;
+  --glass-hairline: alpha(white, 0.10);
+  --glass-divider: alpha(white, 0.08);
+  --glass-hover: alpha(white, 0.05);
+  --glass-selected: alpha(white, 0.08);
+  --glass-text: #f0f0f2;
+  --glass-secondary: #b7b7bf;
+  --glass-tertiary: #a0a0ab;
+  --glass-accent: #fc4c01;
+  --glass-keycap: alpha(white, 0.08);
+  --glass-shadow: 0 8px 24px alpha(black, 0.35);
+  --glass-menu-shadow: 0 4px 12px alpha(black, 0.28);
+
+  /* Radius scale, in logical px. Rows use 8 within the shared Classic geometry.
+     Menus use 12 and their item faces use 8; right-click menus use 10 with a 4px inset,
+     so their item faces use 6. Keep painted Rust radii in glass.rs. */
+  --glass-card-radius: 14px;
+  --glass-menu-radius: 12px;
+  --glass-context-radius: 10px;
+  --glass-context-item-radius: 6px;
+  --glass-row-radius: 8px;
+  --glass-control-radius: 6px;
+  --glass-keycap-radius: 4px;
+}
+
+.omni-look-glass .omni-card {
+  border-radius: var(--glass-card-radius);
+  box-shadow: var(--glass-shadow);
+}
+
+.omni-look-glass .omni-frame,
+.omni-look-glass .omni-glass,
+.omni-look-glass .omni-scrim {
+  border-radius: var(--glass-card-radius);
+}
+
+.omni-look-glass .omni-glass {
+  background-color: transparent;
+  border-color: var(--glass-hairline);
+}
+
+.omni-look-glass .omni-bar {
+  border-bottom-color: var(--glass-divider);
+}
+
+.omni-look-glass .omni-search,
+.omni-look-glass .omni-search:focus-within {
+  background: none;
+  border-color: transparent;
+  box-shadow: none;
+  caret-color: var(--glass-accent);
+  color: var(--glass-text);
+  font-family: Inter, system-ui, sans-serif;
+}
+
+.omni-look-glass .omni-search text {
+  caret-color: var(--glass-accent);
+}
+
+.omni-look-glass .omni-search text placeholder {
+  color: var(--glass-tertiary);
+}
+
+.omni-look-glass .omni-search text selection,
+.omni-look-glass .omni-answer-body selection,
+.omni-look-glass .omni-settings-entry text selection {
+  background-color: alpha(var(--glass-accent), 0.25);
+}
+
+.omni-look-glass .omni-search-brand,
+.omni-look-glass .omni-search image {
+  color: var(--glass-secondary);
+}
+
+@keyframes omni-glass-open {
+  from { transform: translateY(-4px) scale(0.98); opacity: 0; }
+  to { transform: translateY(0) scale(1); opacity: 1; }
+}
+
+.omni-look-glass .omni-glass-opening {
+  animation: omni-glass-open 160ms ease-out;
+}
+
+.omni-look-glass .omni-selection,
+.omni-look-glass .omni-selection-pill {
+  opacity: 0;
+  background-color: transparent;
+}
+
+.omni-look-glass .omni-glass-selection {
+  color: var(--glass-selected);
+}
+
+.omni-look-glass list.omni-results > row {
+  border-radius: var(--glass-row-radius);
+  transition: background-color 90ms ease-out;
+}
+
+.omni-look-glass list.omni-results > row.activatable:hover:not(.omni-glass-selected):not(.omni-calc) {
+  background-color: var(--glass-hover);
+}
+
+.omni-look-glass .omni-title,
+.omni-look-glass .omni-glass-selected .omni-title,
+.omni-look-glass .omni-calc-result,
+.omni-look-glass .omni-answer-body,
+.omni-look-glass .omni-answer-question,
+.omni-look-glass .omni-confirm-text,
+.omni-look-glass .omni-settings-title,
+.omni-look-glass .omni-status-body {
+  color: var(--glass-text);
+}
+
+.omni-look-glass .omni-subtitle,
+.omni-look-glass .omni-path-text,
+.omni-look-glass .omni-path-hint,
+.omni-look-glass .omni-action-bar,
+.omni-look-glass .omni-status-hint,
+.omni-look-glass .omni-content-badge,
+.omni-look-glass .omni-match-count,
+.omni-look-glass .omni-answer-title,
+.omni-look-glass .omni-calc-caption,
+.omni-look-glass .omni-calc-expression,
+.omni-look-glass .omni-calc-arrow,
+.omni-look-glass .omni-menu-detail,
+.omni-look-glass .omni-menu-header,
+.omni-look-glass .omni-settings-status {
+  color: var(--glass-secondary);
+}
+
+.omni-look-glass .omni-kind,
+.omni-look-glass .omni-settings-entry text placeholder {
+  color: var(--glass-tertiary);
+}
+
+.omni-look-glass .omni-kind,
+.omni-look-glass .omni-action-bar {
+  font-size: 11px;
+}
+
+.omni-look-glass .omni-action-bar {
+  font-family: Inter, system-ui, sans-serif;
+}
+
+.omni-look-glass .omni-action-bar .omni-keycap {
+  border-radius: var(--glass-keycap-radius);
+  color: var(--glass-secondary);
+  background-color: var(--glass-keycap);
+  border-color: transparent;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.omni-look-glass .omni-actions-button {
+  min-height: 24px;
+  padding: 0 5px;
+  font-size: 11px;
+}
+
+.omni-look-glass .omni-actions-divider {
+  margin: 4px 0;
+  background-color: var(--glass-divider);
+}
+
+.omni-look-glass .omni-dropdown-trigger,
+.omni-look-glass .omni-contents-toggle,
+.omni-look-glass .omni-copy,
+.omni-look-glass .omni-actions-button,
+.omni-look-glass .omni-settings-button,
+.omni-look-glass .omni-settings-back,
+.omni-look-glass .omni-settings-action,
+.omni-look-glass .omni-answer-button {
+  border-radius: var(--glass-control-radius);
+  background: none;
+  border-color: transparent;
+  box-shadow: none;
+  outline-color: var(--glass-secondary);
+  color: var(--glass-secondary);
+  transition: background-color 90ms ease-out, color 90ms ease-out;
+}
+
+.omni-look-glass .omni-dropdown-trigger:hover,
+.omni-look-glass .omni-contents-toggle:hover,
+.omni-look-glass .omni-copy:hover,
+.omni-look-glass .omni-actions-button:hover,
+.omni-look-glass .omni-settings-slip:hover .omni-settings-button,
+.omni-look-glass .omni-settings-back:hover,
+.omni-look-glass .omni-settings-action:hover,
+.omni-look-glass .omni-answer-button:hover {
+  background-color: var(--glass-hover);
+  border-color: transparent;
+  color: var(--glass-text);
+}
+
+.omni-look-glass .omni-dropdown-trigger.omni-dropdown-open,
+.omni-look-glass .omni-contents-toggle:checked,
+.omni-look-glass .omni-contents-toggle:checked:hover,
+.omni-look-glass .omni-answer-button:active {
+  background-color: var(--glass-selected);
+  border-color: transparent;
+  color: var(--glass-text);
+}
+
+.omni-look-glass .omni-dropdown-trigger:active,
+.omni-look-glass .omni-contents-toggle:active {
+  transform: none;
+  box-shadow: none;
+}
+
+.omni-look-glass .omni-dropdown-trigger:focus-visible,
+.omni-look-glass .omni-contents-toggle:focus-visible {
+  outline-color: var(--glass-secondary);
+}
+
+.omni-look-glass .omni-copy { opacity: 0.8; }
+.omni-look-glass .omni-copy:hover { opacity: 1; }
+
+/* Footer copy button: drawn like the bar's key-caps so it belongs to the action bar. */
+.omni-look-glass .omni-path-copy {
+  min-width: 22px;
+  min-height: 22px;
+  border-radius: var(--glass-keycap-radius);
+  background-color: var(--glass-keycap);
+  color: var(--glass-secondary);
+  opacity: 1;
+}
+
+.omni-look-glass .omni-path-copy:hover {
+  background-color: alpha(white, 0.14);
+  color: var(--glass-text);
+}
+
+.omni-look-glass .omni-path-copy image {
+  -gtk-icon-size: 12px;
+}
+
+.omni-look-glass .omni-menu > contents {
+  border-radius: var(--glass-menu-radius);
+  background: none;
+  border-color: var(--glass-hairline);
+  box-shadow: var(--glass-menu-shadow);
+  /* The native popup snapshot animates both the backdrop and its contents together. */
+  animation: none;
+}
+
+.omni-look-glass .omni-menu .omni-menu-item {
+  border-radius: var(--glass-row-radius);
+  color: var(--glass-secondary);
+  background: none;
+  transition: background-color 90ms ease-out, color 90ms ease-out;
+}
+
+.omni-look-glass .omni-menu .omni-menu-item:hover,
+.omni-look-glass .omni-menu .omni-menu-item:focus-visible,
+.omni-look-glass .omni-menu .omni-menu-item.omni-filter-on {
+  background-color: var(--glass-selected);
+  color: var(--glass-text);
+}
+
+/* Right-click menus only: dense desktop menu, tight and solid. 26px items, 13px text,
+   4px menu padding, 8px item padding. The popup surface is only a few px larger than its
+   contents, so a drop shadow gets cut into a ragged shape: crisp hairline + top highlight
+   instead. Radius 10, item inset 4 -> item radius 6. Width fits the longest item (labels
+   ellipsize past 22 characters), so there is no minimum width. */
+.omni-look-glass .omni-context-menu > contents {
+  min-width: 0;
+  padding: 4px;
+  border-radius: var(--glass-context-radius);
+  box-shadow: inset 0 1px alpha(white, 0.05);
+}
+
+.omni-look-glass .omni-context-menu .omni-menu-item {
+  min-height: 26px;
+  padding: 0 8px;
+  border-radius: var(--glass-context-item-radius);
+  color: var(--glass-text);
+  font-size: 13px;
+  font-weight: 400;
+}
+
+.omni-look-glass .omni-context-menu .omni-menu-content {
+  border-spacing: 8px;
+}
+
+.omni-look-glass .omni-context-menu .omni-menu-item image {
+  color: var(--glass-secondary);
+}
+
+.omni-look-glass .omni-context-menu .omni-menu-item:hover image,
+.omni-look-glass .omni-context-menu .omni-menu-item:focus-visible image {
+  color: var(--glass-text);
+}
+
+.omni-look-glass .omni-context-menu .omni-menu-detail {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--glass-tertiary);
+}
+
+.omni-look-glass .omni-context-menu .omni-menu-header {
+  padding: 4px 8px 2px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--glass-tertiary);
+}
+
+.omni-look-glass .omni-context-menu separator {
+  margin: 4px 0;
+}
+
+.omni-look-glass .omni-menu separator,
+.omni-look-glass .omni-calc-left,
+.omni-look-glass .omni-answer-followup,
+.omni-look-glass .omni-settings-row {
+  border-color: var(--glass-divider);
+}
+
+.omni-look-glass .omni-menu separator {
+  background-color: var(--glass-divider);
+}
+
+.omni-look-glass .omni-dropdown-check,
+.omni-look-glass .omni-ball,
+.omni-look-glass .omni-answer-body link,
+.omni-look-glass .omni-confirm-link {
+  color: var(--glass-accent);
+}
+
+.omni-look-glass .omni-answer,
+.omni-look-glass .omni-calc-card,
+.omni-look-glass .omni-confirm-code {
+  border-radius: var(--glass-row-radius);
+  background-color: var(--glass-hover);
+  border-color: var(--glass-hairline);
+}
+
+.omni-look-glass .omni-calc-caption,
+.omni-look-glass .omni-content-badge {
+  border-radius: var(--glass-keycap-radius);
+  background-color: var(--glass-keycap);
+  border-color: var(--glass-hairline);
+}
+
+.omni-look-glass .omni-confirm-box,
+.omni-look-glass .omni-web-loading,
+.omni-look-glass tooltip.background {
+  border-radius: var(--glass-menu-radius);
+  background: var(--glass-card-fill);
+  border-color: var(--glass-hairline);
+  color: var(--glass-secondary);
+  box-shadow: var(--glass-menu-shadow);
+}
+
+.omni-look-glass .omni-run-confirm .omni-confirm-yes,
+.omni-look-glass .omni-confirm-yes {
+  background-color: var(--glass-selected);
+  color: var(--glass-text);
+}
+
+.omni-look-glass .omni-path {
+  border-radius: 0 0 var(--glass-card-radius) var(--glass-card-radius);
+  border-top-color: var(--glass-divider);
+  background-color: transparent;
+}
+
+.omni-look-glass .omni-settings-entry,
+.omni-look-glass button.omni-switch,
+.omni-look-glass .omni-settings-row scale trough {
+  border-radius: var(--glass-control-radius);
+  background: var(--glass-hover);
+  border-color: var(--glass-hairline);
+  box-shadow: none;
+  color: var(--glass-text);
+}
+
+.omni-look-glass .omni-settings-entry {
+  caret-color: var(--glass-accent);
+}
+
+.omni-look-glass .omni-settings-entry:focus-within {
+  border-color: var(--glass-secondary);
+}
+
+.omni-look-glass button.omni-switch:checked,
+.omni-look-glass .omni-settings-row scale highlight {
+  border-radius: var(--glass-control-radius);
+  background: var(--glass-selected);
+  border-color: var(--glass-hairline);
+  box-shadow: none;
+}
+
+.omni-look-glass button.omni-switch > .omni-switch-thumb,
+.omni-look-glass button.omni-switch:checked > .omni-switch-thumb,
+.omni-look-glass .omni-settings-row scale slider {
+  border-radius: var(--glass-keycap-radius);
+  background: var(--glass-secondary);
+  border-color: var(--glass-hairline);
+  box-shadow: none;
+}
+
+/* Controls stay crisp over the backdrop, including their focused and hovered states. */
+.omni-look-glass .omni-dropdown-trigger,
+.omni-look-glass .omni-contents-toggle,
+.omni-look-glass .omni-action-bar .omni-keycap,
+.omni-look-glass .omni-actions-button,
+.omni-look-glass .omni-copy,
+.omni-look-glass .omni-settings-action,
+.omni-look-glass .omni-settings-entry,
+.omni-look-glass .omni-settings-back,
+.omni-look-glass .omni-settings-button,
+.omni-look-glass .omni-answer-button,
+.omni-look-glass button.omni-switch,
+.omni-look-glass button.omni-switch:checked,
+.omni-look-glass button.omni-switch > .omni-switch-thumb,
+.omni-look-glass button.omni-switch:checked > .omni-switch-thumb,
+.omni-look-glass .omni-settings-row scale trough,
+.omni-look-glass .omni-settings-row scale highlight,
+.omni-look-glass .omni-settings-row scale slider,
+.omni-look-glass .omni-settings-row scale value {
+  box-shadow: none;
+  text-shadow: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .omni-look-glass .omni-dropdown-trigger,
+  .omni-look-glass .omni-contents-toggle,
+  .omni-look-glass .omni-copy,
+  .omni-look-glass .omni-actions-button,
+  .omni-look-glass .omni-settings-button,
+  .omni-look-glass .omni-settings-back,
+  .omni-look-glass .omni-settings-action,
+  .omni-look-glass .omni-answer-button,
+  .omni-look-glass .omni-menu .omni-menu-item,
+  .omni-look-glass list.omni-results > row {
+    transition: none;
+  }
 }
