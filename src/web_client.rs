@@ -215,6 +215,8 @@ struct Page {
     picture: glib::WeakRef<gtk::Picture>,
     status: gtk::Label,
     ready_callback: RefCell<Option<Box<dyn FnOnce()>>>,
+    /// Runs on idle after a link was handed to the system browser.
+    link_opened: RefCell<Option<Rc<dyn Fn()>>>,
     document_ready: Cell<bool>,
     loading: Cell<bool>,
     error: RefCell<Option<String>>,
@@ -260,6 +262,18 @@ impl Page {
             proto::COPIED => {
                 if let (Some(text), Some(p)) = (m.str(), self.picture.upgrade()) {
                     p.clipboard().set_text(&text);
+                }
+            }
+            proto::OPEN_EXTERNAL => {
+                let Some(url) = m.str().filter(|u| proto::is_web_url(u)) else { return };
+                let ctx = self.picture.upgrade().map(|p| p.display().app_launch_context());
+                if let Err(e) = gio::AppInfo::launch_default_for_uri(&url, ctx.as_ref()) {
+                    eprintln!("omni: couldn't open {url}: {e}");
+                    return;
+                }
+                // Deferred: the callback may close this very page, which is mid-dispatch.
+                if let Some(callback) = self.link_opened.borrow().clone() {
+                    glib::idle_add_local_once(move || callback());
                 }
             }
             _ => {}
@@ -324,6 +338,7 @@ impl Surface {
             picture: picture.downgrade(),
             status: status.clone(),
             ready_callback: RefCell::new(None),
+            link_opened: RefCell::new(None),
             document_ready: Cell::new(false),
             loading: Cell::new(false),
             error: RefCell::new(None),
@@ -376,6 +391,10 @@ impl Surface {
         *self.page.ready_callback.borrow_mut() = Some(Box::new(callback));
         // An early failure (the host couldn't start Chromium) may already be here.
         self.page.check_ready();
+    }
+    /// Called after the page hands a followed link to the system browser.
+    pub fn on_link_opened(&self, callback: Rc<dyn Fn()>) {
+        *self.page.link_opened.borrow_mut() = Some(callback);
     }
     pub fn stop(&self) {
         send(proto::Writer::new(proto::STOP, self.page.id).finish());

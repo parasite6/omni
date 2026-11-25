@@ -425,9 +425,39 @@ wrap_display_handler! {
         }
     }
 }
+/// Hand a link the user followed to the launcher, which opens it in the system browser.
+/// Only when the user just clicked or typed, so a page script can't spawn browser tabs.
+fn open_external(state:&Shared, url:&str, user_gesture:i32) {
+    if !proto::is_web_url(url) {return;}
+    let s=state.lock().unwrap();
+    let recent=s.last_input.is_some_and(|t|t.elapsed()<Duration::from_millis(1500));
+    if user_gesture!=0 || recent {send(proto::Writer::new(proto::OPEN_EXTERNAL,s.id).str(url).finish());}
+}
+
+wrap_request_handler! {
+    struct Requests { state:Shared }
+    impl RequestHandler {
+        fn on_before_browse(&self, _browser:Option<&mut Browser>, frame:Option<&mut Frame>, request:Option<&mut Request>, user_gesture:i32, _is_redirect:i32)->i32 {
+            if !frame.is_some_and(|f|f.is_main()!=0) {return 0;}
+            let Some(request)=request else {return 0;};
+            let url=CefString::from(&request.url()).to_string();
+            if proto::stays_embedded(&url) {return 0;}
+            // Leaving Brave Ask: the view never shows it; the system browser does.
+            open_external(&self.state,&url,user_gesture);
+            1
+        }
+        fn on_open_urlfrom_tab(&self, _browser:Option<&mut Browser>, _frame:Option<&mut Frame>, url:Option<&CefString>, _disposition:WindowOpenDisposition, gesture:i32)->i32 {
+            // Middle- or Ctrl-click: a new tab elsewhere, never one inside this view.
+            if let Some(url)=url {open_external(&self.state,&url.to_string(),gesture);}
+            1
+        }
+    }
+}
+
 wrap_client! {
-    struct ClientImpl { render:RenderHandler, load:LoadHandler, life:LifeSpanHandler, display:DisplayHandler }
+    struct ClientImpl { render:RenderHandler, load:LoadHandler, life:LifeSpanHandler, display:DisplayHandler, requests:RequestHandler }
     impl Client {
+        fn request_handler(&self)->Option<RequestHandler>{Some(self.requests.clone())}
         fn render_handler(&self)->Option<RenderHandler>{Some(self.render.clone())}
         fn load_handler(&self)->Option<LoadHandler>{Some(self.load.clone())}
         fn life_span_handler(&self)->Option<LifeSpanHandler>{Some(self.life.clone())}
@@ -440,24 +470,19 @@ fn all_closed() -> bool {
 }
 
 wrap_life_span_handler! {
-    struct Life { closed:Arc<AtomicBool> }
+    struct Life { closed:Arc<AtomicBool>, state:Shared }
     impl LifeSpanHandler {
         fn on_before_close(&self, _browser:Option<&mut Browser>){
             self.closed.store(true,Ordering::Release);
             if SHUTTING_DOWN.load(Ordering::Acquire) && all_closed() {quit_message_loop();}
         }
-        fn on_before_popup(&self, browser:Option<&mut Browser>, _frame:Option<&mut Frame>, _popup_id:i32,
+        fn on_before_popup(&self, _browser:Option<&mut Browser>, _frame:Option<&mut Frame>, _popup_id:i32,
             url:Option<&CefString>, _name:Option<&CefString>, _disposition:WindowOpenDisposition,
-            _gesture:i32, _features:Option<&PopupFeatures>, _window:Option<&mut WindowInfo>,
+            gesture:i32, _features:Option<&PopupFeatures>, _window:Option<&mut WindowInfo>,
             _client:Option<&mut Option<Client>>, _settings:Option<&mut BrowserSettings>,
             _extra:Option<&mut Option<DictionaryValue>>, _no_js:Option<&mut i32>)->i32 {
-            // Keep source links in this page instead of creating unmanaged CEF windows.
-            if let (Some(browser),Some(url))=(browser,url) {
-                let text=url.to_string();
-                if text.starts_with("https://") || text.starts_with("http://") {
-                    if let Some(frame)=browser.main_frame(){frame.load_url(Some(url));}
-                }
-            }
+            // Links that open a new window go to the system browser, never a CEF window.
+            if let Some(url)=url {open_external(&self.state,&url.to_string(),gesture);}
             1
         }
     }
@@ -476,8 +501,9 @@ fn open(id: u32, css: String) -> Result<(), String> {
     let mut client = ClientImpl::new(
         Render::new(state.clone()),
         Load::new(state.clone(), css),
-        Life::new(closed.clone()),
+        Life::new(closed.clone(), state.clone()),
         PageDisplay::new(state.clone()),
+        Requests::new(state.clone()),
     );
     let info = WindowInfo::default().set_as_windowless(0);
     // Each page gets a distinct off-the-record context. Cookies, localStorage,
@@ -491,7 +517,8 @@ fn open(id: u32, css: String) -> Result<(), String> {
         Some(&CefString::from("about:blank")),
         Some(&BrowserSettings {
             windowless_frame_rate: 60,
-            background_color: 0xff1b1b1f,
+            // Transparent: the launcher's card paints blur and tint behind the page.
+            background_color: 0x00000000,
             ..Default::default()
         }),
         None,

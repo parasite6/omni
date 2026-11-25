@@ -1473,6 +1473,12 @@ fn build_ui(app: &gtk::Application) -> Rc<Ui> {
     let u = ui.clone();
     ui.search_view.back.connect_clicked(move |_| show_launcher(&u));
     let u = ui.clone();
+    ui.search_view.on_link_opened(move || {
+        if u.window.is_visible() {
+            hide(&u);
+        }
+    });
+    let u = ui.clone();
     engine_button.connect_clicked(move |button| {
         let names: Vec<&str> = search_provider::SearchProvider::ALL.iter().map(|p| p.name()).collect();
         let current = search_provider::SearchProvider::ALL.iter().position(|p| *p == u.search_provider.get()).unwrap_or(0);

@@ -24,6 +24,8 @@ pub const READY: u8 = 104;
 pub const COPIED: u8 = 105; // text: str
 /// The engine itself failed; page id 0. The host exits after sending it.
 pub const FATAL: u8 = 106; // message: str
+/// The user followed a link off the search page; open it in the system browser.
+pub const OPEN_EXTERNAL: u8 = 107; // url: str
 
 // Key event kinds, matching cef_key_event_type_t.
 pub const KEY_RAWDOWN: i32 = 0;
@@ -128,6 +130,20 @@ pub fn parse<'a>(buf: &'a [u8], out: &mut Vec<Message<'a>>) -> Result<usize, ()>
     Ok(at)
 }
 
+/// Pages the embedded view may show itself: Brave's Ask conversation (and the blank page
+/// it starts on). Everything else the user navigates to belongs in their own browser.
+pub fn stays_embedded(url: &str) -> bool {
+    url == "about:blank"
+        || url
+            .strip_prefix("https://search.brave.com/ask")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['?', '#', '/']))
+}
+
+/// Only web links leave the embedded view; other schemes are dropped.
+pub fn is_web_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,4 +231,16 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn only_brave_ask_stays_embedded() {
+        assert!(stays_embedded("about:blank"));
+        assert!(stays_embedded("https://search.brave.com/ask"));
+        assert!(stays_embedded("https://search.brave.com/ask?q=rust"));
+        assert!(stays_embedded("https://search.brave.com/ask#x"));
+        assert!(!stays_embedded("https://search.brave.com/asks"));
+        assert!(!stays_embedded("https://search.brave.com/search?q=rust"));
+        assert!(!stays_embedded("https://example.com/?u=https://search.brave.com/ask"));
+        assert!(!stays_embedded("http://search.brave.com/ask"));
+    }
 }

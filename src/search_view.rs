@@ -1,6 +1,7 @@
 //! Embedded search browser with provider-specific page styles.
 use gtk::prelude::*;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 pub struct SearchView {
     pub root: gtk::Box,
@@ -9,6 +10,7 @@ pub struct SearchView {
     host: gtk::Stack,
     loading_spinner: gtk::Spinner,
     view: RefCell<Option<crate::web_client::Surface>>,
+    link_opened: RefCell<Option<Rc<dyn Fn()>>>,
 }
 
 impl SearchView {
@@ -61,6 +63,7 @@ impl SearchView {
             host,
             loading_spinner,
             view: RefCell::new(None),
+            link_opened: RefCell::new(None),
         }
     }
 
@@ -89,6 +92,9 @@ impl SearchView {
                             spinner.stop();
                         }
                     });
+                    if let Some(callback) = self.link_opened.borrow().clone() {
+                        view.on_link_opened(callback);
+                    }
                     *self.view.borrow_mut() = Some(view);
                 }
                 Err(error) => {
@@ -101,6 +107,11 @@ impl SearchView {
         if let Some(view) = self.view.borrow().as_ref() {
             view.load(&provider.search_url(query));
         }
+    }
+
+    /// Called after a link on the page was opened in the system browser.
+    pub fn on_link_opened(&self, callback: impl Fn() + 'static) {
+        *self.link_opened.borrow_mut() = Some(Rc::new(callback));
     }
 
     pub fn stop(&self) {

@@ -19,3 +19,22 @@
 .vscroll-track {
   display: none !important;
 }
+
+/* Let omni's Glass card (blur and tint) show through Ask's page surfaces. Brave goes
+ * dark through prefers-color-scheme (no class on <html>); light-theme text would be
+ * unreadable over the dark card, so only then. Answer cards, the prompt box and
+ * popovers keep their own fills. */
+@media (prefers-color-scheme: dark) {
+  html,
+  body,
+  .tap,
+  .ask-center,
+  .ask-center-body,
+  .ask-center-footer {
+    background-color: transparent !important;
+  }
+  /* Its outline would draw a box inside omni's own card edge. */
+  .ask-center-body {
+    border-color: transparent !important;
+  }
+}
